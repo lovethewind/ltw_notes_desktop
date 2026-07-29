@@ -25,8 +25,6 @@ const {
   getProfileDataPath,
   migrateAccountProfile,
   migrateDomainProfile,
-  migrateLegacyProfile,
-  migrateLegacySettings,
   shouldConfirmLocalProfileTransfer
 } = require("./profile-storage.cjs")
 
@@ -1307,7 +1305,6 @@ function createWindow() {
   return browserWindow
 }
 
-const legacyUserDataPath = path.join(app.getPath("appData"), "心悦离线笔记")
 const currentUserDataPath = path.join(app.getPath("appData"), "心悦笔记")
 app.setPath("userData", currentUserDataPath)
 app.setName("心悦笔记")
@@ -1328,22 +1325,11 @@ app.on("open-url", (event, url) => {
 })
 
 app.whenReady().then(() => {
-  migrateLegacySettings(legacyUserDataPath, currentUserDataPath)
   syncSettings = loadSyncSettings()
-  migrateLegacyProfile(
-    legacyUserDataPath,
-    currentUserDataPath,
-    syncSettings.backendUrl,
-    syncSettings.accountId
-  )
   migrateDomainProfile(currentUserDataPath, syncSettings.backendUrl, syncSettings.accountId)
   const profilePath = getBackendProfilePath(syncSettings.backendUrl, syncSettings.accountId)
   const domainProfilePath = path.dirname(profilePath)
   repository = openBackendRepository(syncSettings.backendUrl, syncSettings.accountId)
-  repository.relocateImageAssetPaths(
-    path.join(legacyUserDataPath, LOCAL_ASSET_DIRECTORY_NAME),
-    path.join(profilePath, LOCAL_ASSET_DIRECTORY_NAME)
-  )
   repository.relocateImageAssetPaths(
     path.join(domainProfilePath, LOCAL_ASSET_DIRECTORY_NAME),
     path.join(profilePath, LOCAL_ASSET_DIRECTORY_NAME)

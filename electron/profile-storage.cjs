@@ -79,35 +79,6 @@ function copyProfile(sourcePath, targetPath) {
 }
 
 /**
- * 将旧目录中的同步设置复制到新用户数据目录。
- *
- * @param {string} legacyPath 旧用户数据目录。
- * @param {string} userDataPath 新用户数据目录。
- * @returns {boolean} 是否完成了设置迁移。
- */
-function migrateLegacySettings(legacyPath, userDataPath) {
-  const sourcePath = path.join(legacyPath, "sync-settings.json")
-  const targetPath = path.join(userDataPath, "sync-settings.json")
-  if (!fs.existsSync(sourcePath) || fs.existsSync(targetPath)) return false
-  fs.mkdirSync(userDataPath, { recursive: true })
-  fs.copyFileSync(sourcePath, targetPath, fs.constants.COPYFILE_EXCL)
-  return true
-}
-
-/**
- * 将旧数据库和图片复制到当前域名档案，保留旧目录作为备份。
- *
- * @param {string} legacyPath 旧用户数据目录。
- * @param {string} userDataPath 新用户数据目录。
- * @param {string} backendUrl 已规范化的后端地址。
- * @param {string} accountId 服务端用户唯一 ID，空字符串表示未登录用户。
- * @returns {boolean} 是否完成了档案迁移。
- */
-function migrateLegacyProfile(legacyPath, userDataPath, backendUrl, accountId) {
-  return copyProfile(legacyPath, getProfileDataPath(userDataPath, backendUrl, accountId))
-}
-
-/**
  * 将旧的域名单层档案复制到用户档案。
  *
  * @param {string} userDataPath 应用用户数据根目录。
@@ -166,7 +137,5 @@ module.exports = {
   getProfileDataPath,
   migrateAccountProfile,
   migrateDomainProfile,
-  migrateLegacyProfile,
-  migrateLegacySettings,
   shouldConfirmLocalProfileTransfer
 }
