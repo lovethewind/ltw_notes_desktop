@@ -40,3 +40,40 @@ export function formatNoteExcerpt(content: string): string {
     .replace(/\s+/g, ' ')
     .trim()
 }
+
+/**
+ * 判断笔记标题或正文是否匹配搜索词。
+ *
+ * :param note: 待搜索笔记。
+ * :param keyword: 已规范为小写的搜索词。
+ * :return: 标题或正文包含搜索词时返回 true。
+ */
+export function matchesNoteSearch(
+  note: { title: string, content: string },
+  keyword: string
+): boolean {
+  if (!keyword) return true
+  return note.title.toLocaleLowerCase().includes(keyword)
+    || formatNoteExcerpt(note.content).toLocaleLowerCase().includes(keyword)
+}
+
+/**
+ * 生成包含正文命中位置的搜索结果摘要。
+ *
+ * :param note: 待展示笔记。
+ * :param keyword: 原始搜索词。
+ * :return: 正文命中上下文；未命中时返回普通摘要。
+ */
+export function formatNoteSearchExcerpt(
+  note: { content: string },
+  keyword: string
+): string {
+  const excerpt = formatNoteExcerpt(note.content)
+  const normalizedKeyword = keyword.trim().toLocaleLowerCase()
+  if (!normalizedKeyword) return excerpt
+  const matchIndex = excerpt.toLocaleLowerCase().indexOf(normalizedKeyword)
+  if (matchIndex < 0) return excerpt
+  const start = Math.max(0, matchIndex - 28)
+  const end = Math.min(excerpt.length, matchIndex + normalizedKeyword.length + 52)
+  return `${start > 0 ? '…' : ''}${excerpt.slice(start, end)}${end < excerpt.length ? '…' : ''}`
+}

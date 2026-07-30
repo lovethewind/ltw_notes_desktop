@@ -2,6 +2,7 @@ const fs = require("node:fs")
 const path = require("node:path")
 const { createHash, randomBytes } = require("node:crypto")
 const { pathToFileURL } = require("node:url")
+const Database = require("better-sqlite3")
 const {
   app,
   BrowserWindow,
@@ -27,8 +28,21 @@ const {
   migrateDomainProfile,
   shouldConfirmLocalProfileTransfer
 } = require("./profile-storage.cjs")
+const { checkForUpdates } = require("./app-update.cjs")
+const {
+  createDatabaseBackupManager,
+  restoreProfileSnapshot
+} = require("./database-backup.cjs")
+const {
+  createDatabaseBackupStatusTracker
+} = require("./database-backup-status.cjs")
+const {
+  loadBackupSettings,
+  saveBackupSettings
+} = require("./database-backup-settings.cjs")
 
 const DEFAULT_BACKEND_URL = "https://lovethewind.cn"
+const DEFAULT_WEB_URL = "https://lovethewind.cn"
 const NOTE_SYNC_INTERVAL_MS = 30_000
 const LOCAL_CHANGE_SYNC_DELAY_MS = 3_000
 const SYNC_SETTINGS_FILE_NAME = "sync-settings.json"
@@ -36,6 +50,7 @@ const DESKTOP_AUTH_PROTOCOL = "xinyue-notes"
 const LOCAL_ASSET_PROTOCOL = "xinyue-asset"
 const LOCAL_ASSET_DIRECTORY_NAME = "assets"
 const MAX_IMAGE_ASSET_BYTES = 20 * 1024 * 1024
+const MAX_ATTACHMENT_BYTES = 100 * 1024 * 1024
 const IMAGE_EXTENSION_BY_MIME_TYPE = new Map([
   ["image/avif", ".avif"],
   ["image/bmp", ".bmp"],
@@ -46,10 +61,23 @@ const IMAGE_EXTENSION_BY_MIME_TYPE = new Map([
 ])
 
 let repository = null
+let backupManager = null
 let mainWindow = null
-let syncSettings = { backendUrl: DEFAULT_BACKEND_URL, token: "", accountId: "", accountLabel: "" }
+const backupStatusTracker = createDatabaseBackupStatusTracker((status) => {
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send("database-backup:status", status)
+  }
+})
+let syncSettings = {
+  backendUrl: DEFAULT_BACKEND_URL,
+  webUrl: DEFAULT_WEB_URL,
+  token: "",
+  accountId: "",
+  accountLabel: ""
+}
 let pendingSyncConnection = null
 let pendingBrowserAuth = null
+let pendingNoteLinkId = ""
 let syncInFlight = null
 let automaticSyncTimer = null
 let pendingMutationSyncTimer = null
@@ -107,6 +135,177 @@ function openBackendRepository(backendUrl, accountId) {
   const profilePath = getBackendProfilePath(backendUrl, accountId)
   fs.mkdirSync(profilePath, { recursive: true })
   return openNotesDatabase(profilePath)
+}
+
+/**
+ * 为当前域名和用户档案创建完整备份管理器。
+ *
+ * @returns {ReturnType<typeof createDatabaseBackupManager>} 当前档案备份管理器。
+ */
+function createCurrentBackupManager() {
+  const profilePath = getBackendProfilePath(syncSettings.backendUrl, syncSettings.accountId)
+  return createDatabaseBackupManager({
+    profilePath,
+    backupDatabase: (targetPath) => repository.backupTo(targetPath),
+    getSettings: () => loadBackupSettings(profilePath)
+  })
+}
+
+/**
+ * 获取当前档案的备份策略。
+ *
+ * @returns {{ schedule: "daily" | "weekly" | "off", retention: number }} 备份策略。
+ */
+function getCurrentBackupSettings() {
+  return loadBackupSettings(getBackendProfilePath(syncSettings.backendUrl, syncSettings.accountId))
+}
+
+/**
+ * 保存当前档案的备份策略。
+ *
+ * @param {Record<string, any>} input 原始策略。
+ * @returns {Promise<{ schedule: "daily" | "weekly" | "off", retention: number }>} 已保存策略。
+ */
+async function saveCurrentBackupSettings(input) {
+  const profilePath = getBackendProfilePath(syncSettings.backendUrl, syncSettings.accountId)
+  const settings = await saveBackupSettings(profilePath, input)
+  backupManager = createCurrentBackupManager()
+  if (settings.schedule !== "off") await ensureDailyDatabaseBackup()
+  return settings
+}
+
+/**
+ * 验证 SQLite 备份文件可正常读取且通过快速完整性检查。
+ *
+ * @param {string} backupPath 待验证的备份文件路径。
+ * @returns {void}
+ */
+function validateDatabaseBackup(backupPath) {
+  const database = new Database(backupPath, { readonly: true, fileMustExist: true })
+  try {
+    if (database.pragma("quick_check", { simple: true }) !== "ok") {
+      throw new Error("备份数据库完整性检查失败")
+    }
+  } finally {
+    database.close()
+  }
+}
+
+/**
+ * 为当前档案创建指定原因的完整快照。
+ *
+ * @param {"daily" | "manual" | "before-import" | "pre-restore"} reason 备份原因。
+ * @returns {Promise<Record<string, any>>} 新备份摘要。
+ */
+async function createCurrentDatabaseBackup(reason) {
+  if (!backupManager) backupManager = createCurrentBackupManager()
+  try {
+    const backup = await backupManager.createBackup(reason)
+    backupStatusTracker.recordSuccess(backup)
+    return backup
+  } catch (error) {
+    backupStatusTracker.recordFailure(error, false)
+    throw error
+  }
+}
+
+/**
+ * 确保当前档案当天已经创建自动备份。
+ *
+ * @returns {Promise<Record<string, any>>} 每日备份检查结果。
+ */
+async function ensureDailyDatabaseBackup() {
+  if (!backupManager) backupManager = createCurrentBackupManager()
+  try {
+    const result = await backupManager.ensureDailyBackup()
+    if (result.backup) backupStatusTracker.recordSuccess(result.backup)
+    return result
+  } catch (error) {
+    backupStatusTracker.recordFailure(error, true)
+    throw error
+  }
+}
+
+/**
+ * 查询当前档案的完整备份。
+ *
+ * @returns {Promise<Array<Record<string, any>>>} 按时间倒序排列的备份。
+ */
+async function listCurrentDatabaseBackups() {
+  if (!backupManager) backupManager = createCurrentBackupManager()
+  return backupManager.listBackups()
+}
+
+/**
+ * 在文件管理器中打开当前档案的备份目录。
+ *
+ * @returns {Promise<boolean>} 成功打开时返回 true。
+ */
+async function openCurrentBackupDirectory() {
+  if (!backupManager) backupManager = createCurrentBackupManager()
+  const backupDirectory = backupManager.getBackupDirectory()
+  await fs.promises.mkdir(backupDirectory, { recursive: true })
+  const errorMessage = await shell.openPath(backupDirectory)
+  if (errorMessage) throw new Error(errorMessage)
+  return true
+}
+
+/**
+ * 用指定完整快照恢复当前档案，并在失败时回滚到恢复前快照。
+ *
+ * @param {string} backupId 目标备份文件 ID。
+ * @returns {Promise<Record<string, any>>} 恢复结果。
+ */
+async function restoreCurrentDatabaseBackup(backupId) {
+  if (syncInFlight) await syncInFlight
+  if (!backupManager) backupManager = createCurrentBackupManager()
+  const currentManager = backupManager
+  const sourcePath = await currentManager.resolveBackupPath(backupId)
+  const profilePath = getBackendProfilePath(syncSettings.backendUrl, syncSettings.accountId)
+  const sourceStats = await fs.promises.stat(sourcePath)
+  const stagedSourcePath = path.join(
+    profilePath,
+    `.selected-${randomBytes(8).toString("hex")}${sourceStats.isDirectory() ? "" : ".sqlite3"}`
+  )
+  if (sourceStats.isDirectory()) {
+    await fs.promises.cp(sourcePath, stagedSourcePath, { recursive: true })
+    validateDatabaseBackup(path.join(stagedSourcePath, "notes.sqlite3"))
+  } else {
+    await fs.promises.copyFile(sourcePath, stagedSourcePath)
+    validateDatabaseBackup(stagedSourcePath)
+  }
+  let safetyBackup
+  try {
+    safetyBackup = await currentManager.createBackup("pre-restore")
+    backupStatusTracker.recordSuccess(safetyBackup)
+    const safetyBackupPath = await currentManager.resolveBackupPath(safetyBackup.id)
+    if (pendingMutationSyncTimer) clearTimeout(pendingMutationSyncTimer)
+    pendingMutationSyncTimer = null
+    syncAfterCurrent = false
+    await restoreProfileSnapshot({
+      sourcePath: stagedSourcePath,
+      safetyBackupPath,
+      profilePath,
+      closeDatabase: () => {
+        repository?.close()
+        repository = null
+      },
+      openDatabase: () => {
+        repository = openBackendRepository(syncSettings.backendUrl, syncSettings.accountId)
+        return repository
+      },
+      validateDatabase: validateDatabaseBackup
+    })
+  } finally {
+    await fs.promises.rm(stagedSourcePath, { recursive: true, force: true })
+  }
+  backupManager = createCurrentBackupManager()
+  mainWindow?.webContents.send("workspace:changed")
+  return {
+    restored: true,
+    message: "完整备份已恢复",
+    safetyBackup
+  }
 }
 
 /**
@@ -170,7 +369,7 @@ function decryptSyncToken(encryptedToken) {
 /**
  * 从本地文件读取同步设置。
  *
- * @returns {{ backendUrl: string, token: string, accountId: string, accountLabel: string }} 当前同步设置。
+ * @returns {{ backendUrl: string, webUrl: string, token: string, accountId: string, accountLabel: string }} 当前同步设置。
  */
 function loadSyncSettings() {
   try {
@@ -178,20 +377,27 @@ function loadSyncSettings() {
     const token = decryptSyncToken(String(saved.encryptedToken || ""))
     return {
       backendUrl: normalizeBackendUrl(saved.backendUrl || DEFAULT_BACKEND_URL),
+      webUrl: normalizeBackendUrl(saved.webUrl || DEFAULT_WEB_URL),
       token,
       accountId: String(saved.accountId || getAccountIdFromToken(token)),
       accountLabel: String(saved.accountLabel || "")
     }
   } catch (error) {
     if (error && error.code !== "ENOENT") console.warn("读取同步设置失败，已使用默认配置", error)
-    return { backendUrl: DEFAULT_BACKEND_URL, token: "", accountId: "", accountLabel: "" }
+    return {
+      backendUrl: DEFAULT_BACKEND_URL,
+      webUrl: DEFAULT_WEB_URL,
+      token: "",
+      accountId: "",
+      accountLabel: ""
+    }
   }
 }
 
 /**
  * 把同步设置保存到用户数据目录。
  *
- * @param {{ backendUrl: string, token: string, accountId: string, accountLabel: string }} settings 待保存设置。
+ * @param {{ backendUrl: string, webUrl: string, token: string, accountId: string, accountLabel: string }} settings 待保存设置。
  * @returns {Promise<void>} 保存完成后的 Promise。
  */
 async function persistSyncSettings(settings) {
@@ -199,6 +405,7 @@ async function persistSyncSettings(settings) {
   await fs.promises.mkdir(path.dirname(settingsFilePath), { recursive: true })
   await fs.promises.writeFile(settingsFilePath, `${JSON.stringify({
     backendUrl: settings.backendUrl,
+    webUrl: settings.webUrl,
     encryptedToken: encryptSyncToken(settings.token),
     accountId: settings.accountId,
     accountLabel: settings.accountLabel
@@ -247,7 +454,7 @@ async function promptLocalProfileTransfer(accountLabel) {
 /**
  * 保存同步配置，并在后端域名变化时切换到独立的本地数据库。
  *
- * @param {{ backendUrl: string, token: string, accountId: string, accountLabel: string }} settings 新同步配置。
+ * @param {{ backendUrl: string, webUrl: string, token: string, accountId: string, accountLabel: string }} settings 新同步配置。
  * @returns {Promise<void>} 切换完成后的 Promise。
  */
 async function activateSyncProfile(settings) {
@@ -323,6 +530,11 @@ async function activateSyncProfile(settings) {
   repository = nextRepository
   if (profileChanged) {
     previousRepository?.close()
+    backupManager = createCurrentBackupManager()
+    backupStatusTracker.reset()
+    void ensureDailyDatabaseBackup().catch((error) => {
+      console.warn("创建档案每日备份失败", error)
+    })
     if (mainWindow && !mainWindow.isDestroyed()) {
       mainWindow.webContents.send("workspace:changed")
     }
@@ -332,11 +544,12 @@ async function activateSyncProfile(settings) {
 /**
  * 返回可安全暴露给渲染进程的同步设置。
  *
- * @returns {{ backendUrl: string, configured: boolean, accountLabel: string }} 同步设置摘要。
+ * @returns {{ backendUrl: string, webUrl: string, configured: boolean, accountLabel: string }} 同步设置摘要。
  */
 function getSyncSettingsView() {
   return {
     backendUrl: syncSettings.backendUrl,
+    webUrl: syncSettings.webUrl,
     configured: Boolean(syncSettings.token),
     accountLabel: syncSettings.accountLabel
   }
@@ -366,12 +579,29 @@ async function saveImageAsset(input, shouldScheduleSync = true) {
   const mimeType = String(input?.mimeType || "").toLowerCase()
   const extension = IMAGE_EXTENSION_BY_MIME_TYPE.get(mimeType)
   if (!extension) throw new Error("仅支持 PNG、JPEG、GIF、WebP、AVIF 和 BMP 图片")
+  return saveAttachment({ ...input, mimeType, extension }, shouldScheduleSync)
+}
+
+/**
+ * 将通用附件保存到当前设备的离线资源目录。
+ *
+ * @param {{ id?: string, fileName?: string, mimeType?: string, extension?: string, data?: ArrayBuffer | Uint8Array }} input 附件数据。
+ * @param {boolean} shouldScheduleSync 是否安排云端同步。
+ * @returns {Promise<Record<string, any>>} 已保存的附件资源。
+ */
+async function saveAttachment(input, shouldScheduleSync = true) {
+  const mimeType = String(input?.mimeType || "application/octet-stream").toLowerCase()
+  const requestedExtension = String(input?.extension || path.extname(String(input?.fileName || ""))).toLowerCase()
+  const extension = /^\.[a-z0-9]{1,16}$/.test(requestedExtension) ? requestedExtension : ".bin"
   const data = input?.data
   const buffer = data instanceof ArrayBuffer
     ? Buffer.from(data)
     : ArrayBuffer.isView(data) ? Buffer.from(data.buffer, data.byteOffset, data.byteLength) : null
-  if (!buffer?.length) throw new Error("图片内容为空")
-  if (buffer.length > MAX_IMAGE_ASSET_BYTES) throw new Error("单张图片不能超过 20 MiB")
+  if (!buffer?.length) throw new Error("附件内容为空")
+  const maximumBytes = mimeType.startsWith("image/") ? MAX_IMAGE_ASSET_BYTES : MAX_ATTACHMENT_BYTES
+  if (buffer.length > maximumBytes) {
+    throw new Error(mimeType.startsWith("image/") ? "单张图片不能超过 20 MiB" : "单个附件不能超过 100 MiB")
+  }
 
   const sha256 = createHash("sha256").update(buffer).digest("hex")
   const directory = path.join(
@@ -386,9 +616,9 @@ async function saveImageAsset(input, shouldScheduleSync = true) {
   } catch (error) {
     if (error?.code !== "EEXIST") throw error
   }
-  const asset = repository.createImageAsset({
+  const asset = repository.createAsset({
     id: input?.id ? String(input.id) : undefined,
-    fileName: String(input?.fileName || `图片${extension}`).slice(0, 255),
+    fileName: String(input?.fileName || `附件${extension}`).slice(0, 255),
     mimeType,
     byteSize: buffer.length,
     sha256,
@@ -396,6 +626,38 @@ async function saveImageAsset(input, shouldScheduleSync = true) {
   })
   if (shouldScheduleSync) scheduleSync()
   return asset
+}
+
+/**
+ * 使用系统默认应用打开本地附件。
+ *
+ * @param {string} assetId 附件资源 ID。
+ * @returns {Promise<boolean>} 是否成功发起打开操作。
+ */
+async function openAttachment(assetId) {
+  const asset = repository.getAsset(String(assetId || ""))
+  if (!asset?.localPath || !fs.existsSync(asset.localPath)) throw new Error("附件不存在")
+  const errorMessage = await shell.openPath(asset.localPath)
+  if (errorMessage) throw new Error(errorMessage)
+  return true
+}
+
+/**
+ * 使用系统默认浏览器打开经过校验的外部网页链接。
+ *
+ * @param {string} rawUrl 待打开的网页地址。
+ * @returns {Promise<boolean>} 是否成功发起打开操作。
+ */
+async function openExternalLink(rawUrl) {
+  const targetUrl = new URL(String(rawUrl || ""))
+  if (!["http:", "https:"].includes(targetUrl.protocol)) throw new Error("仅支持 http 或 https 链接")
+  const notePathMatch = targetUrl.pathname.match(/^\/notes\/([^/]+)\/?$/)
+  if (targetUrl.origin === new URL(syncSettings.webUrl).origin && notePathMatch) {
+    notifyOpenNoteLink(decodeURIComponent(notePathMatch[1]))
+    return true
+  }
+  await shell.openExternal(targetUrl.toString())
+  return true
 }
 
 /**
@@ -444,6 +706,43 @@ async function cacheRemoteImages(signal) {
       cachedCount += 1
     } catch (error) {
       console.warn(`缓存笔记图片失败，将在后续同步重试：${remoteUrl}`, error)
+    }
+  }
+  return cachedCount
+}
+
+/**
+ * 下载云端笔记附件到当前设备缓存。
+ *
+ * 单个附件失败不会阻断笔记正文同步，后续同步会继续重试。
+ *
+ * @param {AbortSignal} signal 请求中止信号。
+ * @returns {Promise<number>} 成功缓存的附件数量。
+ */
+async function cacheRemoteAttachments(signal) {
+  const references = repository.listRemoteAttachmentReferencesToCache().slice(0, 10)
+  let cachedCount = 0
+  for (const reference of references) {
+    try {
+      if (reference.byteSize > MAX_ATTACHMENT_BYTES) throw new Error("附件超过 100 MiB")
+      const response = await net.fetch(reference.url, {
+        signal,
+        bypassCustomProtocolHandlers: true
+      })
+      if (!response.ok) throw new Error(`HTTP ${response.status}`)
+      const declaredSize = Number(response.headers.get("content-length") || 0)
+      if (declaredSize > MAX_ATTACHMENT_BYTES) throw new Error("附件超过 100 MiB")
+      const body = Buffer.from(await response.arrayBuffer())
+      if (body.length > MAX_ATTACHMENT_BYTES) throw new Error("附件超过 100 MiB")
+      const asset = await saveAttachment({
+        fileName: reference.fileName,
+        mimeType: reference.mimeType,
+        data: body
+      }, false)
+      repository.markAssetUploaded(asset.id, reference.url)
+      cachedCount += 1
+    } catch (error) {
+      console.warn(`缓存笔记附件失败，将在后续同步重试：${reference.url}`, error)
     }
   }
   return cachedCount
@@ -500,7 +799,7 @@ async function restoreBackupImageAssets(backup) {
   for (const asset of restoredBackup.assets || []) {
     if (!asset?.dataBase64) continue
     const body = Buffer.from(String(asset.dataBase64), "base64")
-    const restored = await saveImageAsset({
+    const restored = await saveAttachment({
       id: String(asset.id || ""),
       fileName: String(asset.fileName || "备份图片"),
       mimeType: String(asset.mimeType || ""),
@@ -547,7 +846,7 @@ async function uploadPendingImageAssets(signal) {
           web_token: syncSettings.token
         },
         body: JSON.stringify({
-          dirType: "image",
+          dirType: asset.mimeType.startsWith("image/") ? "image" : "attach",
           fileName: asset.fileName
         }),
         signal
@@ -571,9 +870,9 @@ async function uploadPendingImageAssets(signal) {
       bypassCustomProtocolHandlers: true
     })
     if (!uploadResponse.ok) {
-      throw new Error(`图片上传失败（HTTP ${uploadResponse.status}）`)
+      throw new Error(`附件上传失败（HTTP ${uploadResponse.status}）`)
     }
-    repository.markImageAssetUploaded(asset.id, remoteUrl, serverSourceId)
+    repository.markAssetUploaded(asset.id, remoteUrl, serverSourceId)
   }
   return pendingAssets.length
 }
@@ -587,9 +886,9 @@ function registerLocalAssetProtocol() {
   protocol.handle(LOCAL_ASSET_PROTOCOL, (request) => {
     const parsedUrl = new URL(request.url)
     const assetId = decodeURIComponent(parsedUrl.pathname.replace(/^\/+/, ""))
-    const asset = parsedUrl.hostname === "local" ? repository.getImageAsset(assetId) : null
+    const asset = parsedUrl.hostname === "local" ? repository.getAsset(assetId) : null
     if (!asset?.localPath || !fs.existsSync(asset.localPath)) {
-      return new Response("图片不存在", { status: 404 })
+      return new Response("附件不存在", { status: 404 })
     }
     return net.fetch(pathToFileURL(asset.localPath).toString())
   })
@@ -628,6 +927,7 @@ async function performSync() {
       })
       const applied = repository.applySyncResult(response.data || {})
       await cacheRemoteImages(controller.signal)
+      await cacheRemoteAttachments(controller.signal)
       const lastSuccessAt = new Date().toISOString()
       const message = applied.conflictCount
         ? `已同步，保留 ${applied.conflictCount} 个冲突副本`
@@ -878,6 +1178,7 @@ async function importFullBackup() {
     throw new Error("备份文件不是有效的 JSON")
   }
   const restoredBackup = await restoreBackupImageAssets(backup)
+  await createCurrentDatabaseBackup("before-import")
   const imported = applyLocalMutation(() => repository.importBackup(restoredBackup))
   mainWindow?.webContents.send("workspace:changed")
   return {
@@ -968,17 +1269,19 @@ async function testSyncConnection(input) {
 /**
  * 保存已通过连接测试的同步设置。
  *
- * @param {{ backendUrl: string }} input 待保存的设置。
- * @returns {Promise<{ backendUrl: string, configured: boolean, accountLabel: string }>} 设置摘要。
+ * @param {{ backendUrl: string, webUrl: string }} input 待保存的设置。
+ * @returns {Promise<{ backendUrl: string, webUrl: string, configured: boolean, accountLabel: string }>} 设置摘要。
  */
 async function saveSyncSettings(input) {
   const backendUrl = normalizeBackendUrl(input.backendUrl)
+  const webUrl = normalizeBackendUrl(input.webUrl || DEFAULT_WEB_URL)
   const candidate = pendingSyncConnection?.backendUrl === backendUrl
     ? pendingSyncConnection
     : syncSettings.backendUrl === backendUrl && syncSettings.token ? syncSettings : null
   if (!candidate) throw new Error("请先完成连接测试")
   const nextSettings = {
     backendUrl,
+    webUrl,
     token: candidate.token,
     accountId: candidate.accountId,
     accountLabel: candidate.accountLabel
@@ -992,11 +1295,12 @@ async function saveSyncSettings(input) {
 /**
  * 清除已保存的同步账号。
  *
- * @returns {Promise<{ backendUrl: string, configured: boolean, accountLabel: string }>} 设置摘要。
+ * @returns {Promise<{ backendUrl: string, webUrl: string, configured: boolean, accountLabel: string }>} 设置摘要。
  */
 async function clearSyncSettings() {
   const nextSettings = {
     backendUrl: syncSettings.backendUrl,
+    webUrl: syncSettings.webUrl,
     token: "",
     accountId: syncSettings.accountId,
     accountLabel: syncSettings.accountLabel
@@ -1010,20 +1314,22 @@ async function clearSyncSettings() {
 /**
  * 打开网页登录页并创建仅保存在内存中的随机授权状态。
  *
- * @param {{ backendUrl: string }} input 浏览器登录参数。
+ * @param {{ backendUrl: string, webUrl: string }} input 浏览器登录参数。
  * @returns {Promise<{ ok: boolean, message: string, backendUrl?: string }>} 启动结果。
  */
 async function startBrowserSyncLogin(input) {
   try {
     const backendUrl = normalizeBackendUrl(input.backendUrl)
+    const webUrl = normalizeBackendUrl(input.webUrl || DEFAULT_WEB_URL)
     const state = randomBytes(32).toString("base64url")
     pendingBrowserAuth = {
       backendUrl,
+      webUrl,
       state,
       expiresAt: Date.now() + 5 * 60 * 1000
     }
     pendingSyncConnection = null
-    const loginUrl = new URL("/notes", `${backendUrl}/`)
+    const loginUrl = new URL("/notes", `${webUrl}/`)
     loginUrl.searchParams.set("desktop_login", "1")
     loginUrl.searchParams.set("state", state)
     await shell.openExternal(loginUrl.toString())
@@ -1124,7 +1430,13 @@ async function handleBrowserAuthCallback(rawUrl) {
       || "已登录账号"
     )
     const accountId = getAccountIdFromUserInfo(infoResponse.data)
-    await activateSyncProfile({ backendUrl: pending.backendUrl, token, accountId, accountLabel })
+    await activateSyncProfile({
+      backendUrl: pending.backendUrl,
+      webUrl: pending.webUrl,
+      token,
+      accountId,
+      accountLabel
+    })
     notifyBrowserAuthResult({ ok: true, message: `已登录：${accountLabel}` })
     void performSync()
   } catch (error) {
@@ -1138,12 +1450,66 @@ async function handleBrowserAuthCallback(rawUrl) {
 }
 
 /**
+ * 激活应用窗口并通知渲染进程打开指定笔记。
+ *
+ * @param {string} noteId 笔记 ID。
+ * @returns {void}
+ */
+function notifyOpenNoteLink(noteId) {
+  if (!mainWindow || mainWindow.isDestroyed()) {
+    pendingNoteLinkId = noteId
+    return
+  }
+  if (mainWindow.isMinimized()) mainWindow.restore()
+  mainWindow.show()
+  mainWindow.focus()
+  mainWindow.webContents.send("note-link:open", noteId)
+}
+
+/**
+ * 分流应用深链接，笔记链接直接打开笔记，其余链接继续交给登录回调。
+ *
+ * @param {string} rawUrl 待处理的应用深链接。
+ * @returns {Promise<void>} 深链接处理完成后的 Promise。
+ */
+async function handleAppDeepLink(rawUrl) {
+  let callbackUrl
+  try {
+    callbackUrl = new URL(rawUrl)
+  } catch {
+    return
+  }
+  if (
+    callbackUrl.protocol === `${DESKTOP_AUTH_PROTOCOL}:`
+    && callbackUrl.hostname === "note"
+  ) {
+    const noteId = decodeURIComponent(callbackUrl.pathname.slice(1)).trim()
+    if (noteId) notifyOpenNoteLink(noteId)
+    return
+  }
+  await handleBrowserAuthCallback(rawUrl)
+}
+
+/**
  * 注册离线数据库 IPC 接口。
  *
  * @returns {void}
  */
 function registerIpcHandlers() {
   ipcMain.handle("workspace:list", () => repository.listWorkspace())
+  ipcMain.handle("note-link:open-local", (_event, noteId) => {
+    const normalizedNoteId = String(noteId || "").trim()
+    if (normalizedNoteId) notifyOpenNoteLink(normalizedNoteId)
+    return Boolean(normalizedNoteId)
+  })
+  ipcMain.handle("note-link:consume-pending", () => {
+    const noteId = pendingNoteLinkId
+    pendingNoteLinkId = ""
+    return noteId
+  })
+  ipcMain.handle("asset:save-attachment", (_event, input) => saveAttachment(input || {}))
+  ipcMain.handle("asset:open", (_event, assetId) => openAttachment(assetId))
+  ipcMain.handle("external-link:open", (_event, url) => openExternalLink(url))
   ipcMain.handle("asset:save-image", (_event, input) => saveImageAsset(input || {}))
   ipcMain.handle("note:create", (_event, folderId) => (
     applyLocalMutation(() => repository.createNote(folderId || null))
@@ -1194,6 +1560,13 @@ function registerIpcHandlers() {
   ipcMain.handle("data:export-backup", () => exportFullBackup())
   ipcMain.handle("data:import-markdown", (_event, folderId) => importMarkdownFiles(folderId || null))
   ipcMain.handle("data:import-backup", () => importFullBackup())
+  ipcMain.handle("database-backup:list", () => listCurrentDatabaseBackups())
+  ipcMain.handle("database-backup:status", () => backupStatusTracker.getStatus())
+  ipcMain.handle("database-backup:settings:get", () => getCurrentBackupSettings())
+  ipcMain.handle("database-backup:settings:save", (_event, input) => saveCurrentBackupSettings(input || {}))
+  ipcMain.handle("database-backup:create", () => createCurrentDatabaseBackup("manual"))
+  ipcMain.handle("database-backup:restore", (_event, backupId) => restoreCurrentDatabaseBackup(backupId))
+  ipcMain.handle("database-backup:open-directory", () => openCurrentBackupDirectory())
   ipcMain.handle("theme:set", (_event, theme) => {
     nativeTheme.themeSource = ["light", "dark"].includes(theme) ? theme : "system"
     return nativeTheme.shouldUseDarkColors
@@ -1206,6 +1579,18 @@ function registerIpcHandlers() {
   ipcMain.handle("sync-auth:cancel", () => cancelBrowserSyncLogin())
   ipcMain.handle("sync-settings:save", (_event, input) => saveSyncSettings(input || {}))
   ipcMain.handle("sync-settings:clear", () => clearSyncSettings())
+  ipcMain.handle("app-update:check", () => checkForUpdates({
+    currentVersion: app.getVersion(),
+    architecture: process.arch,
+    request: (url, options) => net.fetch(url, options)
+  }))
+  ipcMain.handle("app-update:open-download", (_event, downloadUrl) => {
+    const parsedUrl = new URL(String(downloadUrl || ""))
+    if (!["github.com", "objects.githubusercontent.com"].includes(parsedUrl.hostname)) {
+      throw new Error("更新下载地址不受信任")
+    }
+    return shell.openExternal(parsedUrl.toString())
+  })
 }
 
 /**
@@ -1224,6 +1609,10 @@ function installMenu() {
           label: "同步设置…",
           accelerator: "CmdOrCtrl+,",
           click: () => mainWindow?.webContents.send("sync-settings:open")
+        },
+        {
+          label: "检查更新…",
+          click: () => mainWindow?.webContents.send("app-update:check-request", false)
         },
         { type: "separator" },
         { role: "hide" },
@@ -1287,12 +1676,35 @@ function createWindow() {
   })
 
   browserWindow.once("ready-to-show", () => browserWindow.show())
+  browserWindow.webContents.once("did-finish-load", () => {
+    if (app.isPackaged) {
+      setTimeout(() => browserWindow.webContents.send("app-update:check-request", true), 3000)
+    }
+  })
   browserWindow.on("closed", () => {
     mainWindow = null
   })
   browserWindow.webContents.setWindowOpenHandler(({ url }) => {
     if (/^https?:\/\//i.test(url)) void shell.openExternal(url)
     return { action: "deny" }
+  })
+  browserWindow.webContents.on("will-navigate", (event, url) => {
+    let targetUrl
+    try {
+      targetUrl = new URL(url)
+    } catch {
+      event.preventDefault()
+      return
+    }
+    if (targetUrl.protocol === `${LOCAL_ASSET_PROTOCOL}:`) {
+      event.preventDefault()
+      return
+    }
+    if (!["http:", "https:"].includes(targetUrl.protocol)) return
+    event.preventDefault()
+    if (targetUrl.hostname !== "xinyue-note.local") {
+      void shell.openExternal(targetUrl.toString())
+    }
   })
 
   const devServerUrl = process.env.VITE_DEV_SERVER_URL
@@ -1321,7 +1733,7 @@ protocol.registerSchemesAsPrivileged([{
 
 app.on("open-url", (event, url) => {
   event.preventDefault()
-  void handleBrowserAuthCallback(url)
+  void handleAppDeepLink(url)
 })
 
 app.whenReady().then(() => {
@@ -1330,6 +1742,7 @@ app.whenReady().then(() => {
   const profilePath = getBackendProfilePath(syncSettings.backendUrl, syncSettings.accountId)
   const domainProfilePath = path.dirname(profilePath)
   repository = openBackendRepository(syncSettings.backendUrl, syncSettings.accountId)
+  backupManager = createCurrentBackupManager()
   repository.relocateImageAssetPaths(
     path.join(domainProfilePath, LOCAL_ASSET_DIRECTORY_NAME),
     path.join(profilePath, LOCAL_ASSET_DIRECTORY_NAME)
@@ -1338,6 +1751,11 @@ app.whenReady().then(() => {
   registerIpcHandlers()
   installMenu()
   createWindow()
+  setTimeout(() => {
+    void ensureDailyDatabaseBackup().catch((error) => {
+      console.warn("创建每日数据库备份失败", error)
+    })
+  }, 1000)
   if (syncSettings.token) {
     setTimeout(() => void performSync(), 1500)
   }
@@ -1356,6 +1774,7 @@ app.on("before-quit", () => {
   pendingMutationSyncTimer = null
   repository?.close()
   repository = null
+  backupManager = null
 })
 
 app.on("window-all-closed", () => {

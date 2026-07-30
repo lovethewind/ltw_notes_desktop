@@ -65,6 +65,7 @@ export type ThemeMode = 'system' | 'light' | 'dark'
 
 export interface SyncSettingsView {
   backendUrl: string
+  webUrl: string
   configured: boolean
   accountLabel: string
 }
@@ -88,6 +89,15 @@ export interface SyncStatus {
   lastSuccessAt: string
 }
 
+export interface UpdateCheckResult {
+  status: 'available' | 'latest' | 'unpublished'
+  currentVersion: string
+  latestVersion: string
+  title: string
+  releaseNotes: string
+  downloadUrl: string
+}
+
 export interface DataTransferResult {
   canceled: boolean
   message?: string
@@ -97,6 +107,33 @@ export interface DataTransferResult {
   importedHistories?: number
   rootFolderId?: string
   noteIds?: string[]
+}
+
+export interface DatabaseBackup {
+  id: string
+  createdAt: string
+  reason: 'daily' | 'manual' | 'before-import' | 'pre-restore'
+  size: number
+  kind: 'complete' | 'database'
+  assetCount: number
+}
+
+export interface DatabaseBackupRestoreResult {
+  restored: boolean
+  message: string
+  safetyBackup: DatabaseBackup
+}
+
+export interface DatabaseBackupStatus {
+  state: 'idle' | 'success' | 'error'
+  message: string
+  lastSuccessAt: string
+  reason: DatabaseBackup['reason'] | ''
+}
+
+export interface DatabaseBackupSettings {
+  schedule: 'daily' | 'weekly' | 'off'
+  retention: number
 }
 
 export interface SaveImageAssetInput {
@@ -119,8 +156,20 @@ export interface ImageAsset {
   updatedAt: string
 }
 
+export type SaveAttachmentInput = SaveImageAssetInput
+export type AttachmentAsset = ImageAsset
+
 export interface NotesDesktopApi {
   listWorkspace(): Promise<WorkspaceData>
+  /** 打开指定笔记。 */
+  openNoteLink(noteId: string): Promise<boolean>
+  /** 获取冷启动期间待打开的笔记 ID。 */
+  consumePendingNoteLink(): Promise<string>
+  /** 监听外部应用触发的笔记深链接。 */
+  onOpenNoteLink(callback: (noteId: string) => void): () => void
+  saveAttachment(input: SaveAttachmentInput): Promise<AttachmentAsset>
+  openAttachment(assetId: string): Promise<boolean>
+  openExternalLink(url: string): Promise<boolean>
   saveImageAsset(input: SaveImageAssetInput): Promise<ImageAsset>
   createNote(folderId: string | null): Promise<OfflineNote>
   updateNote(noteId: string, patch: NotePatch): Promise<OfflineNote | null>
@@ -142,15 +191,28 @@ export interface NotesDesktopApi {
   exportFullBackup(): Promise<DataTransferResult>
   importMarkdown(folderId: string | null): Promise<DataTransferResult>
   importFullBackup(): Promise<DataTransferResult>
+  listDatabaseBackups(): Promise<DatabaseBackup[]>
+  /** 获取当前档案的备份状态。 */
+  getDatabaseBackupStatus(): Promise<DatabaseBackupStatus>
+  getDatabaseBackupSettings(): Promise<DatabaseBackupSettings>
+  saveDatabaseBackupSettings(input: DatabaseBackupSettings): Promise<DatabaseBackupSettings>
+  createDatabaseBackup(): Promise<DatabaseBackup>
+  restoreDatabaseBackup(backupId: string): Promise<DatabaseBackupRestoreResult>
+  openDatabaseBackupDirectory(): Promise<boolean>
+  /** 监听当前档案的备份状态变化。 */
+  onDatabaseBackupStatus(callback: (status: DatabaseBackupStatus) => void): () => void
   setTheme(theme: ThemeMode): Promise<boolean>
   getSyncSettings(): Promise<SyncSettingsView>
   getSyncStatus(): Promise<SyncStatus>
   runSync(): Promise<SyncStatus>
   testSyncConnection(input: SyncConnectionInput): Promise<SyncConnectionResult>
-  startBrowserSyncLogin(input: { backendUrl: string }): Promise<SyncConnectionResult>
+  startBrowserSyncLogin(input: { backendUrl: string, webUrl: string }): Promise<SyncConnectionResult>
   cancelBrowserSyncLogin(): Promise<SyncConnectionResult>
-  saveSyncSettings(input: { backendUrl: string }): Promise<SyncSettingsView>
+  saveSyncSettings(input: { backendUrl: string, webUrl: string }): Promise<SyncSettingsView>
   clearSyncSettings(): Promise<SyncSettingsView>
+  checkForUpdates(): Promise<UpdateCheckResult>
+  openUpdateDownload(downloadUrl: string): Promise<void>
+  onCheckForUpdates(callback: (silent: boolean) => void): () => void
   onOpenSyncSettings(callback: () => void): () => void
   onSyncAuthResult(callback: (result: SyncConnectionResult) => void): () => void
   onSyncStatus(callback: (status: SyncStatus) => void): () => void

@@ -5,6 +5,7 @@ const Database = require("better-sqlite3")
 const HISTORY_INTERVAL_MS = 5 * 60 * 1000
 const MAX_NOTE_CONTENT_BYTES = 15 * 1024 * 1024
 const LOCAL_ASSET_URL_PREFIX = "xinyue-asset://local/"
+const INTERNAL_ATTACHMENT_URL_PREFIX = "https://xinyue-asset.local/"
 
 /**
  * 返回当前 ISO 时间。
@@ -252,6 +253,16 @@ function mapNote(row, tags = []) {
  * @returns {Record<string, Function>} 仓储方法。
  */
 function createRepository(database) {
+  /**
+   * 使用 SQLite 在线备份 API 创建一致性数据库快照。
+   *
+   * @param {string} targetPath 目标备份文件路径。
+   * @returns {Promise<Record<string, any>>} SQLite 备份元数据。
+   */
+  async function backupTo(targetPath) {
+    return database.backup(targetPath)
+  }
+
   const selectTagsForNote = database.prepare(`
     SELECT t.id, t.name
     FROM tags t
@@ -323,6 +334,7 @@ function createRepository(database) {
     `).all()
     for (const row of assets) {
       markdown = markdown.split(`${LOCAL_ASSET_URL_PREFIX}${row.id}`).join(row.remote_url)
+      markdown = markdown.split(`${INTERNAL_ATTACHMENT_URL_PREFIX}${row.id}`).join(row.remote_url)
     }
     return markdown
   }
@@ -335,11 +347,17 @@ function createRepository(database) {
    */
   function localizeImageAssetReferences(content) {
     let markdown = String(content || "")
-    const assets = database.prepare(`
-      SELECT * FROM note_assets WHERE remote_url IS NOT NULL ORDER BY created_at
-    `).all()
+    const assets = database.prepare("SELECT * FROM note_assets ORDER BY created_at").all()
     for (const row of assets) {
-      markdown = markdown.split(row.remote_url).join(`${LOCAL_ASSET_URL_PREFIX}${row.id}`)
+      const isImage = String(row.mime_type || "").startsWith("image/")
+      if (isImage && row.remote_url) {
+        markdown = markdown.split(row.remote_url).join(`${LOCAL_ASSET_URL_PREFIX}${row.id}`)
+        continue
+      }
+      if (isImage) continue
+      const attachmentUrl = row.remote_url || `${INTERNAL_ATTACHMENT_URL_PREFIX}${row.id}`
+      markdown = markdown.split(`${LOCAL_ASSET_URL_PREFIX}${row.id}`).join(attachmentUrl)
+      markdown = markdown.split(`${INTERNAL_ATTACHMENT_URL_PREFIX}${row.id}`).join(attachmentUrl)
     }
     return markdown
   }
@@ -368,6 +386,41 @@ function createRepository(database) {
       }
     }
     return [...urls]
+  }
+
+  /**
+   * 提取尚未缓存的 Markdown 远程附件引用。
+   *
+   * @returns {Array<{ url: string, fileName: string, mimeType: string, byteSize: number }>} 远程附件信息。
+   */
+  function listRemoteAttachmentReferencesToCache() {
+    const knownUrls = new Set(
+      database.prepare("SELECT remote_url FROM note_assets WHERE remote_url IS NOT NULL")
+        .all()
+        .map((row) => row.remote_url)
+    )
+    const references = new Map()
+    const rows = database.prepare(`
+      SELECT content FROM notes
+      UNION ALL
+      SELECT content FROM note_history
+    `).all()
+    const attachmentPattern = /\[((?:\\.|[^\\\]])+)\]\((https?:\/\/[^)\s]+)\s+["']attachment\|([^|"']*)\|(\d+)["']\)/gi
+    for (const row of rows) {
+      for (const match of String(row.content || "").matchAll(attachmentPattern)) {
+        if (knownUrls.has(match[2])) continue
+        references.set(match[2], {
+          url: match[2],
+          fileName: match[1]
+            .replaceAll("\\[", "[")
+            .replaceAll("\\]", "]")
+            .replaceAll("\\\\", "\\"),
+          mimeType: decodeURIComponent(match[3] || "application/octet-stream"),
+          byteSize: Number(match[4] || 0)
+        })
+      }
+    }
+    return [...references.values()]
   }
 
   /**
@@ -1616,6 +1669,7 @@ function createRepository(database) {
   }
 
   return {
+    backupTo,
     close: () => database.close(),
     relocateImageAssetPaths,
     listWorkspace,
@@ -1637,11 +1691,17 @@ function createRepository(database) {
     exportBackup,
     importBackup,
     importMarkdownDocuments,
+    createAsset: createImageAsset,
     createImageAsset,
+    getAsset: getImageAsset,
     getImageAsset,
+    listAssets: listImageAssets,
     listImageAssets,
+    listPendingAssets: listPendingImageAssets,
     listPendingImageAssets,
+    listRemoteAttachmentReferencesToCache,
     listRemoteImageUrlsToCache,
+    markAssetUploaded: markImageAssetUploaded,
     markImageAssetUploaded,
     getSyncBatch,
     applySyncResult

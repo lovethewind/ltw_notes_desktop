@@ -2,6 +2,24 @@ const { contextBridge, ipcRenderer } = require("electron")
 
 contextBridge.exposeInMainWorld("notesDesktop", {
   listWorkspace: () => ipcRenderer.invoke("workspace:list"),
+  /** @param {string} noteId 笔记 ID；@returns {Promise<boolean>} 是否已发起打开。 */
+  openNoteLink: (noteId) => ipcRenderer.invoke("note-link:open-local", noteId),
+  /** @returns {Promise<string>} 返回冷启动期间待打开的笔记 ID。 */
+  consumePendingNoteLink: () => ipcRenderer.invoke("note-link:consume-pending"),
+  /**
+   * 监听外部应用触发的笔记深链接。
+   *
+   * @param {(noteId: string) => void} callback 笔记 ID 回调。
+   * @returns {() => void} 取消监听函数。
+   */
+  onOpenNoteLink: (callback) => {
+    const listener = (_event, noteId) => callback(String(noteId || ""))
+    ipcRenderer.on("note-link:open", listener)
+    return () => ipcRenderer.removeListener("note-link:open", listener)
+  },
+  saveAttachment: (input) => ipcRenderer.invoke("asset:save-attachment", input),
+  openAttachment: (assetId) => ipcRenderer.invoke("asset:open", assetId),
+  openExternalLink: (url) => ipcRenderer.invoke("external-link:open", url),
   saveImageAsset: (input) => ipcRenderer.invoke("asset:save-image", input),
   createNote: (folderId) => ipcRenderer.invoke("note:create", folderId),
   updateNote: (noteId, patch) => ipcRenderer.invoke("note:update", noteId, patch),
@@ -23,6 +41,25 @@ contextBridge.exposeInMainWorld("notesDesktop", {
   exportFullBackup: () => ipcRenderer.invoke("data:export-backup"),
   importMarkdown: (folderId) => ipcRenderer.invoke("data:import-markdown", folderId),
   importFullBackup: () => ipcRenderer.invoke("data:import-backup"),
+  listDatabaseBackups: () => ipcRenderer.invoke("database-backup:list"),
+  /** @returns {Promise<Record<string, string>>} 当前档案的备份状态。 */
+  getDatabaseBackupStatus: () => ipcRenderer.invoke("database-backup:status"),
+  getDatabaseBackupSettings: () => ipcRenderer.invoke("database-backup:settings:get"),
+  saveDatabaseBackupSettings: (input) => ipcRenderer.invoke("database-backup:settings:save", input),
+  createDatabaseBackup: () => ipcRenderer.invoke("database-backup:create"),
+  restoreDatabaseBackup: (backupId) => ipcRenderer.invoke("database-backup:restore", backupId),
+  openDatabaseBackupDirectory: () => ipcRenderer.invoke("database-backup:open-directory"),
+  /**
+   * 监听备份状态变化。
+   *
+   * @param {(status: Record<string, string>) => void} callback 状态回调。
+   * @returns {() => void} 取消监听函数。
+   */
+  onDatabaseBackupStatus: (callback) => {
+    const listener = (_event, status) => callback(status)
+    ipcRenderer.on("database-backup:status", listener)
+    return () => ipcRenderer.removeListener("database-backup:status", listener)
+  },
   setTheme: (theme) => ipcRenderer.invoke("theme:set", theme),
   getSyncSettings: () => ipcRenderer.invoke("sync-settings:get"),
   getSyncStatus: () => ipcRenderer.invoke("sync:status"),
@@ -32,6 +69,13 @@ contextBridge.exposeInMainWorld("notesDesktop", {
   cancelBrowserSyncLogin: () => ipcRenderer.invoke("sync-auth:cancel"),
   saveSyncSettings: (input) => ipcRenderer.invoke("sync-settings:save", input),
   clearSyncSettings: () => ipcRenderer.invoke("sync-settings:clear"),
+  checkForUpdates: () => ipcRenderer.invoke("app-update:check"),
+  openUpdateDownload: (downloadUrl) => ipcRenderer.invoke("app-update:open-download", downloadUrl),
+  onCheckForUpdates: (callback) => {
+    const listener = (_event, silent) => callback(Boolean(silent))
+    ipcRenderer.on("app-update:check-request", listener)
+    return () => ipcRenderer.removeListener("app-update:check-request", listener)
+  },
   onOpenSyncSettings: (callback) => {
     const listener = () => callback()
     ipcRenderer.on("sync-settings:open", listener)

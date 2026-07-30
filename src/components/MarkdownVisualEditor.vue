@@ -12,6 +12,12 @@
     <Transition name="editor-feedback">
       <div v-if="feedbackText" class="editor-feedback" role="status">{{ feedbackText }}</div>
     </Transition>
+    <input
+      ref="attachmentInputRef"
+      class="attachment-file-input"
+      type="file"
+      @change="handleAttachmentSelection"
+    >
     <div ref="editorScrollRef" class="milkdown-editor-scroll" @scroll.passive="updateActiveOutline">
       <div ref="editorRootRef" class="milkdown-editor-root" />
     </div>
@@ -52,8 +58,10 @@ import { EditorView } from '@codemirror/view'
 import { Crepe } from '@milkdown/crepe'
 import { commandsCtx, editorViewCtx } from '@milkdown/kit/core'
 import { redoCommand, undoCommand } from '@milkdown/kit/plugin/history'
+import type { Node as ProseMirrorNode } from '@milkdown/kit/prose/model'
 import { paragraphSchema } from '@milkdown/kit/preset/commonmark'
 import { TextSelection } from '@milkdown/kit/prose/state'
+import { Decoration, DecorationSet } from '@milkdown/kit/prose/view'
 import { replaceAll } from '@milkdown/kit/utils'
 import { Icon } from '@iconify/vue'
 import { h, nextTick, onBeforeUnmount, onMounted, ref, render, watch } from 'vue'
@@ -98,6 +106,7 @@ const emit = defineEmits<{
 
 const editorRootRef = ref<HTMLDivElement | null>(null)
 const editorScrollRef = ref<HTMLDivElement | null>(null)
+const attachmentInputRef = ref<HTMLInputElement | null>(null)
 const contentValue = ref(props.value)
 const outlineItems = ref<MarkdownOutlineItem[]>([])
 const outlineOpen = ref(true)
@@ -116,6 +125,7 @@ let feedbackTimer: ReturnType<typeof setTimeout> | undefined
 let outlineTimer: ReturnType<typeof setTimeout> | undefined
 let suppressionTimer: ReturnType<typeof setTimeout> | undefined
 let readonlyObserver: MutationObserver | null = null
+let activeFindMatch: { from: number, to: number } | null = null
 const toolbarMenuPanels = new Map<HTMLElement, HTMLDivElement>()
 const outlineCache = new Map<string, OutlineCacheEntry>()
 const OUTLINE_STORAGE_KEY = 'markdown-outline-open'
@@ -125,6 +135,82 @@ const topBarLabels = [
   '加粗', '斜体', '删除线', '行内代码', '无序列表', '有序列表', '任务列表',
   '链接', '图片', '表格', '代码块', '公式', '引用', '分隔线'
 ]
+
+/**
+ * 为当前查找结果生成编辑器装饰。
+ *
+ * :param documentNode: ProseMirror 文档节点。
+ * :return: 当前文档对应的装饰集合。
+ */
+function createEditorDecorations(documentNode: ProseMirrorNode): DecorationSet {
+  const decorations: Decoration[] = []
+  if (activeFindMatch && activeFindMatch.to <= documentNode.content.size) {
+    decorations.push(Decoration.inline(activeFindMatch.from, activeFindMatch.to, {
+      class: 'note-find-match'
+    }))
+  }
+  return DecorationSet.create(documentNode, decorations)
+}
+
+/**
+ * 处理编辑器中的附件和普通链接点击。
+ *
+ * :param event: 鼠标点击事件。
+ * :return: 无返回值。
+ */
+function handleEditorLinkClick(event: MouseEvent): void {
+  const anchor = event.target instanceof Element
+    ? event.target.closest<HTMLAnchorElement>('a[href]')
+    : null
+  const href = anchor?.href ?? ''
+  const shouldOpenLink = previewMode.value || props.readonly || event.metaKey || event.ctrlKey
+  if (href && new URL(href).protocol === 'xinyue-notes:' && new URL(href).hostname === 'note') {
+    event.preventDefault()
+    event.stopPropagation()
+    if (event.button !== 0 || !shouldOpenLink) return
+    const noteId = decodeURIComponent(new URL(href).pathname.slice(1))
+    void window.notesDesktop.openNoteLink(noteId).catch((error: unknown) => {
+      showFeedback(error instanceof Error ? error.message : '笔记打开失败')
+    })
+    return
+  }
+  if (href && new URL(href).hostname === 'xinyue-asset.local') {
+    event.preventDefault()
+    event.stopPropagation()
+    if (event.button !== 0 || !shouldOpenLink) return
+    const attachmentId = decodeURIComponent(new URL(href).pathname.slice(1))
+    void window.notesDesktop.openAttachment(attachmentId).catch((error: unknown) => {
+      showFeedback(error instanceof Error ? error.message : '附件打开失败')
+    })
+    return
+  }
+  if (!/^https?:\/\//i.test(href)) return
+  event.preventDefault()
+  event.stopPropagation()
+  if (event.button !== 0 || !shouldOpenLink) return
+  void window.notesDesktop.openExternalLink(href).catch((error: unknown) => {
+    showFeedback(error instanceof Error ? error.message : '链接打开失败')
+  })
+}
+
+/**
+ * 根据 Command/Ctrl 状态切换链接手型光标。
+ *
+ * :param event: 键盘或鼠标事件。
+ * :return: 无返回值。
+ */
+function syncLinkModifierState(event: KeyboardEvent | MouseEvent): void {
+  document.body.classList.toggle('is-link-modifier-active', event.metaKey || event.ctrlKey)
+}
+
+/**
+ * 清除链接快捷打开的修饰键状态。
+ *
+ * :return: 无返回值。
+ */
+function clearLinkModifierState(): void {
+  document.body.classList.remove('is-link-modifier-active')
+}
 
 /**
  * 显示短暂的编辑器操作反馈。
@@ -352,6 +438,134 @@ async function uploadImage(file: File): Promise<string> {
   })
   showFeedback(asset.remoteUrl ? '图片已保存' : '图片已离线保存，联网后自动同步')
   return asset.localUrl
+}
+
+/**
+ * 保存剪贴板图片并直接插入编辑器图片节点。
+ *
+ * :param file: 剪贴板中的图片文件。
+ * :return: 完成保存和插入后的 Promise。
+ */
+async function insertPastedImage(file: File): Promise<void> {
+  if (!editor || !editorReady || props.readonly) return
+  try {
+    const src = await uploadImage(file)
+    editor.editor.action((context) => {
+      const view = context.get(editorViewCtx)
+      const imageNodeType = view.state.schema.nodes['image-block'] || view.state.schema.nodes.image
+      const imageNode = imageNodeType?.createAndFill({ src, alt: file.name })
+      if (!imageNode) throw new Error('编辑器图片能力不可用')
+      view.dispatch(view.state.tr.replaceSelectionWith(imageNode).scrollIntoView())
+      view.focus()
+    })
+  } catch (error) {
+    showFeedback(error instanceof Error ? error.message : '图片保存失败')
+  }
+}
+
+/**
+ * 打开系统附件选择器。
+ *
+ * :return: 无返回值。
+ */
+function openAttachmentPicker(): void {
+  attachmentInputRef.value?.click()
+}
+
+/**
+ * 保存用户选择的附件并插入当前光标位置。
+ *
+ * :param event: 文件选择输入事件。
+ * :return: 完成保存和插入后的 Promise。
+ */
+async function handleAttachmentSelection(event: Event): Promise<void> {
+  const input = event.currentTarget as HTMLInputElement
+  const file = input.files?.[0]
+  input.value = ''
+  if (!file || !editor || !editorReady || props.readonly) return
+  await insertAttachment(file)
+}
+
+/**
+ * 保存附件并插入当前编辑位置。
+ *
+ * :param file: 待保存的附件。
+ * :return: 完成保存和插入后的 Promise。
+ */
+async function insertAttachment(file: File): Promise<void> {
+  if (!editor || !editorReady || props.readonly) return
+  try {
+    const asset = await window.notesDesktop.saveAttachment({
+      fileName: file.name,
+      mimeType: file.type || 'application/octet-stream',
+      data: await file.arrayBuffer()
+    })
+    const internalUrl = `https://xinyue-asset.local/${encodeURIComponent(asset.id)}`
+    const attachmentTitle = `attachment|${encodeURIComponent(asset.mimeType)}|${asset.byteSize}`
+    editor.editor.action((context) => {
+      const view = context.get(editorViewCtx)
+      const { from, to } = view.state.selection
+      const linkMark = view.state.schema.marks.link
+      if (!linkMark) throw new Error('编辑器链接能力不可用')
+      const attachmentNode = view.state.schema.text(
+        asset.fileName,
+        [linkMark.create({ href: internalUrl, title: attachmentTitle })]
+      )
+      view.dispatch(view.state.tr.replaceRangeWith(from, to, attachmentNode).scrollIntoView())
+      view.focus()
+    })
+    showFeedback(asset.remoteUrl ? '附件已保存' : '附件已保存到本地，正在等待同步')
+  } catch (error) {
+    showFeedback(error instanceof Error ? error.message : '附件保存失败')
+  }
+}
+
+/**
+ * 允许非图片文件拖入编辑器。
+ *
+ * :param event: 拖拽经过事件。
+ * :return: 无返回值。
+ */
+function handleAttachmentDragOver(event: DragEvent): void {
+  const file = event.dataTransfer?.files?.[0]
+  if (!file || file.type.startsWith('image/')) return
+  event.preventDefault()
+  if (event.dataTransfer) event.dataTransfer.dropEffect = 'copy'
+}
+
+/**
+ * 将拖入的非图片文件保存为附件。
+ *
+ * :param event: 文件拖放事件。
+ * :return: 无返回值。
+ */
+function handleAttachmentDrop(event: DragEvent): void {
+  const file = event.dataTransfer?.files?.[0]
+  if (!file || file.type.startsWith('image/')) return
+  event.preventDefault()
+  event.stopPropagation()
+  void insertAttachment(file)
+}
+
+/**
+ * 将剪贴板中的非图片文件保存为附件。
+ *
+ * 图片继续交由编辑器原有的图片粘贴能力处理。
+ *
+ * :param event: 剪贴板粘贴事件。
+ * :return: 无返回值。
+ */
+function handleAttachmentPaste(event: ClipboardEvent): void {
+  const files = Array.from(event.clipboardData?.files || [])
+  if (!files.length || props.readonly) return
+  const images = files.filter((file) => file.type.startsWith('image/'))
+  const attachments = files.filter((file) => !file.type.startsWith('image/'))
+  event.preventDefault()
+  event.stopPropagation()
+  void (async () => {
+    for (const file of images) await insertPastedImage(file)
+    for (const file of attachments) await insertAttachment(file)
+  })()
 }
 
 /**
@@ -637,6 +851,7 @@ function groupTopBarActions(actions: HTMLElement): void {
   const insertMenu = createToolbarMenu({
     key: 'insert', label: '插入', icon: 'material-symbols:add-box-outline-rounded'
   }, [
+    createToolbarActionButton({ label: '附件', icon: 'tabler:paperclip', action: openAttachmentPicker }),
     ...pickButtons(['表格', '公式', '引用', '分隔线']),
     createToolbarActionButton({ label: '行内公式', icon: 'material-symbols:functions-rounded', action: toggleInlineFormula })
   ])
@@ -787,6 +1002,15 @@ async function createEditor(): Promise<void> {
     return
   }
   localizeTopBar(editorRootRef.value)
+  editorRootRef.value.addEventListener('click', handleEditorLinkClick)
+  editorRootRef.value.addEventListener('paste', handleAttachmentPaste, true)
+  editorRootRef.value.addEventListener('dragover', handleAttachmentDragOver)
+  editorRootRef.value.addEventListener('drop', handleAttachmentDrop)
+  crepe.editor.action((context) => {
+    context.get(editorViewCtx).setProps({
+      decorations: (state) => createEditorDecorations(state.doc)
+    })
+  })
   crepe.setReadonly(props.readonly)
   syncPreviewReadonly()
   editorReady = true
@@ -802,12 +1026,90 @@ async function createEditor(): Promise<void> {
  */
 function setContent(value: string, documentId: string): void {
   const documentChanged = editorDocumentId !== documentId
+  const contentChanged = editorMarkdown !== value
+  if (documentChanged) activeFindMatch = null
   contentValue.value = value
   editorDocumentId = documentId
   scheduleOutlineUpdate(value, documentId)
-  if (editor && editorReady && editorMarkdown !== value) replaceContentSilently(value, editor)
+  if (editor && editorReady && contentChanged) replaceContentSilently(value, editor)
   if (documentChanged) resetEditorScroll()
 }
+
+/**
+ * 在编辑器正文中查找并选中指定匹配项。
+ *
+ * :param keyword: 查找关键词。
+ * :param requestedIndex: 希望定位的匹配索引，可超出范围以支持循环。
+ * :return: 实际匹配数量和当前索引。
+ */
+function findText(keyword: string, requestedIndex: number): { count: number, index: number } {
+  const normalizedKeyword = keyword.trim().toLocaleLowerCase()
+  if (!editor || !editorReady) return { count: 0, index: -1 }
+  const matches: Array<{ from: number, to: number }> = []
+  editor.editor.action((context) => {
+    const view = context.get(editorViewCtx)
+    if (!normalizedKeyword) {
+      activeFindMatch = null
+      view.dispatch(view.state.tr)
+      return
+    }
+    view.state.doc.descendants((node, position) => {
+      if (!node.isText || !node.text) return
+      const normalizedText = node.text.toLocaleLowerCase()
+      let offset = normalizedText.indexOf(normalizedKeyword)
+      while (offset >= 0) {
+        matches.push({
+          from: position + offset,
+          to: position + offset + normalizedKeyword.length
+        })
+        offset = normalizedText.indexOf(normalizedKeyword, offset + normalizedKeyword.length)
+      }
+    })
+    if (!matches.length) {
+      activeFindMatch = null
+      view.dispatch(view.state.tr)
+      return
+    }
+    const index = ((requestedIndex % matches.length) + matches.length) % matches.length
+    const match = matches[index]
+    activeFindMatch = match
+    const transaction = view.state.tr
+      .setSelection(TextSelection.create(view.state.doc, match.from, match.to))
+    view.dispatch(transaction)
+    const scrollContainer = view.dom.closest<HTMLElement>('.milkdown-editor-scroll')
+    if (scrollContainer) {
+      const matchCoordinates = view.coordsAtPos(match.from)
+      const containerRect = scrollContainer.getBoundingClientRect()
+      scrollContainer.scrollTo({
+        top: scrollContainer.scrollTop
+          + matchCoordinates.top
+          - containerRect.top
+          - containerRect.height / 2,
+        behavior: 'auto'
+      })
+    }
+  })
+  if (!matches.length) return { count: 0, index: -1 }
+  return {
+    count: matches.length,
+    index: ((requestedIndex % matches.length) + matches.length) % matches.length
+  }
+}
+
+/**
+ * 清除笔记内查找高亮。
+ *
+ * :return: 无返回值。
+ */
+function clearFindHighlight(): void {
+  editor?.editor.action((context) => {
+    const view = context.get(editorViewCtx)
+    activeFindMatch = null
+    view.dispatch(view.state.tr)
+  })
+}
+
+defineExpose({ clearFindHighlight, findText })
 
 watch(
   () => [props.value, props.documentId] as const,
@@ -817,6 +1119,10 @@ watch(() => props.readonly, syncPreviewReadonly)
 onMounted(() => {
   outlineOpen.value = props.showOutline && localStorage.getItem(OUTLINE_STORAGE_KEY) !== 'false'
   scheduleOutlineUpdate(contentValue.value, editorDocumentId)
+  document.addEventListener('keydown', syncLinkModifierState)
+  document.addEventListener('keyup', syncLinkModifierState)
+  document.addEventListener('mousemove', syncLinkModifierState)
+  window.addEventListener('blur', clearLinkModifierState)
   void createEditor()
 })
 onBeforeUnmount(() => {
@@ -825,8 +1131,17 @@ onBeforeUnmount(() => {
     emit('change', latestMarkdown, editorDocumentId)
   }
   destroyed = true
+  clearLinkModifierState()
+  document.removeEventListener('keydown', syncLinkModifierState)
+  document.removeEventListener('keyup', syncLinkModifierState)
+  document.removeEventListener('mousemove', syncLinkModifierState)
+  window.removeEventListener('blur', clearLinkModifierState)
   readonlyObserver?.disconnect()
   readonlyObserver = null
+  editorRootRef.value?.removeEventListener('click', handleEditorLinkClick)
+  editorRootRef.value?.removeEventListener('paste', handleAttachmentPaste, true)
+  editorRootRef.value?.removeEventListener('dragover', handleAttachmentDragOver)
+  editorRootRef.value?.removeEventListener('drop', handleAttachmentDrop)
   document.body.classList.remove('markdown-editor-focus-mode')
   if (toolbarEventsBound) {
     document.removeEventListener('click', closeToolbarMenus)

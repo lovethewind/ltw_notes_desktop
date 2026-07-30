@@ -11,6 +11,7 @@
     "test:database": "node --test tests/database.test.cjs tests/data-transfer.test.cjs",
     "type-check": "vue-tsc -b",
     "build": "vue-tsc -b && vite build",
+    "desktop:pack:mac": "npm run build && electron-builder --mac dir --arm64",
     "desktop:build:mac": "npm run build && electron-builder --mac dmg --arm64",
     "preview": "vite preview"
   },

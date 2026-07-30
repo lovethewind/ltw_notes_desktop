@@ -1,8 +1,8 @@
 <script setup lang="ts">
 import { computed } from 'vue'
 import { Icon } from '@iconify/vue'
+import SearchExcerpt from './SearchExcerpt.vue'
 import {
-  formatNoteExcerpt as getNoteExcerpt,
   formatNoteUpdatedTime as formatTime
 } from '../utils/note-workspace'
 import type { NoteFolder, OfflineNote } from '../types'
@@ -17,6 +17,7 @@ const props = defineProps<{
   activeNoteId: string | null
   activeFolderId: string | null
   recycle?: boolean
+  searchKeyword?: string
 }>()
 
 const emit = defineEmits<{
@@ -129,6 +130,7 @@ function openNoteContext(event: MouseEvent, note: OfflineNote): void {
         :active-note-id="activeNoteId"
         :active-folder-id="activeFolderId"
         :recycle="recycle"
+        :search-keyword="searchKeyword"
         @toggle="emit('toggle', $event)"
         @select-note="emit('selectNote', $event)"
         @folder-context="forwardFolderContext"
@@ -145,7 +147,7 @@ function openNoteContext(event: MouseEvent, note: OfflineNote): void {
           <Icon :icon="note.isPinned && !recycle
             ? 'material-symbols:keep-rounded'
             : 'material-symbols:description-outline-rounded'" />
-          <span><strong>{{ note.title || '无标题笔记' }}</strong><small>{{ getNoteExcerpt(note.content) }}</small></span>
+          <span><strong>{{ note.title || '无标题笔记' }}</strong><small><SearchExcerpt :content="note.content" :keyword="searchKeyword || ''" /></small></span>
           <time>{{ formatTime(note.updatedAt) }}</time>
         </button>
       </article>

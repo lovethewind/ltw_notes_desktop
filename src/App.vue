@@ -4,13 +4,18 @@ import { Icon } from '@iconify/vue'
 import {
   formatNoteExcerpt as getNoteExcerpt,
   formatNoteUpdatedTime as formatTime,
+  matchesNoteSearch,
   NOTE_AUTOSAVE_DELAY_MS,
   type NoteNavigationKind
 } from './utils/note-workspace'
 import NoteNavigation from './components/NoteNavigation.vue'
 import FolderTreeItem from './components/FolderTreeItem.vue'
 import MarkdownVisualEditor from './components/MarkdownVisualEditor.vue'
+import SearchExcerpt from './components/SearchExcerpt.vue'
 import type {
+  DatabaseBackup,
+  DatabaseBackupStatus,
+  DatabaseBackupSettings,
   DataTransferResult,
   NoteFolder,
   NoteHistory,
@@ -21,6 +26,7 @@ import type {
   SyncSettingsView,
   SyncStatus,
   ThemeMode,
+  UpdateCheckResult,
   WorkspaceData
 } from './types'
 
@@ -62,14 +68,27 @@ const activeFilter = reactive<ActiveFilter>({ kind: 'all', id: null })
 const activeNoteId = ref<string | null>(null)
 const searchKeyword = ref('')
 const searchInput = ref<HTMLInputElement | null>(null)
+const noteFindVisible = ref(false)
+const noteFindKeyword = ref('')
+const noteFindInput = ref<HTMLInputElement | null>(null)
+const noteFindResult = reactive({ count: 0, index: -1 })
+const markdownEditorRef = ref<{
+  clearFindHighlight: () => void
+  findText: (keyword: string, requestedIndex: number) => { count: number, index: number }
+} | null>(null)
 const loading = ref(true)
 const saveState = ref<SaveState>('idle')
 const lastSavedAt = ref('')
+const linkCopyFeedback = ref('')
 const historyVisible = ref(false)
 const noteHistories = ref<NoteHistory[]>([])
 const selectedHistoryId = ref<string | null>(null)
 const historyLoading = ref(false)
 const actionError = ref('')
+const updateDialogVisible = ref(false)
+const updateChecking = ref(false)
+const updateError = ref('')
+const updateResult = ref<UpdateCheckResult | null>(null)
 const syncDialogVisible = ref(false)
 const syncTesting = ref(false)
 const syncBrowserLoginPending = ref(false)
@@ -77,16 +96,29 @@ const syncSaving = ref(false)
 const dataTransferVisible = ref(false)
 const dataTransferBusy = ref(false)
 const dataTransferMessage = ref('')
+const databaseBackupVisible = ref(false)
+const databaseBackupBusy = ref(false)
+const databaseBackupMessage = ref('')
+const databaseBackups = ref<DatabaseBackup[]>([])
+const databaseBackupStatus = reactive<DatabaseBackupStatus>({
+  state: 'idle',
+  message: '尚未创建备份',
+  lastSuccessAt: '',
+  reason: ''
+})
+const databaseBackupSettings = reactive<DatabaseBackupSettings>({ schedule: 'daily', retention: 10 })
 const markdownImportTargetVisible = ref(false)
 const markdownImportTargetFolderId = ref<string | null>(null)
 const verifiedBackendUrl = ref('')
 const syncSettings = reactive<SyncSettingsView>({
   backendUrl: 'https://lovethewind.cn',
+  webUrl: 'https://lovethewind.cn',
   configured: false,
   accountLabel: ''
 })
 const syncForm = reactive({
   backendUrl: 'https://lovethewind.cn',
+  webUrl: 'https://lovethewind.cn',
   username: '',
   password: ''
 })
@@ -157,8 +189,13 @@ let saveTimer: ReturnType<typeof setTimeout> | undefined
 let draftReady = false
 let draftVersion = 0
 let pendingRemoteRefresh = false
+let initialWorkspaceLoad: Promise<void> | null = null
 let confirmationResolver: ((confirmed: boolean) => void) | null = null
+let linkCopyFeedbackTimer: ReturnType<typeof setTimeout> | null = null
 let disposeOpenSyncSettings: (() => void) | null = null
+let disposeOpenNoteLink: (() => void) | null = null
+let disposeCheckForUpdates: (() => void) | null = null
+let disposeDatabaseBackupStatus: (() => void) | null = null
 let disposeSyncAuthResult: (() => void) | null = null
 let disposeSyncStatus: (() => void) | null = null
 let disposeWorkspaceChanged: (() => void) | null = null
@@ -195,8 +232,12 @@ const visibleNotes = computed(() => {
     if (activeFilter.kind === 'pinned' && !note.isPinned) return false
     if (activeFilter.kind === 'folder' && note.folderId !== activeFilter.id) return false
     if (activeFilter.kind === 'tag' && !note.tags.some((tag) => tag.id === activeFilter.id)) return false
-    if (keyword && !note.title.toLocaleLowerCase().includes(keyword)) return false
+    if (!matchesNoteSearch(note, keyword)) return false
     return true
+  }).sort((left, right) => {
+    if (!keyword) return 0
+    return Number(right.title.toLocaleLowerCase().includes(keyword))
+      - Number(left.title.toLocaleLowerCase().includes(keyword))
   })
 })
 const explorerNotes = computed(() => {
@@ -204,10 +245,46 @@ const explorerNotes = computed(() => {
   return workspace.notes.filter((note) => {
     if (note.isDeleted) return false
     if (activeFilter.kind === 'tag' && !note.tags.some((tag) => tag.id === activeFilter.id)) return false
-    return !keyword || note.title.toLocaleLowerCase().includes(keyword)
+    return matchesNoteSearch(note, keyword)
+  }).sort((left, right) => {
+    if (!keyword) return 0
+    return Number(right.title.toLocaleLowerCase().includes(keyword))
+      - Number(left.title.toLocaleLowerCase().includes(keyword))
   })
 })
-const rootFolders = computed(() => workspace.folders.filter((folder) => !folder.isDeleted && folder.parentId === null))
+const searchFolderIds = computed(() => {
+  if (!searchKeyword.value.trim()) return null
+  const folderById = new Map(workspace.folders.map((folder) => [folder.id, folder]))
+  const visibleIds = new Set<string>()
+  for (const note of explorerNotes.value) {
+    let folderId = note.folderId
+    const visited = new Set<string>()
+    while (folderId && !visited.has(folderId)) {
+      visited.add(folderId)
+      const folder = folderById.get(folderId)
+      if (!folder || folder.isDeleted) break
+      visibleIds.add(folder.id)
+      folderId = folder.parentId
+    }
+  }
+  return visibleIds
+})
+const explorerFolders = computed(() => (
+  searchFolderIds.value
+    ? workspace.folders.filter((folder) => searchFolderIds.value?.has(folder.id))
+    : workspace.folders
+))
+const explorerExpandedFolderIds = computed(() => (
+  searchFolderIds.value
+    ? new Set([...expandedFolderIds.value, ...searchFolderIds.value])
+    : expandedFolderIds.value
+))
+const explorerUnclassifiedExpanded = computed(() => (
+  searchFolderIds.value ? true : unclassifiedExpanded.value
+))
+const rootFolders = computed(() => explorerFolders.value.filter((folder) => (
+  !folder.isDeleted && folder.parentId === null
+)))
 const folderOptions = computed(() => {
   const options: Array<{ id: string, name: string, label: string, depth: number }> = []
   const visited = new Set<string>()
@@ -287,6 +364,43 @@ const canSaveSyncSettings = computed(() => {
     && !syncForm.password
   return !syncSaving.value && (usingSavedConnection || backendUrl === verifiedBackendUrl.value)
 })
+
+/**
+ * 检查 GitHub Releases 中是否存在新版本。
+ *
+ * :param silent: 已是最新版或检查失败时是否静默。
+ * :return: 检查完成后的 Promise。
+ */
+async function runUpdateCheck(silent = false): Promise<void> {
+  if (updateChecking.value) return
+  updateChecking.value = true
+  updateError.value = ''
+  if (!silent) updateDialogVisible.value = true
+  try {
+    updateResult.value = await window.notesDesktop.checkForUpdates()
+    if (updateResult.value.status === 'available') updateDialogVisible.value = true
+  } catch (error) {
+    updateError.value = error instanceof Error ? error.message : '检查更新失败'
+    if (!silent) updateDialogVisible.value = true
+  } finally {
+    updateChecking.value = false
+  }
+}
+
+/**
+ * 使用系统浏览器打开新版本下载地址。
+ *
+ * :return: 打开完成后的 Promise。
+ */
+async function openUpdateDownload(): Promise<void> {
+  if (!updateResult.value?.downloadUrl) return
+  try {
+    await window.notesDesktop.openUpdateDownload(updateResult.value.downloadUrl)
+    updateDialogVisible.value = false
+  } catch (error) {
+    updateError.value = error instanceof Error ? error.message : '无法打开下载地址'
+  }
+}
 
 /**
  * 将工作区响应覆盖到响应式状态。
@@ -382,6 +496,165 @@ function openDataTransfer(): void {
   dataTransferMessage.value = ''
   markdownImportTargetVisible.value = false
   dataTransferVisible.value = true
+}
+
+/**
+ * 格式化数据库备份的本地时间。
+ *
+ * :param value: ISO 备份时间。
+ * :return: 本地日期时间文本。
+ */
+function formatDatabaseBackupTime(value: string): string {
+  return new Intl.DateTimeFormat('zh-CN', {
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit'
+  }).format(new Date(value))
+}
+
+/**
+ * 格式化数据库备份文件大小。
+ *
+ * :param size: 文件字节数。
+ * :return: 易读的文件大小文本。
+ */
+function formatDatabaseBackupSize(size: number): string {
+  if (size < 1024 * 1024) return `${Math.max(1, Math.round(size / 1024))} KB`
+  return `${(size / 1024 / 1024).toFixed(1)} MB`
+}
+
+/**
+ * 返回数据库备份原因对应的界面标签。
+ *
+ * :param reason: 备份原因。
+ * :return: 中文原因标签。
+ */
+function getDatabaseBackupReasonLabel(reason: DatabaseBackup['reason']): string {
+  return {
+    daily: '每日自动',
+    manual: '手动创建',
+    'before-import': '导入前保护',
+    'pre-restore': '恢复前保护'
+  }[reason]
+}
+
+/**
+ * 刷新当前档案的完整备份列表。
+ *
+ * :return: 加载完成后的 Promise。
+ */
+async function loadDatabaseBackups(): Promise<void> {
+  const [backups, settings] = await Promise.all([
+    window.notesDesktop.listDatabaseBackups(),
+    window.notesDesktop.getDatabaseBackupSettings()
+  ])
+  databaseBackups.value = backups
+  Object.assign(databaseBackupSettings, settings)
+}
+
+/**
+ * 保存当前档案的自动备份策略。
+ *
+ * :return: 保存完成后的 Promise。
+ */
+async function saveDatabaseBackupPolicy(): Promise<void> {
+  databaseBackupBusy.value = true
+  try {
+    const settings = await window.notesDesktop.saveDatabaseBackupSettings({
+      schedule: databaseBackupSettings.schedule,
+      retention: databaseBackupSettings.retention
+    })
+    Object.assign(databaseBackupSettings, settings)
+    await loadDatabaseBackups()
+    databaseBackupMessage.value = '自动备份策略已保存'
+  } catch (error) {
+    databaseBackupMessage.value = error instanceof Error ? error.message : '备份策略保存失败'
+  } finally {
+    databaseBackupBusy.value = false
+  }
+}
+
+/**
+ * 打开完整自动备份管理窗口。
+ *
+ * :return: 打开完成后的 Promise。
+ */
+async function openDatabaseBackupManager(): Promise<void> {
+  dataTransferVisible.value = false
+  databaseBackupVisible.value = true
+  databaseBackupBusy.value = true
+  databaseBackupMessage.value = ''
+  try {
+    await loadDatabaseBackups()
+  } catch (error) {
+    databaseBackupMessage.value = error instanceof Error ? error.message : '备份列表加载失败'
+  } finally {
+    databaseBackupBusy.value = false
+  }
+}
+
+/**
+ * 立即创建当前档案的完整备份。
+ *
+ * :return: 创建完成后的 Promise。
+ */
+async function createDatabaseBackup(): Promise<void> {
+  if (databaseBackupBusy.value) return
+  databaseBackupBusy.value = true
+  databaseBackupMessage.value = ''
+  try {
+    await flushSave()
+    await window.notesDesktop.createDatabaseBackup()
+    await loadDatabaseBackups()
+    databaseBackupMessage.value = '当前数据库和附件已安全备份'
+  } catch (error) {
+    databaseBackupMessage.value = error instanceof Error ? error.message : '完整备份失败'
+  } finally {
+    databaseBackupBusy.value = false
+  }
+}
+
+/**
+ * 恢复指定完整备份。
+ *
+ * :param backup: 待恢复的备份摘要。
+ * :return: 恢复完成后的 Promise。
+ */
+async function restoreDatabaseBackup(backup: DatabaseBackup): Promise<void> {
+  const confirmed = await requestConfirmation(
+    '恢复完整备份？',
+    `将恢复到 ${formatDatabaseBackupTime(backup.createdAt)} 的状态。当前数据库和附件会先自动创建一份“恢复前保护”快照。`,
+    '确认恢复'
+  )
+  if (!confirmed) return
+  databaseBackupBusy.value = true
+  databaseBackupMessage.value = ''
+  try {
+    await flushSave()
+    const result = await window.notesDesktop.restoreDatabaseBackup(backup.id)
+    await refreshWorkspace()
+    await loadDatabaseBackups()
+    databaseBackupMessage.value = `${result.message}，恢复前状态也已保留`
+  } catch (error) {
+    databaseBackupMessage.value = error instanceof Error ? error.message : '完整备份恢复失败'
+  } finally {
+    databaseBackupBusy.value = false
+  }
+}
+
+/**
+ * 在 Finder 中打开当前档案的备份目录。
+ *
+ * :return: 打开完成后的 Promise。
+ */
+async function openDatabaseBackupDirectory(): Promise<void> {
+  try {
+    await window.notesDesktop.openDatabaseBackupDirectory()
+  } catch (error) {
+    databaseBackupMessage.value = error instanceof Error ? error.message : '无法打开备份目录'
+  }
 }
 
 /**
@@ -489,6 +762,7 @@ async function importCompleteBackup(): Promise<void> {
  */
 function applySyncSettings(settings: SyncSettingsView): void {
   syncSettings.backendUrl = settings.backendUrl
+  syncSettings.webUrl = settings.webUrl
   syncSettings.configured = settings.configured
   syncSettings.accountLabel = settings.accountLabel
 }
@@ -514,6 +788,7 @@ async function loadSyncSettings(): Promise<void> {
 async function openSyncSettings(): Promise<void> {
   await loadSyncSettings()
   syncForm.backendUrl = syncSettings.backendUrl
+  syncForm.webUrl = syncSettings.webUrl
   syncForm.username = ''
   syncForm.password = ''
   verifiedBackendUrl.value = ''
@@ -566,7 +841,8 @@ async function startBrowserSyncLogin(): Promise<void> {
   syncConnectionResult.message = '正在打开浏览器登录页…'
   try {
     const result = await window.notesDesktop.startBrowserSyncLogin({
-      backendUrl: syncForm.backendUrl
+      backendUrl: syncForm.backendUrl,
+      webUrl: syncForm.webUrl
     })
     syncConnectionResult.ok = result.ok
     syncConnectionResult.message = result.message
@@ -635,7 +911,10 @@ async function saveSyncSettings(): Promise<void> {
   if (!canSaveSyncSettings.value || syncSaving.value) return
   syncSaving.value = true
   try {
-    applySyncSettings(await window.notesDesktop.saveSyncSettings({ backendUrl: syncForm.backendUrl }))
+    applySyncSettings(await window.notesDesktop.saveSyncSettings({
+      backendUrl: syncForm.backendUrl,
+      webUrl: syncForm.webUrl
+    }))
     syncDialogVisible.value = false
     syncForm.password = ''
     verifiedBackendUrl.value = ''
@@ -1309,7 +1588,7 @@ function openNoteContextMenu(event: MouseEvent, note: OfflineNote): void {
   contextMenu.note = note
   contextMenu.tag = null
   contextMenu.x = Math.max(12, Math.min(event.clientX, window.innerWidth - 216))
-  contextMenu.y = Math.max(64, Math.min(event.clientY, window.innerHeight - 142))
+  contextMenu.y = Math.max(64, Math.min(event.clientY, window.innerHeight - 190))
   contextMenu.visible = true
 }
 
@@ -1384,14 +1663,100 @@ async function handleFolderContextCommand(
  * :param command: 笔记命令。
  * :return: 命令完成后的 Promise。
  */
-async function handleNoteContextCommand(command: 'pin' | 'trash' | 'restore' | 'delete'): Promise<void> {
+async function handleNoteContextCommand(
+  command: 'copy-link' | 'pin' | 'trash' | 'restore' | 'delete'
+): Promise<void> {
   const note = contextMenu.note
   closeContextMenu()
   if (!note) return
+  if (command === 'copy-link') await copyNoteLink(note)
   if (command === 'pin') await setNotePinned(note, !note.isPinned)
   if (command === 'trash') await setNoteDeleted(note, true)
   if (command === 'restore') await setNoteDeleted(note, false)
   if (command === 'delete') await deleteNotePermanently(note)
+}
+
+/**
+ * 在页面顶部显示短暂的复制结果提示。
+ *
+ * :param message: 待显示的提示内容。
+ * :return: 无返回值。
+ */
+function showLinkCopyFeedback(message: string): void {
+  linkCopyFeedback.value = message
+  if (linkCopyFeedbackTimer) clearTimeout(linkCopyFeedbackTimer)
+  linkCopyFeedbackTimer = setTimeout(() => {
+    linkCopyFeedback.value = ''
+    linkCopyFeedbackTimer = null
+  }, 1800)
+}
+
+/**
+ * 将可唤起应用的当前笔记深链接复制到剪贴板。
+ *
+ * :param note: 待复制链接的笔记。
+ * :return: 复制完成后的 Promise。
+ */
+async function copyNoteLink(note: OfflineNote): Promise<void> {
+  let serverId = note.serverId
+  if (!serverId && syncSettings.configured) {
+    const status = await window.notesDesktop.runSync()
+    if (status.state !== 'error') {
+      const refreshedWorkspace = await window.notesDesktop.listWorkspace()
+      serverId = refreshedWorkspace.notes.find((item) => item.id === note.id)?.serverId ?? null
+    }
+  }
+  if (!serverId) {
+    actionError.value = syncSettings.configured
+      ? '笔记尚未同步到服务器，请稍后重试'
+      : '请先连接同步账号，再复制网页版笔记链接'
+    return
+  }
+  const noteLink = new URL(
+    `/notes/${encodeURIComponent(serverId)}`,
+    syncSettings.webUrl
+  ).toString()
+  const noteTitle = note.title.trim() || '无标题笔记'
+  const markdownLink = `[${noteTitle}](${noteLink})`
+  const anchor = document.createElement('a')
+  anchor.href = noteLink
+  anchor.textContent = noteTitle
+  try {
+    if (typeof ClipboardItem === 'undefined' || !navigator.clipboard.write) {
+      await navigator.clipboard.writeText(markdownLink)
+    } else {
+      await navigator.clipboard.write([
+        new ClipboardItem({
+          'text/html': new Blob([anchor.outerHTML], { type: 'text/html' }),
+          'text/plain': new Blob([markdownLink], { type: 'text/plain' })
+        })
+      ])
+    }
+    showLinkCopyFeedback('笔记链接已复制')
+  } catch {
+    showLinkCopyFeedback('复制失败，请检查剪贴板权限')
+  }
+}
+
+/**
+ * 根据外部深链接定位并打开本地笔记。
+ *
+ * :param noteId: 待打开的笔记 ID。
+ * :return: 定位完成后的 Promise。
+ */
+async function openNoteFromLink(noteId: string): Promise<void> {
+  if (!noteId) return
+  if (initialWorkspaceLoad) await initialWorkspaceLoad
+  const note = workspace.notes.find(
+    (item) => (item.id === noteId || item.serverId === noteId) && !item.isDeleted
+  )
+  if (!note) {
+    actionError.value = '链接对应的笔记不存在，或已被删除'
+    return
+  }
+  searchKeyword.value = ''
+  setFilter('all')
+  await selectNote(note)
 }
 
 /**
@@ -1509,6 +1874,10 @@ async function removeTag(tag: NoteTag): Promise<void> {
  */
 function handleShortcut(event: KeyboardEvent): void {
   if (event.key === 'Escape') {
+    if (noteFindVisible.value) {
+      closeCurrentNoteFind()
+      return
+    }
     if (confirmationDialog.visible) resolveConfirmation(false)
     syncDialogVisible.value = false
     createMenuVisible.value = false
@@ -1529,6 +1898,51 @@ function handleShortcut(event: KeyboardEvent): void {
     event.preventDefault()
     searchInput.value?.focus()
   }
+  if (event.key.toLocaleLowerCase() === 'f' && activeNote.value) {
+    event.preventDefault()
+    noteFindVisible.value = true
+    void nextTick(() => {
+      noteFindInput.value?.focus()
+      noteFindInput.value?.select()
+    })
+  }
+}
+
+/**
+ * 在当前笔记中定位相邻匹配项。
+ *
+ * :param direction: 1 表示下一个，-1 表示上一个。
+ * :return: 无返回值。
+ */
+function findInCurrentNote(direction: 1 | -1 = 1): void {
+  const requestedIndex = noteFindResult.index < 0
+    ? direction > 0 ? 0 : -1
+    : noteFindResult.index + direction
+  Object.assign(
+    noteFindResult,
+    markdownEditorRef.value?.findText(noteFindKeyword.value, requestedIndex)
+      ?? { count: 0, index: -1 }
+  )
+}
+
+/**
+ * 处理笔记内查找输入变化。
+ *
+ * :return: 无返回值。
+ */
+function refreshCurrentNoteFind(): void {
+  noteFindResult.index = -1
+  findInCurrentNote(1)
+}
+
+/**
+ * 关闭当前笔记查找并清除匹配高亮。
+ *
+ * :return: 无返回值。
+ */
+function closeCurrentNoteFind(): void {
+  noteFindVisible.value = false
+  markdownEditorRef.value?.clearFindHighlight()
 }
 
 /**
@@ -1583,6 +1997,11 @@ function hideButtonTooltip(event?: PointerEvent | FocusEvent | Event): void {
 }
 
 watch(draft, scheduleSave, { deep: true })
+watch(activeNoteId, () => {
+  closeCurrentNoteFind()
+  noteFindKeyword.value = ''
+  Object.assign(noteFindResult, { count: 0, index: -1 })
+})
 onMounted(() => {
   window.addEventListener('keydown', handleShortcut)
   systemThemeMedia.addEventListener('change', handleSystemThemeChange)
@@ -1593,13 +2012,27 @@ onMounted(() => {
   window.addEventListener('resize', hideButtonTooltip)
   window.addEventListener('scroll', hideButtonTooltip, true)
   disposeOpenSyncSettings = window.notesDesktop.onOpenSyncSettings(() => void openSyncSettings())
+  disposeOpenNoteLink = window.notesDesktop.onOpenNoteLink((noteId) => void openNoteFromLink(noteId))
+  disposeCheckForUpdates = window.notesDesktop.onCheckForUpdates((silent) => void runUpdateCheck(silent))
+  disposeDatabaseBackupStatus = window.notesDesktop.onDatabaseBackupStatus((status) => {
+    Object.assign(databaseBackupStatus, status)
+  })
   disposeSyncAuthResult = window.notesDesktop.onSyncAuthResult((result) => void handleSyncAuthResult(result))
   disposeSyncStatus = window.notesDesktop.onSyncStatus((status) => Object.assign(syncStatus, status))
   disposeWorkspaceChanged = window.notesDesktop.onWorkspaceChanged(() => void refreshWorkspace())
   void window.notesDesktop.setTheme(themeMode.value)
   void loadSyncSettings()
   void window.notesDesktop.getSyncStatus().then((status) => Object.assign(syncStatus, status))
-  void loadWorkspace()
+  void window.notesDesktop.getDatabaseBackupStatus().then((status) => {
+    Object.assign(databaseBackupStatus, status)
+  })
+  initialWorkspaceLoad = loadWorkspace()
+  void initialWorkspaceLoad
+    .then(() => window.notesDesktop.consumePendingNoteLink())
+    .then((noteId) => openNoteFromLink(noteId))
+    .finally(() => {
+      initialWorkspaceLoad = null
+    })
 })
 onBeforeUnmount(() => {
   window.removeEventListener('keydown', handleShortcut)
@@ -1612,6 +2045,12 @@ onBeforeUnmount(() => {
   window.removeEventListener('scroll', hideButtonTooltip, true)
   disposeOpenSyncSettings?.()
   disposeOpenSyncSettings = null
+  disposeOpenNoteLink?.()
+  disposeOpenNoteLink = null
+  disposeCheckForUpdates?.()
+  disposeCheckForUpdates = null
+  disposeDatabaseBackupStatus?.()
+  disposeDatabaseBackupStatus = null
   disposeSyncAuthResult?.()
   disposeSyncAuthResult = null
   disposeSyncStatus?.()
@@ -1622,6 +2061,7 @@ onBeforeUnmount(() => {
     clearTimeout(syncBrowserLoginTimer)
     syncBrowserLoginTimer = null
   }
+  if (linkCopyFeedbackTimer) clearTimeout(linkCopyFeedbackTimer)
   if (confirmationResolver) resolveConfirmation(false)
   if (saveTimer) clearTimeout(saveTimer)
   void saveDraft()
@@ -1630,6 +2070,9 @@ onBeforeUnmount(() => {
 
 <template>
   <div class="desktop-shell" @click="createMenuVisible = false; closeContextMenu(); closePropertyPickers()">
+    <Transition name="editor-feedback">
+      <div v-if="linkCopyFeedback" class="editor-feedback">{{ linkCopyFeedback }}</div>
+    </Transition>
     <header class="titlebar">
       <div class="titlebar-brand"><span class="brand-dot"></span>心悦笔记</div>
       <div class="titlebar-actions">
@@ -1683,6 +2126,10 @@ onBeforeUnmount(() => {
       <Icon icon="tabler:alert-circle" />{{ actionError }}
       <button type="button" @click="actionError = ''">关闭</button>
     </div>
+    <div v-if="databaseBackupStatus.state === 'error'" class="error-banner backup-error-banner" role="alert">
+      <Icon icon="tabler:database-exclamation" />{{ databaseBackupStatus.message }}
+      <button type="button" @click="openDatabaseBackupManager">查看备份</button>
+    </div>
 
     <main class="workspace">
       <aside class="navigation-panel">
@@ -1715,7 +2162,7 @@ onBeforeUnmount(() => {
 
           <label class="search-box sidebar-search">
             <Icon icon="tabler:search" />
-            <input ref="searchInput" v-model="searchKeyword" type="search" placeholder="搜索笔记" />
+            <input ref="searchInput" v-model="searchKeyword" type="search" placeholder="搜索标题和正文" />
             <kbd>⌘ K</kbd>
           </label>
         </div>
@@ -1740,17 +2187,17 @@ onBeforeUnmount(() => {
           </div>
           <div class="nav-scroll-list">
             <div v-if="loading" class="sidebar-placeholder">正在读取本地数据库…</div>
-            <div class="nav-resource-group unclassified-group">
+            <div v-if="!searchKeyword.trim() || getUnclassifiedNotes().length" class="nav-resource-group unclassified-group">
               <div
                 :class="['nav-resource', { 'is-empty': !getUnclassifiedNotes().length }]"
                 @contextmenu.prevent="openUnclassifiedContextMenu"
               >
-                <button :class="{ active: activeNote?.folderId === null }" type="button" :aria-expanded="getUnclassifiedNotes().length ? unclassifiedExpanded : undefined" @click="getUnclassifiedNotes().length && (unclassifiedExpanded = !unclassifiedExpanded)">
-                  <Icon v-if="getUnclassifiedNotes().length" class="resource-chevron" :icon="unclassifiedExpanded ? 'tabler:chevron-down' : 'tabler:chevron-right'" />
+                <button :class="{ active: activeNote?.folderId === null }" type="button" :aria-expanded="getUnclassifiedNotes().length ? explorerUnclassifiedExpanded : undefined" @click="getUnclassifiedNotes().length && (unclassifiedExpanded = !unclassifiedExpanded)">
+                  <Icon v-if="getUnclassifiedNotes().length" class="resource-chevron" :icon="explorerUnclassifiedExpanded ? 'tabler:chevron-down' : 'tabler:chevron-right'" />
                   <Icon icon="tabler:folder-question" /><span>未分类</span><small>{{ getUnclassifiedNotes().length }}</small>
                 </button>
               </div>
-              <div v-if="getUnclassifiedNotes().length && unclassifiedExpanded" class="folder-children">
+              <div v-if="getUnclassifiedNotes().length && explorerUnclassifiedExpanded" class="folder-children">
                 <article
                   v-for="note in getUnclassifiedNotes()"
                   :key="note.id"
@@ -1761,7 +2208,7 @@ onBeforeUnmount(() => {
                     <Icon :icon="note.isPinned
                       ? 'material-symbols:keep-rounded'
                       : 'material-symbols:description-outline-rounded'" />
-                    <span><strong>{{ note.title || '无标题笔记' }}</strong><small>{{ getNoteExcerpt(note.content) }}</small></span>
+                    <span><strong>{{ note.title || '无标题笔记' }}</strong><small><SearchExcerpt :content="note.content" :keyword="searchKeyword" /></small></span>
                     <time>{{ formatTime(note.updatedAt) }}</time>
                   </button>
                 </article>
@@ -1772,17 +2219,19 @@ onBeforeUnmount(() => {
               v-for="folder in rootFolders"
               :key="folder.id"
               :folder="folder"
-              :folders="workspace.folders"
+              :folders="explorerFolders"
               :notes="explorerNotes"
-              :expanded-folder-ids="expandedFolderIds"
+              :expanded-folder-ids="explorerExpandedFolderIds"
               :active-note-id="activeNoteId"
               :active-folder-id="activeNote?.folderId ?? null"
+              :search-keyword="searchKeyword"
               @toggle="toggleFolder"
               @select-note="selectNote"
               @folder-context="openFolderContextMenu"
               @note-context="openNoteContextMenu"
             />
-            <p v-if="!workspace.folders.length" class="nav-empty">还没有文件夹</p>
+            <p v-if="searchKeyword.trim() && !rootFolders.length && !getUnclassifiedNotes().length" class="nav-empty">没有找到匹配笔记</p>
+            <p v-else-if="!workspace.folders.length" class="nav-empty">还没有文件夹</p>
           </div>
         </section>
 
@@ -1889,7 +2338,7 @@ onBeforeUnmount(() => {
                 <Icon :icon="note.isPinned ? 'tabler:pinned-filled' : 'tabler:file-text'" />
                 <span>
                   <strong>{{ note.title || '无标题笔记' }}</strong>
-                  <small>{{ getNoteExcerpt(note.content) }}</small>
+                  <small><SearchExcerpt :content="note.content" :keyword="searchKeyword" /></small>
                 </span>
                 <time>{{ formatTime(note.updatedAt) }}</time>
               </button>
@@ -2011,7 +2460,23 @@ onBeforeUnmount(() => {
           </div>
 
           <div class="editor-body">
+            <div v-if="noteFindVisible" class="note-find-bar">
+              <Icon icon="tabler:search" />
+              <input
+                ref="noteFindInput"
+                v-model="noteFindKeyword"
+                type="search"
+                placeholder="在当前笔记中查找"
+                @input="refreshCurrentNoteFind"
+                @keydown.enter.prevent="findInCurrentNote($event.shiftKey ? -1 : 1)"
+              />
+              <span>{{ noteFindResult.count ? `${noteFindResult.index + 1}/${noteFindResult.count}` : '0/0' }}</span>
+              <button type="button" aria-label="上一个匹配" @click="findInCurrentNote(-1)"><Icon icon="tabler:chevron-up" /></button>
+              <button type="button" aria-label="下一个匹配" @click="findInCurrentNote(1)"><Icon icon="tabler:chevron-down" /></button>
+              <button type="button" aria-label="关闭查找" @click="closeCurrentNoteFind"><Icon icon="tabler:x" /></button>
+            </div>
             <MarkdownVisualEditor
+              ref="markdownEditorRef"
               :document-id="activeNote.id"
               :value="draft.content"
               @change="updateDraftContent"
@@ -2070,6 +2535,9 @@ onBeforeUnmount(() => {
         </button>
       </template>
       <template v-else-if="contextMenu.note && !contextMenu.note.isDeleted">
+        <button type="button" role="menuitem" @click="handleNoteContextCommand('copy-link')">
+          <Icon icon="material-symbols:link-rounded" /><span>复制链接</span>
+        </button>
         <button type="button" role="menuitem" @click="handleNoteContextCommand('pin')">
           <Icon :icon="contextMenu.note.isPinned ? 'material-symbols:keep-off-outline-rounded' : 'material-symbols:keep-outline-rounded'" />
           <span>{{ contextMenu.note.isPinned ? '取消置顶' : '置顶' }}</span>
@@ -2119,6 +2587,10 @@ onBeforeUnmount(() => {
           <label>
             <span>后端地址</span>
             <input v-model="syncForm.backendUrl" type="url" autocomplete="url" placeholder="https://lovethewind.cn" />
+          </label>
+          <label>
+            <span>网页地址</span>
+            <input v-model="syncForm.webUrl" type="url" autocomplete="url" placeholder="https://lovethewind.cn" />
           </label>
           <div class="browser-login-actions">
             <button
@@ -2197,12 +2669,77 @@ onBeforeUnmount(() => {
             <Icon icon="tabler:database-export" />
             <span><strong>创建完整备份</strong><small>包含标签、回收站和历史版本</small></span>
           </button>
+          <button type="button" :disabled="dataTransferBusy" @click="openDatabaseBackupManager">
+            <Icon icon="tabler:database-cog" />
+            <span><strong>自动备份管理</strong><small>查看、创建和恢复数据库与附件快照</small></span>
+          </button>
         </div>
         <p v-if="dataTransferMessage" class="data-transfer-message">{{ dataTransferMessage }}</p>
         <div class="data-transfer-actions">
           <button type="button" :disabled="dataTransferBusy" @click="dataTransferVisible = false">
             {{ dataTransferBusy ? '处理中…' : '关闭' }}
           </button>
+        </div>
+      </section>
+    </div>
+
+    <div v-if="databaseBackupVisible" class="dialog-backdrop" @click.self="!databaseBackupBusy && (databaseBackupVisible = false)">
+      <section class="folder-dialog database-backup-dialog" role="dialog" aria-modal="true" aria-label="自动备份管理">
+        <div class="dialog-icon"><Icon icon="tabler:database-heart" /></div>
+        <h2>自动备份管理</h2>
+        <p>每个域名和用户档案独立备份，每天自动保存一次 SQLite 与附件，最多保留最近 10 份。</p>
+        <div :class="['database-backup-status', databaseBackupStatus.state]">
+          <Icon :icon="databaseBackupStatus.state === 'error' ? 'tabler:alert-circle' : databaseBackupStatus.lastSuccessAt ? 'tabler:circle-check' : 'tabler:clock'" />
+          <span>
+            <strong>{{ databaseBackupStatus.message }}</strong>
+            <small v-if="databaseBackupStatus.lastSuccessAt">
+              最近成功：{{ formatDatabaseBackupTime(databaseBackupStatus.lastSuccessAt) }}
+            </small>
+          </span>
+        </div>
+        <div class="database-backup-policy">
+          <label>自动备份
+            <select v-model="databaseBackupSettings.schedule" :disabled="databaseBackupBusy">
+              <option value="daily">每天</option>
+              <option value="weekly">每周</option>
+              <option value="off">关闭</option>
+            </select>
+          </label>
+          <label>保留数量
+            <input v-model.number="databaseBackupSettings.retention" type="number" min="1" max="50" :disabled="databaseBackupBusy" />
+          </label>
+          <button type="button" :disabled="databaseBackupBusy" @click="saveDatabaseBackupPolicy">保存策略</button>
+        </div>
+        <div class="database-backup-toolbar">
+          <button type="button" :disabled="databaseBackupBusy" @click="createDatabaseBackup">
+            <Icon icon="tabler:database-plus" />立即备份
+          </button>
+          <button type="button" :disabled="databaseBackupBusy" @click="openDatabaseBackupDirectory">
+            <Icon icon="tabler:folder-open" />打开目录
+          </button>
+        </div>
+        <div v-if="databaseBackupBusy && !databaseBackups.length" class="database-backup-empty">
+          <Icon class="spinning" icon="tabler:loader-2" />正在读取备份…
+        </div>
+        <div v-else-if="!databaseBackups.length" class="database-backup-empty">
+          <Icon icon="tabler:database-off" />当前档案还没有备份
+        </div>
+        <div v-else class="database-backup-list">
+          <article v-for="backup in databaseBackups" :key="backup.id">
+            <div class="database-backup-kind"><Icon :icon="backup.kind === 'complete' ? 'tabler:archive' : 'tabler:database'" /></div>
+            <div>
+              <strong>{{ formatDatabaseBackupTime(backup.createdAt) }}</strong>
+              <small>
+                {{ getDatabaseBackupReasonLabel(backup.reason) }} · {{ formatDatabaseBackupSize(backup.size) }}
+                · {{ backup.kind === 'complete' ? `${backup.assetCount} 个附件` : '旧版数据库快照' }}
+              </small>
+            </div>
+            <button type="button" :disabled="databaseBackupBusy" @click="restoreDatabaseBackup(backup)">恢复</button>
+          </article>
+        </div>
+        <p v-if="databaseBackupMessage" class="database-backup-message">{{ databaseBackupMessage }}</p>
+        <div class="database-backup-actions">
+          <button type="button" :disabled="databaseBackupBusy" @click="databaseBackupVisible = false">关闭</button>
         </div>
       </section>
     </div>
@@ -2303,6 +2840,29 @@ onBeforeUnmount(() => {
         <div>
           <button type="button" @click="resolveConfirmation(false)">取消</button>
           <button class="danger-confirm" type="button" autofocus @click="resolveConfirmation(true)">{{ confirmationDialog.confirmLabel }}</button>
+        </div>
+      </section>
+    </div>
+
+    <div v-if="updateDialogVisible" class="dialog-backdrop" @click.self="!updateChecking && (updateDialogVisible = false)">
+      <section class="folder-dialog update-dialog" role="dialog" aria-modal="true" aria-labelledby="update-dialog-title">
+        <div class="dialog-icon"><Icon :icon="updateChecking ? 'tabler:loader-2' : updateResult?.status === 'available' ? 'tabler:sparkles' : updateError ? 'tabler:alert-circle' : 'tabler:circle-check'" /></div>
+        <h2 id="update-dialog-title">
+          {{ updateChecking ? '正在检查更新' : updateError ? '检查更新失败' : updateResult?.status === 'available' ? '发现新版本' : updateResult?.status === 'unpublished' ? '暂无发布版本' : '已是最新版本' }}
+        </h2>
+        <p v-if="updateChecking">正在连接 GitHub Releases 获取最新版本信息…</p>
+        <template v-else-if="updateError">
+          <p>{{ updateError }}</p>
+        </template>
+        <template v-else-if="updateResult">
+          <p v-if="updateResult.status === 'unpublished'">当前版本 {{ updateResult.currentVersion }}。GitHub 仓库还没有正式 Release，发布首个版本后即可正常检查更新。</p>
+          <p v-else>当前版本 {{ updateResult.currentVersion }}，最新版本 {{ updateResult.latestVersion }}。</p>
+          <div v-if="updateResult.status === 'available' && updateResult.releaseNotes" class="update-release-notes">{{ updateResult.releaseNotes }}</div>
+        </template>
+        <div>
+          <button v-if="updateError" type="button" @click="runUpdateCheck(false)">重新检查</button>
+          <button type="button" :disabled="updateChecking" @click="updateDialogVisible = false">稍后</button>
+          <button v-if="updateResult?.status === 'available'" class="primary" type="button" @click="openUpdateDownload">前往下载</button>
         </div>
       </section>
     </div>
