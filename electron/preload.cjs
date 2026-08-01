@@ -22,6 +22,43 @@ contextBridge.exposeInMainWorld("notesDesktop", {
   openExternalLink: (url) => ipcRenderer.invoke("external-link:open", url),
   saveImageAsset: (input) => ipcRenderer.invoke("asset:save-image", input),
   createNote: (folderId) => ipcRenderer.invoke("note:create", folderId),
+  openQuickCapture: () => ipcRenderer.invoke("quick-capture:open"),
+  hideQuickCapture: () => ipcRenderer.invoke("quick-capture:hide"),
+  getQuickCaptureSettings: () => ipcRenderer.invoke("quick-capture:settings:get"),
+  saveQuickCaptureSettings: (input) => ipcRenderer.invoke("quick-capture:settings:save", input),
+  createQuickNote: (input) => ipcRenderer.invoke("quick-capture:create", input),
+  onQuickCaptureFocus: (callback) => {
+    const listener = () => callback()
+    ipcRenderer.on("quick-capture:focus", listener)
+    return () => ipcRenderer.removeListener("quick-capture:focus", listener)
+  },
+  onOpenQuickCaptureSettings: (callback) => {
+    const listener = () => callback()
+    ipcRenderer.on("quick-capture:open-settings", listener)
+    return () => ipcRenderer.removeListener("quick-capture:open-settings", listener)
+  },
+  /**
+   * 监听菜单栏打开通用设置的请求。
+   *
+   * @param {() => void} callback 打开设置的回调。
+   * @returns {() => void} 取消监听函数。
+   */
+  onOpenGeneralSettings: (callback) => {
+    const listener = () => callback()
+    ipcRenderer.on("general-settings:open", listener)
+    return () => ipcRenderer.removeListener("general-settings:open", listener)
+  },
+  /**
+   * 监听主进程捕获的快速记录 Escape 按键。
+   *
+   * @param {() => void} callback Escape 按键回调。
+   * @returns {() => void} 取消监听函数。
+   */
+  onQuickCaptureEscape: (callback) => {
+    const listener = () => callback()
+    ipcRenderer.on("quick-capture:escape", listener)
+    return () => ipcRenderer.removeListener("quick-capture:escape", listener)
+  },
   updateNote: (noteId, patch) => ipcRenderer.invoke("note:update", noteId, patch),
   listNoteHistory: (noteId) => ipcRenderer.invoke("note-history:list", noteId),
   restoreNoteHistory: (noteId, historyId) => ipcRenderer.invoke("note-history:restore", noteId, historyId),
@@ -31,6 +68,17 @@ contextBridge.exposeInMainWorld("notesDesktop", {
   emptyTrash: () => ipcRenderer.invoke("note:empty-trash"),
   createFolder: (name, parentId) => ipcRenderer.invoke("folder:create", name, parentId),
   renameFolder: (folderId, name) => ipcRenderer.invoke("folder:rename", folderId, name),
+  /**
+   * 移动文件夹到指定层级与排序位置。
+   *
+   * @param {string} folderId 文件夹 ID。
+   * @param {string | null} parentId 新父文件夹 ID。
+   * @param {string | null} beforeFolderId 排在其前面的文件夹 ID。
+   * @returns {Promise<Record<string, any>>} 移动后的文件夹。
+   */
+  moveFolder: (folderId, parentId, beforeFolderId) => (
+    ipcRenderer.invoke("folder:move", folderId, parentId, beforeFolderId)
+  ),
   setFolderDeleted: (folderId) => ipcRenderer.invoke("folder:set-deleted", folderId),
   restoreFolder: (folderId) => ipcRenderer.invoke("folder:restore", folderId),
   deleteFolderPermanently: (folderId) => ipcRenderer.invoke("folder:delete-permanently", folderId),
@@ -41,6 +89,17 @@ contextBridge.exposeInMainWorld("notesDesktop", {
   exportFullBackup: () => ipcRenderer.invoke("data:export-backup"),
   importMarkdown: (folderId) => ipcRenderer.invoke("data:import-markdown", folderId),
   importFullBackup: () => ipcRenderer.invoke("data:import-backup"),
+  /**
+   * 监听菜单栏打开导入导出窗口的请求。
+   *
+   * @param {() => void} callback 打开窗口的回调。
+   * @returns {() => void} 取消监听函数。
+   */
+  onOpenDataTransfer: (callback) => {
+    const listener = () => callback()
+    ipcRenderer.on("data-transfer:open", listener)
+    return () => ipcRenderer.removeListener("data-transfer:open", listener)
+  },
   listDatabaseBackups: () => ipcRenderer.invoke("database-backup:list"),
   /** @returns {Promise<Record<string, string>>} 当前档案的备份状态。 */
   getDatabaseBackupStatus: () => ipcRenderer.invoke("database-backup:status"),

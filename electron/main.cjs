@@ -7,6 +7,7 @@ const {
   app,
   BrowserWindow,
   dialog,
+  globalShortcut,
   ipcMain,
   Menu,
   nativeTheme,
@@ -40,6 +41,10 @@ const {
   loadBackupSettings,
   saveBackupSettings
 } = require("./database-backup-settings.cjs")
+const {
+  loadQuickCaptureSettings,
+  saveQuickCaptureSettings
+} = require("./quick-capture-settings.cjs")
 
 const DEFAULT_BACKEND_URL = "https://lovethewind.cn"
 const DEFAULT_WEB_URL = "https://lovethewind.cn"
@@ -63,6 +68,9 @@ const IMAGE_EXTENSION_BY_MIME_TYPE = new Map([
 let repository = null
 let backupManager = null
 let mainWindow = null
+let quickCaptureWindow = null
+let quickCaptureSettings = null
+let isQuitting = false
 const backupStatusTracker = createDatabaseBackupStatusTracker((status) => {
   if (mainWindow && !mainWindow.isDestroyed()) {
     mainWindow.webContents.send("database-backup:status", status)
@@ -83,6 +91,42 @@ let automaticSyncTimer = null
 let pendingMutationSyncTimer = null
 let syncAfterCurrent = false
 let syncStatus = { state: "idle", message: "仅保存在本机", lastSuccessAt: "" }
+
+/** 注册快速记录全局快捷键，注册失败时恢复旧快捷键。 */
+function registerQuickCaptureShortcut(shortcut, previousShortcut = "") {
+  if (previousShortcut) globalShortcut.unregister(previousShortcut)
+  let registered = false
+  try {
+    registered = globalShortcut.register(shortcut, () => showQuickCaptureWindow())
+  } catch {
+    registered = false
+  }
+  if (!registered && previousShortcut) {
+    try {
+      globalShortcut.register(previousShortcut, () => showQuickCaptureWindow())
+    } catch {
+      // 原快捷键仅来自已保存且成功使用过的配置，异常时交由设置界面重新录入。
+    }
+  }
+  return registered
+}
+
+/** 显示快速记录窗口，并可直接进入快捷键设置。 */
+function showQuickCaptureWindow(openSettings = false) {
+  const browserWindow = quickCaptureWindow && !quickCaptureWindow.isDestroyed()
+    ? quickCaptureWindow
+    : createQuickCaptureWindow()
+  if (browserWindow.isMinimized()) browserWindow.restore()
+  if (process.platform === "darwin") app.show()
+  browserWindow.show()
+  browserWindow.focus()
+  const channel = openSettings ? "quick-capture:open-settings" : "quick-capture:focus"
+  if (browserWindow.webContents.isLoading()) {
+    browserWindow.webContents.once("did-finish-load", () => browserWindow.webContents.send(channel))
+  } else {
+    browserWindow.webContents.send(channel)
+  }
+}
 
 /**
  * 将用户输入规范化为不带 `/api` 后缀的后端地址。
@@ -1514,6 +1558,44 @@ function registerIpcHandlers() {
   ipcMain.handle("note:create", (_event, folderId) => (
     applyLocalMutation(() => repository.createNote(folderId || null))
   ))
+  ipcMain.handle("quick-capture:open", () => {
+    showQuickCaptureWindow()
+    return true
+  })
+  ipcMain.handle("quick-capture:hide", () => {
+    quickCaptureWindow?.hide()
+    if (process.platform === "darwin") app.hide()
+    return true
+  })
+  ipcMain.handle("quick-capture:settings:get", () => ({ ...quickCaptureSettings }))
+  ipcMain.handle("quick-capture:settings:save", async (_event, input) => {
+    const previous = quickCaptureSettings
+    const requestedShortcut = String(input?.shortcut || "").trim()
+    if (!requestedShortcut) throw new Error("请先录入快捷键")
+    if (!registerQuickCaptureShortcut(requestedShortcut, previous.shortcut)) {
+      throw new Error("快捷键已被系统或其他应用占用，请换一个组合")
+    }
+    try {
+      quickCaptureSettings = await saveQuickCaptureSettings(app.getPath("userData"), {
+        shortcut: requestedShortcut,
+        folderId: input?.folderId
+      })
+      return { ...quickCaptureSettings }
+    } catch (error) {
+      globalShortcut.unregister(requestedShortcut)
+      registerQuickCaptureShortcut(previous.shortcut)
+      throw error
+    }
+  })
+  ipcMain.handle("quick-capture:create", async (_event, input) => {
+    const note = applyLocalMutation(() => repository.createQuickNote(input || {}))
+    quickCaptureSettings = await saveQuickCaptureSettings(app.getPath("userData"), {
+      ...quickCaptureSettings,
+      folderId: note.folderId
+    })
+    mainWindow?.webContents.send("workspace:changed")
+    return note
+  })
   ipcMain.handle("note:update", (_event, noteId, patch) => (
     applyLocalMutation(() => repository.updateNote(noteId, patch))
   ))
@@ -1543,6 +1625,9 @@ function registerIpcHandlers() {
   ))
   ipcMain.handle("folder:rename", (_event, folderId, name) => (
     applyLocalMutation(() => repository.renameFolder(folderId, name))
+  ))
+  ipcMain.handle("folder:move", (_event, folderId, parentId, beforeFolderId) => (
+    applyLocalMutation(() => repository.moveFolder(folderId, parentId || null, beforeFolderId || null))
   ))
   ipcMain.handle("folder:set-deleted", (_event, folderId) => (
     applyLocalMutation(() => repository.setFolderDeleted(folderId))
@@ -1603,11 +1688,24 @@ function installMenu() {
     {
       label: app.name,
       submenu: [
-        { role: "about" },
+        { label: "关于 心悦笔记", role: "about" },
+        { type: "separator" },
+        {
+          label: "快速记录…",
+          click: () => showQuickCaptureWindow()
+        },
+        {
+          label: "通用设置…",
+          accelerator: "CmdOrCtrl+,",
+          click: () => mainWindow?.webContents.send("general-settings:open")
+        },
+        {
+          label: "导入导出…",
+          click: () => mainWindow?.webContents.send("data-transfer:open")
+        },
         { type: "separator" },
         {
           label: "同步设置…",
-          accelerator: "CmdOrCtrl+,",
           click: () => mainWindow?.webContents.send("sync-settings:open")
         },
         {
@@ -1615,38 +1713,45 @@ function installMenu() {
           click: () => mainWindow?.webContents.send("app-update:check-request", false)
         },
         { type: "separator" },
-        { role: "hide" },
-        { role: "hideOthers" },
-        { role: "unhide" },
+        { label: "隐藏心悦笔记", role: "hide" },
+        { label: "隐藏其他应用", role: "hideOthers" },
+        { label: "全部显示", role: "unhide" },
         { type: "separator" },
-        { role: "quit" }
+        { label: "退出心悦笔记", role: "quit" }
       ]
     },
     {
       label: "编辑",
       submenu: [
-        { role: "undo" },
-        { role: "redo" },
+        { label: "撤销", role: "undo" },
+        { label: "重做", role: "redo" },
         { type: "separator" },
-        { role: "cut" },
-        { role: "copy" },
-        { role: "paste" },
-        { role: "selectAll" }
+        { label: "剪切", role: "cut" },
+        { label: "复制", role: "copy" },
+        { label: "粘贴", role: "paste" },
+        { label: "全选", role: "selectAll" }
       ]
     },
     {
       label: "显示",
       submenu: [
-        { role: "reload" },
+        { label: "重新加载", role: "reload" },
         { type: "separator" },
-        { role: "resetZoom" },
-        { role: "zoomIn" },
-        { role: "zoomOut" },
+        { label: "实际大小", role: "resetZoom" },
+        { label: "放大", role: "zoomIn" },
+        { label: "缩小", role: "zoomOut" },
         { type: "separator" },
-        { role: "togglefullscreen" }
+        { label: "进入全屏", role: "togglefullscreen" }
       ]
     },
-    { label: "窗口", submenu: [{ role: "minimize" }, { role: "zoom" }, { role: "front" }] }
+    {
+      label: "窗口",
+      submenu: [
+        { label: "最小化", role: "minimize" },
+        { label: "缩放", role: "zoom" },
+        { label: "前置全部窗口", role: "front" }
+      ]
+    }
   ]))
 }
 
@@ -1678,7 +1783,11 @@ function createWindow() {
   browserWindow.once("ready-to-show", () => browserWindow.show())
   browserWindow.webContents.once("did-finish-load", () => {
     if (app.isPackaged) {
-      setTimeout(() => browserWindow.webContents.send("app-update:check-request", true), 3000)
+      setTimeout(() => {
+        if (!browserWindow.isDestroyed() && !browserWindow.webContents.isDestroyed()) {
+          browserWindow.webContents.send("app-update:check-request", true)
+        }
+      }, 3000)
     }
   })
   browserWindow.on("closed", () => {
@@ -1717,6 +1826,48 @@ function createWindow() {
   return browserWindow
 }
 
+/** 创建轻量快速记录窗口。 */
+function createQuickCaptureWindow() {
+  const browserWindow = new BrowserWindow({
+    width: 620,
+    height: 500,
+    minWidth: 520,
+    minHeight: 420,
+    show: false,
+    resizable: true,
+    title: "快速记录",
+    backgroundColor: "#f7faff",
+    titleBarStyle: "hiddenInset",
+    trafficLightPosition: { x: 16, y: 16 },
+    alwaysOnTop: true,
+    webPreferences: {
+      preload: path.join(__dirname, "preload.cjs"),
+      contextIsolation: true,
+      nodeIntegration: false,
+      sandbox: true,
+      spellcheck: true
+    }
+  })
+  browserWindow.on("close", (event) => {
+    if (isQuitting) return
+    event.preventDefault()
+    browserWindow.hide()
+  })
+  browserWindow.on("closed", () => {
+    quickCaptureWindow = null
+  })
+  browserWindow.webContents.on("before-input-event", (event, input) => {
+    if (input.type !== "keyDown" || input.key !== "Escape") return
+    event.preventDefault()
+    browserWindow.webContents.send("quick-capture:escape")
+  })
+  const devServerUrl = process.env.VITE_DEV_SERVER_URL
+  if (devServerUrl) void browserWindow.loadURL(`${devServerUrl}/quick-capture.html`)
+  else void browserWindow.loadFile(path.join(__dirname, "../dist/quick-capture.html"))
+  quickCaptureWindow = browserWindow
+  return browserWindow
+}
+
 const currentUserDataPath = path.join(app.getPath("appData"), "心悦笔记")
 app.setPath("userData", currentUserDataPath)
 app.setName("心悦笔记")
@@ -1738,6 +1889,7 @@ app.on("open-url", (event, url) => {
 
 app.whenReady().then(() => {
   syncSettings = loadSyncSettings()
+  quickCaptureSettings = loadQuickCaptureSettings(app.getPath("userData"))
   migrateDomainProfile(currentUserDataPath, syncSettings.backendUrl, syncSettings.accountId)
   const profilePath = getBackendProfilePath(syncSettings.backendUrl, syncSettings.accountId)
   const domainProfilePath = path.dirname(profilePath)
@@ -1751,6 +1903,9 @@ app.whenReady().then(() => {
   registerIpcHandlers()
   installMenu()
   createWindow()
+  if (!registerQuickCaptureShortcut(quickCaptureSettings.shortcut)) {
+    console.warn(`快速记录快捷键注册失败: ${quickCaptureSettings.shortcut}`)
+  }
   setTimeout(() => {
     void ensureDailyDatabaseBackup().catch((error) => {
       console.warn("创建每日数据库备份失败", error)
@@ -1763,11 +1918,13 @@ app.whenReady().then(() => {
     if (syncSettings.token) void performSync()
   }, NOTE_SYNC_INTERVAL_MS)
   app.on("activate", () => {
-    if (BrowserWindow.getAllWindows().length === 0) createWindow()
+    if (!mainWindow || mainWindow.isDestroyed()) createWindow()
   })
 })
 
 app.on("before-quit", () => {
+  isQuitting = true
+  globalShortcut.unregisterAll()
   if (automaticSyncTimer) clearInterval(automaticSyncTimer)
   automaticSyncTimer = null
   if (pendingMutationSyncTimer) clearTimeout(pendingMutationSyncTimer)

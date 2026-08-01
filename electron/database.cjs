@@ -594,6 +594,29 @@ function createRepository(database) {
     return note
   }
 
+  /** 创建一篇已填写内容的快速记录。 */
+  const createQuickNote = database.transaction((input = {}) => {
+    const content = validateNoteContent(typeof input.content === "string" ? input.content.trim() : "")
+    const requestedTitle = typeof input.title === "string" ? input.title.trim() : ""
+    if (!requestedTitle && !content) throw new Error("快速记录内容不能为空")
+    const folderId = typeof input.folderId === "string" && input.folderId ? input.folderId : null
+    if (folderId) {
+      const folder = getFolder(folderId)
+      if (!folder || folder.isDeleted) throw new Error("目标文件夹不存在")
+    }
+    const generatedTitle = Array.from(content.replace(/\s+/g, " ").trim()).slice(0, 30).join("")
+    const title = (requestedTitle || generatedTitle || "快速记录").slice(0, 100)
+    const id = randomUUID()
+    const timestamp = nowIso()
+    database.prepare(`
+      INSERT INTO notes(id, folder_id, title, content, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?)
+    `).run(id, folderId, title, content, timestamp, timestamp)
+    const note = getNote(id)
+    enqueue("note", id, "upsert", note)
+    return note
+  })
+
   /**
    * 为当前笔记按时间间隔保存历史快照。
    *
@@ -907,6 +930,75 @@ function createRepository(database) {
     enqueue("folder", folderId, "upsert", folder)
     return folder
   }
+
+  /**
+   * 移动文件夹并重新编号来源与目标层级的排序值。
+   *
+   * @param {string} folderId 待移动文件夹 ID。
+   * @param {string | null} parentId 新父文件夹 ID。
+   * @param {string | null} beforeFolderId 新层级中排在其前面的文件夹 ID，空值表示末尾。
+   * @returns {Record<string, any>} 移动后的文件夹。
+   */
+  const moveFolder = database.transaction((folderId, parentId = null, beforeFolderId = null) => {
+    const current = getFolder(folderId)
+    if (!current || current.isDeleted) throw new Error("文件夹不存在")
+    if (folderId === parentId) throw new Error("文件夹不能移动到自身或子文件夹")
+    let ancestorId = parentId
+    const visited = new Set()
+    while (ancestorId) {
+      if (ancestorId === folderId || visited.has(ancestorId)) {
+        throw new Error("文件夹不能移动到自身或子文件夹")
+      }
+      visited.add(ancestorId)
+      const ancestor = getFolder(ancestorId)
+      if (!ancestor || ancestor.isDeleted) throw new Error("目标文件夹不存在")
+      ancestorId = ancestor.parentId
+    }
+    if (beforeFolderId === folderId) beforeFolderId = null
+    if (beforeFolderId) {
+      const beforeFolder = getFolder(beforeFolderId)
+      if (!beforeFolder || beforeFolder.isDeleted || beforeFolder.parentId !== parentId) {
+        throw new Error("目标排序位置无效")
+      }
+    }
+
+    const timestamp = nowIso()
+    const sourceParentId = current.parentId
+    database.prepare("UPDATE folders SET parent_id = ? WHERE id = ?").run(parentId, folderId)
+    const affectedIds = new Set([folderId])
+
+    /**
+     * 按指定顺序持久化同级文件夹。
+     *
+     * @param {string | null} siblingParentId 父文件夹 ID。
+     * @param {string | null} movingId 要插入的文件夹 ID。
+     * @param {string | null} beforeId 插入位置后的文件夹 ID。
+     * @returns {void}
+     */
+    function reorderSiblings(siblingParentId, movingId = null, beforeId = null) {
+      const siblingIds = database.prepare(`
+        SELECT id FROM folders
+        WHERE parent_id IS ? AND is_deleted = 0 AND id != ?
+        ORDER BY sort_order, name COLLATE NOCASE
+      `).all(siblingParentId, movingId || "").map((folder) => folder.id)
+      if (movingId) {
+        const insertionIndex = beforeId ? siblingIds.indexOf(beforeId) : siblingIds.length
+        siblingIds.splice(insertionIndex < 0 ? siblingIds.length : insertionIndex, 0, movingId)
+      }
+      const updateOrder = database.prepare(`
+        UPDATE folders SET sort_order = ?, updated_at = ?, dirty = 1 WHERE id = ?
+      `)
+      siblingIds.forEach((id, index) => {
+        updateOrder.run(index, timestamp, id)
+        affectedIds.add(id)
+      })
+    }
+
+    if (sourceParentId !== parentId) reorderSiblings(sourceParentId)
+    reorderSiblings(parentId, folderId, beforeFolderId)
+    for (const id of affectedIds) enqueue("folder", id, "upsert", getFolder(id))
+    return getFolder(folderId)
+  })
 
   /**
    * 收集指定状态下的文件夹子树。
@@ -1674,6 +1766,7 @@ function createRepository(database) {
     relocateImageAssetPaths,
     listWorkspace,
     createNote,
+    createQuickNote,
     updateNote,
     listNoteHistory,
     restoreNoteHistory,
@@ -1683,6 +1776,7 @@ function createRepository(database) {
     emptyTrash,
     createFolder,
     renameFolder,
+    moveFolder,
     setFolderDeleted,
     restoreFolder,
     deleteFolderPermanently,

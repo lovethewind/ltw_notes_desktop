@@ -66,6 +66,7 @@ import { replaceAll } from '@milkdown/kit/utils'
 import { Icon } from '@iconify/vue'
 import { h, nextTick, onBeforeUnmount, onMounted, ref, render, watch } from 'vue'
 import { extractMarkdownOutline, type MarkdownOutlineItem } from '../utils/markdown-outline'
+import { formatJsonCode } from '../utils/json-code-formatter.js'
 
 interface Props {
   value: string
@@ -125,6 +126,7 @@ let feedbackTimer: ReturnType<typeof setTimeout> | undefined
 let outlineTimer: ReturnType<typeof setTimeout> | undefined
 let suppressionTimer: ReturnType<typeof setTimeout> | undefined
 let readonlyObserver: MutationObserver | null = null
+let jsonFormatObserver: MutationObserver | null = null
 let activeFindMatch: { from: number, to: number } | null = null
 const toolbarMenuPanels = new Map<HTMLElement, HTMLDivElement>()
 const outlineCache = new Map<string, OutlineCacheEntry>()
@@ -224,6 +226,113 @@ function showFeedback(message: string): void {
   feedbackTimer = setTimeout(() => {
     feedbackText.value = ''
   }, 1800)
+}
+
+/**
+ * 为 JSON 代码块同步格式化按钮。
+ *
+ * :param root: 编辑器根节点。
+ * :return: 无返回值。
+ */
+function syncJsonFormatButtons(root: HTMLElement): void {
+  root.querySelectorAll<HTMLElement>('.milkdown-code-block').forEach((codeBlock) => {
+    const languageName = codeBlock
+      .querySelector<HTMLElement>('.language-button')
+      ?.textContent
+      ?.trim()
+      .toLocaleLowerCase() ?? ''
+    const isJsonLanguage = languageName === 'json'
+    const buttonGroup = codeBlock.querySelector<HTMLElement>('.tools-button-group')
+    const currentButton = codeBlock.querySelector<HTMLButtonElement>('.json-code-format-button')
+    if (!isJsonLanguage || !buttonGroup) {
+      currentButton?.remove()
+      return
+    }
+    if (currentButton) return
+    const button = document.createElement('button')
+    button.type = 'button'
+    button.className = 'json-code-format-button'
+    button.textContent = '格式化'
+    button.title = '格式化 JSON'
+    button.setAttribute('aria-label', '格式化 JSON')
+    buttonGroup.prepend(button)
+  })
+}
+
+/**
+ * 判断 DOM 变化是否会影响 JSON 格式化按钮。
+ *
+ * :param mutations: 编辑器 DOM 变化记录。
+ * :return: 需要重新同步按钮时返回 true。
+ */
+function shouldSyncJsonFormatButtons(mutations: MutationRecord[]): boolean {
+  return mutations.some((mutation) => {
+    const targetElement = mutation.target instanceof Element
+      ? mutation.target
+      : mutation.target.parentElement
+    if (targetElement?.closest('.language-button, .tools-button-group')) return true
+    return [...mutation.addedNodes].some((node) => (
+      node instanceof Element
+      && (
+        node.matches('.milkdown-code-block, .tools')
+        || Boolean(node.querySelector('.milkdown-code-block, .tools'))
+      )
+    ))
+  })
+}
+
+/**
+ * 启动 JSON 格式化按钮的 DOM 同步。
+ *
+ * :param root: 编辑器根节点。
+ * :return: 无返回值。
+ */
+function startJsonFormatButtons(root: HTMLElement): void {
+  jsonFormatObserver?.disconnect()
+  syncJsonFormatButtons(root)
+  jsonFormatObserver = new MutationObserver((mutations) => {
+    if (shouldSyncJsonFormatButtons(mutations)) syncJsonFormatButtons(root)
+  })
+  jsonFormatObserver.observe(root, {
+    childList: true,
+    characterData: true,
+    subtree: true
+  })
+}
+
+/**
+ * 格式化用户点击按钮所在的 JSON 代码块。
+ *
+ * :param event: 编辑器点击事件。
+ * :return: 无返回值。
+ */
+function handleJsonCodeFormatClick(event: MouseEvent): void {
+  const button = event.target instanceof Element
+    ? event.target.closest<HTMLButtonElement>('.json-code-format-button')
+    : null
+  if (!button || props.readonly || previewMode.value) return
+  event.preventDefault()
+  event.stopPropagation()
+  const editorElement = button
+    .closest<HTMLElement>('.milkdown-code-block')
+    ?.querySelector<HTMLElement>('.cm-editor')
+  if (!editorElement) return
+  const codeMirrorView = EditorView.findFromDOM(editorElement)
+  if (!codeMirrorView) return
+  const result = formatJsonCode(codeMirrorView.state.doc.toString())
+  if (!result.ok) {
+    showFeedback(result.message)
+    return
+  }
+  codeMirrorView.focus()
+  codeMirrorView.dispatch({
+    changes: {
+      from: 0,
+      to: codeMirrorView.state.doc.length,
+      insert: result.code
+    }
+  })
+  showFeedback('JSON 格式化完成')
 }
 
 /**
@@ -1003,6 +1112,7 @@ async function createEditor(): Promise<void> {
   }
   localizeTopBar(editorRootRef.value)
   editorRootRef.value.addEventListener('click', handleEditorLinkClick)
+  editorRootRef.value.addEventListener('click', handleJsonCodeFormatClick)
   editorRootRef.value.addEventListener('paste', handleAttachmentPaste, true)
   editorRootRef.value.addEventListener('dragover', handleAttachmentDragOver)
   editorRootRef.value.addEventListener('drop', handleAttachmentDrop)
@@ -1013,6 +1123,7 @@ async function createEditor(): Promise<void> {
   })
   crepe.setReadonly(props.readonly)
   syncPreviewReadonly()
+  startJsonFormatButtons(editorRootRef.value)
   editorReady = true
   editorMarkdown = contentValue.value
 }
@@ -1138,7 +1249,10 @@ onBeforeUnmount(() => {
   window.removeEventListener('blur', clearLinkModifierState)
   readonlyObserver?.disconnect()
   readonlyObserver = null
+  jsonFormatObserver?.disconnect()
+  jsonFormatObserver = null
   editorRootRef.value?.removeEventListener('click', handleEditorLinkClick)
+  editorRootRef.value?.removeEventListener('click', handleJsonCodeFormatClick)
   editorRootRef.value?.removeEventListener('paste', handleAttachmentPaste, true)
   editorRootRef.value?.removeEventListener('dragover', handleAttachmentDragOver)
   editorRootRef.value?.removeEventListener('drop', handleAttachmentDrop)

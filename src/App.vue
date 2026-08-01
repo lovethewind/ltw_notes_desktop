@@ -8,6 +8,7 @@ import {
   NOTE_AUTOSAVE_DELAY_MS,
   type NoteNavigationKind
 } from './utils/note-workspace'
+import { collectBlockedFolderDropIds, getDragAutoScrollDelta } from './utils/resource-drag'
 import NoteNavigation from './components/NoteNavigation.vue'
 import FolderTreeItem from './components/FolderTreeItem.vue'
 import MarkdownVisualEditor from './components/MarkdownVisualEditor.vue'
@@ -63,6 +64,24 @@ interface ButtonTooltipState {
   placement: 'top' | 'bottom'
 }
 
+interface ResourceDragData {
+  kind: 'note' | 'folder'
+  id: string
+}
+
+interface FolderDropPayload {
+  event: DragEvent
+  folder: NoteFolder
+  position: 'before' | 'inside' | 'after'
+}
+
+interface QuickOpenResult {
+  note: OfflineNote
+  folderPath: string
+  excerpt: string
+  contentMatched: boolean
+}
+
 const workspace = reactive<WorkspaceData>({ folders: [], tags: [], notes: [], pendingCount: 0 })
 const activeFilter = reactive<ActiveFilter>({ kind: 'all', id: null })
 const activeNoteId = ref<string | null>(null)
@@ -90,6 +109,24 @@ const updateChecking = ref(false)
 const updateError = ref('')
 const updateResult = ref<UpdateCheckResult | null>(null)
 const syncDialogVisible = ref(false)
+const generalSettingsVisible = ref(false)
+const generalSettingsSaving = ref(false)
+const generalSettingsMessage = ref('')
+const generalShortcutRecording = ref(false)
+const generalShortcut = ref('CommandOrControl+Shift+Space')
+const generalQuickCaptureFolderId = ref<string | null>(null)
+const quickOpenVisible = ref(false)
+const quickOpenKeyword = ref('')
+const quickOpenInput = ref<HTMLInputElement | null>(null)
+const quickOpenResultsElement = ref<HTMLElement | null>(null)
+const quickOpenActiveIndex = ref(0)
+const quickOpenShortcutRecording = ref(false)
+const quickOpenShortcut = ref(window.localStorage.getItem('notes-quick-open-shortcut') || 'CommandOrControl+O')
+const draftQuickOpenShortcut = ref(quickOpenShortcut.value)
+const quickOpenHistory = ref(loadQuickOpenHistory())
+const storedShowTreeLines = window.localStorage.getItem('notes-show-tree-lines')
+const showTreeLines = ref(storedShowTreeLines !== 'false')
+const draftShowTreeLines = ref(showTreeLines.value)
 const syncTesting = ref(false)
 const syncBrowserLoginPending = ref(false)
 const syncSaving = ref(false)
@@ -178,6 +215,8 @@ const buttonTooltip = reactive<ButtonTooltipState>({
 })
 const expandedFolderIds = ref<Set<string>>(new Set())
 const unclassifiedExpanded = ref(true)
+const draggedResource = ref<ResourceDragData | null>(null)
+const sidebarResourceScroll = ref<HTMLElement | null>(null)
 const draft = reactive({
   title: '',
   content: '',
@@ -195,11 +234,15 @@ let linkCopyFeedbackTimer: ReturnType<typeof setTimeout> | null = null
 let disposeOpenSyncSettings: (() => void) | null = null
 let disposeOpenNoteLink: (() => void) | null = null
 let disposeCheckForUpdates: (() => void) | null = null
+let disposeOpenDataTransfer: (() => void) | null = null
+let disposeOpenGeneralSettings: (() => void) | null = null
 let disposeDatabaseBackupStatus: (() => void) | null = null
 let disposeSyncAuthResult: (() => void) | null = null
 let disposeSyncStatus: (() => void) | null = null
 let disposeWorkspaceChanged: (() => void) | null = null
 let syncBrowserLoginTimer: ReturnType<typeof setTimeout> | null = null
+let resourceAutoScrollFrame: number | null = null
+let resourceAutoScrollDelta = 0
 
 const activeNote = computed(() => workspace.notes.find((note) => note.id === activeNoteId.value) ?? null)
 const allCount = computed(() => workspace.notes.filter((note) => !note.isDeleted).length)
@@ -285,6 +328,11 @@ const explorerUnclassifiedExpanded = computed(() => (
 const rootFolders = computed(() => explorerFolders.value.filter((folder) => (
   !folder.isDeleted && folder.parentId === null
 )))
+const resourceDragEnabled = computed(() => activeFilter.kind === 'all' && !searchKeyword.value.trim())
+const blockedFolderDropIds = computed(() => collectBlockedFolderDropIds(
+  draggedResource.value?.kind === 'folder' ? draggedResource.value.id : null,
+  workspace.folders
+))
 const folderOptions = computed(() => {
   const options: Array<{ id: string, name: string, label: string, depth: number }> = []
   const visited = new Set<string>()
@@ -312,6 +360,39 @@ const folderOptions = computed(() => {
 
   appendFolderOptions(null, 0)
   return options
+})
+const quickOpenResults = computed<QuickOpenResult[]>(() => {
+  const keyword = quickOpenKeyword.value.trim().toLocaleLowerCase()
+  const folderById = new Map(workspace.folders.map((folder) => [folder.id, folder]))
+  return workspace.notes
+    .filter((note) => !note.isDeleted)
+    .map((note) => {
+      const folderPath = getQuickOpenFolderPath(note.folderId, folderById)
+      const searchText = [
+        note.title,
+        note.content,
+        note.tags.map((tag) => tag.name).join(' '),
+        folderPath
+      ].join(' ').toLocaleLowerCase()
+      const score = keyword
+        ? Number(note.title.toLocaleLowerCase().includes(keyword)) * 4
+          + Number(note.tags.some((tag) => tag.name.toLocaleLowerCase().includes(keyword))) * 3
+          + Number(folderPath.toLocaleLowerCase().includes(keyword)) * 2
+          + Number(note.content.toLocaleLowerCase().includes(keyword))
+        : 0
+      return {
+        note,
+        folderPath,
+        excerpt: getNoteExcerpt(note.content),
+        contentMatched: Boolean(keyword && note.content.toLocaleLowerCase().includes(keyword)),
+        searchText,
+        score
+      }
+    })
+    .filter((result) => !keyword || result.searchText.includes(keyword))
+    .sort((left, right) => right.score - left.score || Date.parse(right.note.updatedAt) - Date.parse(left.note.updatedAt))
+    .slice(0, 12)
+    .map(({ note, folderPath, excerpt, contentMatched }) => ({ note, folderPath, excerpt, contentMatched }))
 })
 const currentFolderName = computed(() => {
   if (!draft.folderId) return '未分类'
@@ -485,6 +566,277 @@ async function runSync(): Promise<void> {
 async function pullLatestData(): Promise<void> {
   await runSync()
   if (syncSettings.configured) await refreshWorkspace()
+}
+
+/**
+ * 将 Electron 快捷键格式转换为界面展示文本。
+ *
+ * :param value: Electron 快捷键字符串。
+ * :return: 当前系统对应的快捷键文本。
+ */
+function formatGeneralShortcut(value: string): string {
+  return value
+    .replace('CommandOrControl', navigator.platform.includes('Mac') ? '⌘' : 'Ctrl')
+    .replaceAll('Shift', '⇧')
+    .replaceAll('Alt', navigator.platform.includes('Mac') ? '⌥' : 'Alt')
+    .replaceAll('+', ' ')
+}
+
+/**
+ * 将键盘事件转换为 Electron 全局快捷键字符串。
+ *
+ * :param event: 键盘事件。
+ * :return: 有效快捷键字符串，无修饰键或仅按修饰键时返回 null。
+ */
+function getGeneralShortcutFromEvent(event: KeyboardEvent): string | null {
+  const ignoredKeys = new Set(['Meta', 'Control', 'Shift', 'Alt'])
+  if (ignoredKeys.has(event.key)) return null
+  const modifiers: string[] = []
+  if (event.metaKey || event.ctrlKey) modifiers.push('CommandOrControl')
+  if (event.altKey) modifiers.push('Alt')
+  if (event.shiftKey) modifiers.push('Shift')
+  if (!modifiers.length) return null
+  const aliases: Record<string, string> = {
+    ' ': 'Space', ArrowUp: 'Up', ArrowDown: 'Down', ArrowLeft: 'Left', ArrowRight: 'Right'
+  }
+  const key = aliases[event.key] || (event.key.length === 1 ? event.key.toUpperCase() : event.key)
+  return [...modifiers, key].join('+')
+}
+
+/**
+ * 录入通用设置中的快速记录快捷键。
+ *
+ * :param event: 键盘事件。
+ * :return: 无返回值。
+ */
+function recordGeneralShortcut(event: KeyboardEvent): void {
+  event.preventDefault()
+  event.stopPropagation()
+  const shortcut = getGeneralShortcutFromEvent(event)
+  if (!shortcut) return
+  generalShortcut.value = shortcut
+  generalShortcutRecording.value = false
+  generalSettingsMessage.value = ''
+}
+
+/**
+ * 生成笔记所在文件夹的完整路径。
+ *
+ * :param folderId: 笔记所属文件夹 ID。
+ * :param folderById: 按 ID 索引的文件夹集合。
+ * :return: 文件夹路径，未分类笔记返回“未分类”。
+ */
+function getQuickOpenFolderPath(folderId: string | null, folderById: Map<string, NoteFolder>): string {
+  if (!folderId) return '未分类'
+  const names: string[] = []
+  const visited = new Set<string>()
+  let currentId: string | null = folderId
+  while (currentId && !visited.has(currentId)) {
+    visited.add(currentId)
+    const folder = folderById.get(currentId)
+    if (!folder || folder.isDeleted) break
+    names.unshift(folder.name)
+    currentId = folder.parentId
+  }
+  return names.join(' / ') || '未分类'
+}
+
+/**
+ * 录入通用设置中的快速打开快捷键。
+ *
+ * :param event: 键盘事件。
+ * :return: 无返回值。
+ */
+function recordQuickOpenShortcut(event: KeyboardEvent): void {
+  event.preventDefault()
+  event.stopPropagation()
+  const shortcut = getGeneralShortcutFromEvent(event)
+  if (!shortcut) return
+  draftQuickOpenShortcut.value = shortcut
+  quickOpenShortcutRecording.value = false
+  generalSettingsMessage.value = ''
+}
+
+/**
+ * 判断键盘事件是否匹配应用内快捷键。
+ *
+ * :param event: 键盘事件。
+ * :param shortcut: Electron 格式的快捷键字符串。
+ * :return: 匹配时返回 true。
+ */
+function matchesAppShortcut(event: KeyboardEvent, shortcut: string): boolean {
+  const parts = shortcut.split('+').map((part) => part.toLocaleLowerCase())
+  const expectedCommand = parts.includes('commandorcontrol')
+  const expectedShift = parts.includes('shift')
+  const expectedAlt = parts.includes('alt')
+  const key = parts.find((part) => !['commandorcontrol', 'shift', 'alt'].includes(part))
+  if (!key) return false
+  return (event.metaKey || event.ctrlKey) === expectedCommand
+    && event.shiftKey === expectedShift
+    && event.altKey === expectedAlt
+    && event.key.toLocaleLowerCase() === key.toLocaleLowerCase()
+}
+
+/**
+ * 从本地设置读取最近使用的快速搜索词。
+ *
+ * :return: 最多八条有效搜索词。
+ */
+function loadQuickOpenHistory(): string[] {
+  try {
+    const value = JSON.parse(window.localStorage.getItem('notes-quick-open-history') || '[]')
+    return Array.isArray(value)
+      ? value.filter((item): item is string => typeof item === 'string' && Boolean(item.trim())).slice(0, 8)
+      : []
+  } catch {
+    return []
+  }
+}
+
+/**
+ * 保存最近使用的快速搜索词并去重。
+ *
+ * :param keyword: 已完成跳转的搜索词。
+ * :return: 无返回值。
+ */
+function rememberQuickOpenKeyword(keyword: string): void {
+  const normalizedKeyword = keyword.trim()
+  if (!normalizedKeyword) return
+  quickOpenHistory.value = [
+    normalizedKeyword,
+    ...quickOpenHistory.value.filter((item) => item.toLocaleLowerCase() !== normalizedKeyword.toLocaleLowerCase())
+  ].slice(0, 8)
+  window.localStorage.setItem('notes-quick-open-history', JSON.stringify(quickOpenHistory.value))
+}
+
+/**
+ * 将历史搜索词填入快速打开输入框。
+ *
+ * :param keyword: 待复用搜索词。
+ * :return: 无返回值。
+ */
+function applyQuickOpenHistory(keyword: string): void {
+  quickOpenKeyword.value = keyword
+  quickOpenActiveIndex.value = 0
+  void nextTick(() => quickOpenInput.value?.focus())
+}
+
+/**
+ * 打开全库快速搜索面板并聚焦输入框。
+ *
+ * :return: 无返回值。
+ */
+function openQuickOpen(): void {
+  quickOpenVisible.value = true
+  quickOpenKeyword.value = ''
+  quickOpenActiveIndex.value = 0
+  void nextTick(() => quickOpenInput.value?.focus())
+}
+
+/**
+ * 选择快速搜索结果并跳转到对应笔记。
+ *
+ * :param result: 待打开的快速搜索结果。
+ * :return: 跳转完成后的 Promise。
+ */
+async function chooseQuickOpenResult(result: QuickOpenResult): Promise<void> {
+  const keyword = quickOpenKeyword.value.trim()
+  quickOpenVisible.value = false
+  activeFilter.kind = 'all'
+  activeFilter.id = null
+  rememberQuickOpenKeyword(keyword)
+  await selectNote(result.note)
+  if (result.contentMatched && keyword) {
+    noteFindVisible.value = true
+    noteFindKeyword.value = keyword
+    await nextTick()
+    findInCurrentNote(1)
+  }
+}
+
+/**
+ * 将快速搜索中的当前选中项滚动到结果列表可视区域。
+ *
+ * :return: 无返回值。
+ */
+function scrollQuickOpenActiveResultIntoView(): void {
+  void nextTick(() => {
+    quickOpenResultsElement.value
+      ?.querySelector<HTMLElement>('[aria-selected="true"]')
+      ?.scrollIntoView({ block: 'nearest' })
+  })
+}
+
+/**
+ * 处理快速搜索面板的方向键、回车和退出操作。
+ *
+ * :param event: 键盘事件。
+ * :return: 无返回值。
+ */
+function handleQuickOpenKeydown(event: KeyboardEvent): void {
+  if (event.key === 'ArrowDown') {
+    event.preventDefault()
+    quickOpenActiveIndex.value = Math.min(quickOpenActiveIndex.value + 1, Math.max(quickOpenResults.value.length - 1, 0))
+    scrollQuickOpenActiveResultIntoView()
+  } else if (event.key === 'ArrowUp') {
+    event.preventDefault()
+    quickOpenActiveIndex.value = Math.max(quickOpenActiveIndex.value - 1, 0)
+    scrollQuickOpenActiveResultIntoView()
+  } else if (event.key === 'Enter') {
+    event.preventDefault()
+    const result = quickOpenResults.value[quickOpenActiveIndex.value]
+    if (result) void chooseQuickOpenResult(result)
+  } else if (event.key === 'Escape') {
+    event.preventDefault()
+    quickOpenVisible.value = false
+  }
+}
+
+/**
+ * 打开通用设置并读取当前快速记录配置。
+ *
+ * :return: 配置加载完成后的 Promise。
+ */
+async function openGeneralSettings(): Promise<void> {
+  generalSettingsMessage.value = ''
+  generalShortcutRecording.value = false
+  quickOpenShortcutRecording.value = false
+  draftQuickOpenShortcut.value = quickOpenShortcut.value
+  draftShowTreeLines.value = showTreeLines.value
+  try {
+    const settings = await window.notesDesktop.getQuickCaptureSettings()
+    generalShortcut.value = settings.shortcut
+    generalQuickCaptureFolderId.value = settings.folderId
+    generalSettingsVisible.value = true
+  } catch (error) {
+    actionError.value = error instanceof Error ? error.message : '通用设置加载失败'
+  }
+}
+
+/**
+ * 保存通用设置并立即应用侧边栏连接线状态。
+ *
+ * :return: 保存完成后的 Promise。
+ */
+async function saveGeneralSettings(): Promise<void> {
+  if (generalSettingsSaving.value) return
+  generalSettingsSaving.value = true
+  generalSettingsMessage.value = ''
+  try {
+    await window.notesDesktop.saveQuickCaptureSettings({
+      shortcut: generalShortcut.value,
+      folderId: generalQuickCaptureFolderId.value
+    })
+    showTreeLines.value = draftShowTreeLines.value
+    window.localStorage.setItem('notes-show-tree-lines', String(showTreeLines.value))
+    quickOpenShortcut.value = draftQuickOpenShortcut.value
+    window.localStorage.setItem('notes-quick-open-shortcut', quickOpenShortcut.value)
+    generalSettingsVisible.value = false
+  } catch (error) {
+    generalSettingsMessage.value = error instanceof Error ? error.message : '通用设置保存失败'
+  } finally {
+    generalSettingsSaving.value = false
+  }
 }
 
 /**
@@ -1344,6 +1696,130 @@ function toggleFolder(folderId: string): void {
 }
 
 /**
+ * 从拖拽事件中读取心悦笔记资源。
+ *
+ * :param event: 拖拽事件。
+ * :return: 合法资源信息，无法解析时返回空值。
+ */
+function readDraggedResource(event: DragEvent): ResourceDragData | null {
+  try {
+    const value = JSON.parse(event.dataTransfer?.getData('application/x-xinyue-resource') || '')
+    if ((value?.kind === 'note' || value?.kind === 'folder') && typeof value.id === 'string') return value
+  } catch {
+    return null
+  }
+  return null
+}
+
+/**
+ * 记录正在拖动的资源，供非法目标判断和边缘滚动使用。
+ */
+function startResourceDrag(event: DragEvent, resource: ResourceDragData): void {
+  if (!resourceDragEnabled.value || !event.dataTransfer) return
+  event.dataTransfer.effectAllowed = 'move'
+  event.dataTransfer.setData('application/x-xinyue-resource', JSON.stringify(resource))
+  draggedResource.value = resource
+}
+
+/** 停止侧边栏拖拽边缘滚动。 */
+function stopResourceAutoScroll(): void {
+  resourceAutoScrollDelta = 0
+  if (resourceAutoScrollFrame !== null) cancelAnimationFrame(resourceAutoScrollFrame)
+  resourceAutoScrollFrame = null
+}
+
+/** 按当前速度持续滚动侧边栏资源列表。 */
+function runResourceAutoScroll(): void {
+  if (!sidebarResourceScroll.value || !resourceAutoScrollDelta) {
+    stopResourceAutoScroll()
+    return
+  }
+  sidebarResourceScroll.value.scrollTop += resourceAutoScrollDelta
+  resourceAutoScrollFrame = requestAnimationFrame(runResourceAutoScroll)
+}
+
+/** 根据拖拽指针位置启动、调整或停止边缘滚动。 */
+function handleResourceAutoScroll(event: DragEvent): void {
+  if (!draggedResource.value || !resourceDragEnabled.value) return
+  const element = event.currentTarget as HTMLElement
+  const bounds = element.getBoundingClientRect()
+  resourceAutoScrollDelta = getDragAutoScrollDelta(event.clientY, bounds.top, bounds.bottom)
+  if (!resourceAutoScrollDelta) {
+    stopResourceAutoScroll()
+  } else if (resourceAutoScrollFrame === null) {
+    resourceAutoScrollFrame = requestAnimationFrame(runResourceAutoScroll)
+  }
+}
+
+/** 指针真正离开侧边栏滚动区时停止边缘滚动。 */
+function handleResourceAutoScrollLeave(event: DragEvent): void {
+  const element = event.currentTarget as HTMLElement
+  if (event.relatedTarget instanceof Node && element.contains(event.relatedTarget)) return
+  stopResourceAutoScroll()
+}
+
+/** 清理一次资源拖拽产生的全局状态。 */
+function finishResourceDrag(): void {
+  draggedResource.value = null
+  stopResourceAutoScroll()
+}
+
+/**
+ * 将资源移动到未分类或根目录末尾。
+ *
+ * :param event: 拖拽事件。
+ * :return: 移动完成后的 Promise。
+ */
+async function dropResourceAtRoot(event: DragEvent): Promise<void> {
+  if (!resourceDragEnabled.value) return
+  event.preventDefault()
+  const resource = readDraggedResource(event)
+  if (!resource) return
+  try {
+    if (resource.kind === 'note') await window.notesDesktop.updateNote(resource.id, { folderId: null })
+    else await window.notesDesktop.moveFolder(resource.id, null, null)
+    applyWorkspace(await window.notesDesktop.listWorkspace())
+  } catch (error) {
+    actionError.value = error instanceof Error ? error.message : '移动失败'
+  }
+}
+
+/**
+ * 将资源移动到目标文件夹或目标文件夹相邻位置。
+ *
+ * :param payload: 文件夹放置位置与原始事件。
+ * :return: 移动完成后的 Promise。
+ */
+async function dropResourceOnFolder(payload: FolderDropPayload): Promise<void> {
+  if (!resourceDragEnabled.value) return
+  const resource = readDraggedResource(payload.event)
+  if (!resource) return
+  // 文件夹落在自身的任意区域都视为取消拖拽，避免无意义的移动和错误提示。
+  if (resource.kind === 'folder' && blockedFolderDropIds.value.has(payload.folder.id)) return
+  try {
+    if (resource.kind === 'note') {
+      await window.notesDesktop.updateNote(resource.id, { folderId: payload.folder.id })
+      expandedFolderIds.value = new Set([...expandedFolderIds.value, payload.folder.id])
+    } else {
+      const parentId = payload.position === 'inside' ? payload.folder.id : payload.folder.parentId
+      let beforeFolderId: string | null = payload.position === 'before' ? payload.folder.id : null
+      if (payload.position === 'after') {
+        const siblings = workspace.folders.filter((folder) => (
+          !folder.isDeleted && folder.parentId === payload.folder.parentId && folder.id !== resource.id
+        ))
+        const targetIndex = siblings.findIndex((folder) => folder.id === payload.folder.id)
+        beforeFolderId = siblings[targetIndex + 1]?.id ?? null
+      }
+      await window.notesDesktop.moveFolder(resource.id, parentId, beforeFolderId)
+      if (parentId) expandedFolderIds.value = new Set([...expandedFolderIds.value, parentId])
+    }
+    applyWorkspace(await window.notesDesktop.listWorkspace())
+  } catch (error) {
+    actionError.value = error instanceof Error ? error.message : '移动失败'
+  }
+}
+
+/**
  * 返回符合搜索条件的未分类笔记。
  *
  * :return: 未分类笔记列表。
@@ -1874,15 +2350,27 @@ async function removeTag(tag: NoteTag): Promise<void> {
  */
 function handleShortcut(event: KeyboardEvent): void {
   if (event.key === 'Escape') {
+    if (quickOpenVisible.value) {
+      quickOpenVisible.value = false
+      return
+    }
     if (noteFindVisible.value) {
       closeCurrentNoteFind()
       return
     }
     if (confirmationDialog.visible) resolveConfirmation(false)
+    generalSettingsVisible.value = false
+    generalShortcutRecording.value = false
+    quickOpenShortcutRecording.value = false
     syncDialogVisible.value = false
     createMenuVisible.value = false
     closeContextMenu()
     closePropertyPickers()
+    return
+  }
+  if (matchesAppShortcut(event, quickOpenShortcut.value)) {
+    event.preventDefault()
+    openQuickOpen()
     return
   }
   if (!(event.metaKey || event.ctrlKey)) return
@@ -2002,8 +2490,13 @@ watch(activeNoteId, () => {
   noteFindKeyword.value = ''
   Object.assign(noteFindResult, { count: 0, index: -1 })
 })
+watch(quickOpenKeyword, () => {
+  quickOpenActiveIndex.value = 0
+})
 onMounted(() => {
   window.addEventListener('keydown', handleShortcut)
+  window.addEventListener('drop', finishResourceDrag)
+  window.addEventListener('dragend', finishResourceDrag)
   systemThemeMedia.addEventListener('change', handleSystemThemeChange)
   document.addEventListener('pointerover', showButtonTooltip)
   document.addEventListener('pointerout', hideButtonTooltip)
@@ -2014,6 +2507,8 @@ onMounted(() => {
   disposeOpenSyncSettings = window.notesDesktop.onOpenSyncSettings(() => void openSyncSettings())
   disposeOpenNoteLink = window.notesDesktop.onOpenNoteLink((noteId) => void openNoteFromLink(noteId))
   disposeCheckForUpdates = window.notesDesktop.onCheckForUpdates((silent) => void runUpdateCheck(silent))
+  disposeOpenDataTransfer = window.notesDesktop.onOpenDataTransfer(openDataTransfer)
+  disposeOpenGeneralSettings = window.notesDesktop.onOpenGeneralSettings(() => void openGeneralSettings())
   disposeDatabaseBackupStatus = window.notesDesktop.onDatabaseBackupStatus((status) => {
     Object.assign(databaseBackupStatus, status)
   })
@@ -2036,6 +2531,9 @@ onMounted(() => {
 })
 onBeforeUnmount(() => {
   window.removeEventListener('keydown', handleShortcut)
+  window.removeEventListener('drop', finishResourceDrag)
+  window.removeEventListener('dragend', finishResourceDrag)
+  finishResourceDrag()
   systemThemeMedia.removeEventListener('change', handleSystemThemeChange)
   document.removeEventListener('pointerover', showButtonTooltip)
   document.removeEventListener('pointerout', hideButtonTooltip)
@@ -2049,6 +2547,10 @@ onBeforeUnmount(() => {
   disposeOpenNoteLink = null
   disposeCheckForUpdates?.()
   disposeCheckForUpdates = null
+  disposeOpenDataTransfer?.()
+  disposeOpenDataTransfer = null
+  disposeOpenGeneralSettings?.()
+  disposeOpenGeneralSettings = null
   disposeDatabaseBackupStatus?.()
   disposeDatabaseBackupStatus = null
   disposeSyncAuthResult?.()
@@ -2069,7 +2571,7 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <div class="desktop-shell" @click="createMenuVisible = false; closeContextMenu(); closePropertyPickers()">
+  <div :class="['desktop-shell', { 'tree-lines-hidden': !showTreeLines }]" @click="createMenuVisible = false; closeContextMenu(); closePropertyPickers()">
     <Transition name="editor-feedback">
       <div v-if="linkCopyFeedback" class="editor-feedback">{{ linkCopyFeedback }}</div>
     </Transition>
@@ -2174,7 +2676,13 @@ onBeforeUnmount(() => {
           @select="selectNavigation"
         />
 
-        <div class="sidebar-resource-scroll" @scroll.passive="closeContextMenu">
+        <div
+          ref="sidebarResourceScroll"
+          class="sidebar-resource-scroll"
+          @scroll.passive="closeContextMenu"
+          @dragover="handleResourceAutoScroll"
+          @dragleave="handleResourceAutoScrollLeave"
+        >
         <section
           v-if="!showFilteredResults && activeFilter.kind !== 'trash'"
           class="nav-section explorer-section"
@@ -2187,7 +2695,12 @@ onBeforeUnmount(() => {
           </div>
           <div class="nav-scroll-list">
             <div v-if="loading" class="sidebar-placeholder">正在读取本地数据库…</div>
-            <div v-if="!searchKeyword.trim() || getUnclassifiedNotes().length" class="nav-resource-group unclassified-group">
+            <div
+              v-if="!searchKeyword.trim() || getUnclassifiedNotes().length"
+              class="nav-resource-group unclassified-group"
+              @dragover="resourceDragEnabled && $event.preventDefault()"
+              @drop="dropResourceAtRoot"
+            >
               <div
                 :class="['nav-resource', { 'is-empty': !getUnclassifiedNotes().length }]"
                 @contextmenu.prevent="openUnclassifiedContextMenu"
@@ -2202,6 +2715,8 @@ onBeforeUnmount(() => {
                   v-for="note in getUnclassifiedNotes()"
                   :key="note.id"
                   :class="['sidebar-note-row', 'is-nested', { active: note.id === activeNoteId }]"
+                  :draggable="resourceDragEnabled"
+                  @dragstart="startResourceDrag($event, { kind: 'note', id: note.id })"
                   @contextmenu.prevent="openNoteContextMenu($event, note)"
                 >
                   <button class="sidebar-note-main" type="button" @click="selectNote(note)">
@@ -2225,10 +2740,14 @@ onBeforeUnmount(() => {
               :active-note-id="activeNoteId"
               :active-folder-id="activeNote?.folderId ?? null"
               :search-keyword="searchKeyword"
+              :drag-enabled="resourceDragEnabled"
+              :blocked-folder-ids="blockedFolderDropIds"
               @toggle="toggleFolder"
               @select-note="selectNote"
               @folder-context="openFolderContextMenu"
               @note-context="openNoteContextMenu"
+              @resource-drag-start="startResourceDrag"
+              @resource-drop="dropResourceOnFolder"
             />
             <p v-if="searchKeyword.trim() && !rootFolders.length && !getUnclassifiedNotes().length" class="nav-empty">没有找到匹配笔记</p>
             <p v-else-if="!workspace.folders.length" class="nav-empty">还没有文件夹</p>
@@ -2575,6 +3094,121 @@ onBeforeUnmount(() => {
         <p>{{ tagDialogAttachToDraft ? '创建后会自动添加到当前笔记。' : '创建后可以在任意笔记中选择使用。' }}</p>
         <input v-model="tagName" autofocus maxlength="30" placeholder="例如：学习" />
         <div><button type="button" @click="tagDialogVisible = false">取消</button><button class="primary" type="submit">创建</button></div>
+      </form>
+    </div>
+
+    <div v-if="quickOpenVisible" class="dialog-backdrop quick-open-backdrop" @click.self="quickOpenVisible = false">
+      <section class="quick-open-dialog" role="dialog" aria-modal="true" aria-label="快速打开笔记">
+        <div class="quick-open-search">
+          <Icon icon="tabler:search" />
+          <input
+            ref="quickOpenInput"
+            v-model="quickOpenKeyword"
+            placeholder="搜索标题、正文、标签或文件夹"
+            autocomplete="off"
+            @keydown="handleQuickOpenKeydown"
+          />
+          <kbd>Esc</kbd>
+        </div>
+        <div v-if="!quickOpenKeyword && quickOpenHistory.length" class="quick-open-history">
+          <span>最近搜索</span>
+          <button
+            v-for="keyword in quickOpenHistory"
+            :key="keyword"
+            type="button"
+            @click="applyQuickOpenHistory(keyword)"
+          >
+            {{ keyword }}
+          </button>
+        </div>
+        <div ref="quickOpenResultsElement" class="quick-open-results" role="listbox" aria-label="笔记搜索结果">
+          <button
+            v-for="(result, index) in quickOpenResults"
+            :key="result.note.id"
+            :class="{ active: index === quickOpenActiveIndex }"
+            type="button"
+            role="option"
+            :aria-selected="index === quickOpenActiveIndex"
+            @mouseenter="quickOpenActiveIndex = index"
+            @click="chooseQuickOpenResult(result)"
+          >
+            <Icon icon="tabler:file-text" />
+            <span>
+              <strong>{{ result.note.title || '无标题笔记' }}</strong>
+              <small>{{ result.excerpt || '暂无正文内容' }}</small>
+            </span>
+            <em>{{ result.folderPath }}</em>
+          </button>
+          <div v-if="!quickOpenResults.length" class="quick-open-empty">
+            <Icon icon="tabler:file-search" />
+            没有找到匹配的笔记
+          </div>
+        </div>
+        <footer>
+          <span><kbd>↑</kbd><kbd>↓</kbd> 选择</span>
+          <span><kbd>Enter</kbd> 打开</span>
+          <small v-if="!quickOpenKeyword">最近更新的笔记</small>
+        </footer>
+      </section>
+    </div>
+
+    <div v-if="generalSettingsVisible" class="dialog-backdrop" @click.self="generalSettingsVisible = false">
+      <form class="folder-dialog general-settings-dialog" aria-label="通用设置" @submit.prevent="saveGeneralSettings">
+        <div class="dialog-icon"><Icon icon="tabler:settings" /></div>
+        <h2>通用设置</h2>
+        <p>配置快速记录和笔记列表的显示方式。</p>
+        <div class="general-settings-list">
+          <section class="general-setting-item">
+            <div>
+              <strong>快速记录快捷键</strong>
+              <small>在其他应用中也可以呼出快速记录窗口</small>
+            </div>
+            <button
+              :class="['general-shortcut-recorder', { recording: generalShortcutRecording }]"
+              type="button"
+              @click="generalShortcutRecording = true"
+              @keydown="recordGeneralShortcut"
+            >
+              {{ generalShortcutRecording ? '请按快捷键…' : formatGeneralShortcut(generalShortcut) }}
+            </button>
+          </section>
+          <section class="general-setting-item">
+            <div>
+              <strong>快速打开快捷键</strong>
+              <small>仅在心悦笔记处于前台时搜索整个笔记库</small>
+            </div>
+            <button
+              :class="['general-shortcut-recorder', { recording: quickOpenShortcutRecording }]"
+              type="button"
+              @click="quickOpenShortcutRecording = true"
+              @keydown="recordQuickOpenShortcut"
+            >
+              {{ quickOpenShortcutRecording ? '请按快捷键…' : formatGeneralShortcut(draftQuickOpenShortcut) }}
+            </button>
+          </section>
+          <section class="general-setting-item">
+            <div>
+              <strong>文件夹树连接线</strong>
+              <small>显示侧边栏文件夹层级之间的辅助线</small>
+            </div>
+            <button
+              :class="['general-setting-switch', { active: draftShowTreeLines }]"
+              type="button"
+              role="switch"
+              :aria-checked="draftShowTreeLines"
+              @click="draftShowTreeLines = !draftShowTreeLines"
+            >
+              <span></span>
+            </button>
+          </section>
+        </div>
+        <p v-if="generalSettingsMessage" class="general-settings-message">{{ generalSettingsMessage }}</p>
+        <div class="general-settings-actions">
+          <button type="button" :disabled="generalSettingsSaving" @click="generalSettingsVisible = false">取消</button>
+          <button class="primary" type="submit" :disabled="generalSettingsSaving">
+            {{ generalSettingsSaving ? '保存中…' : '保存设置' }}
+          </button>
+        </div>
       </form>
     </div>
 

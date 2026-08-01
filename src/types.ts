@@ -172,6 +172,17 @@ export interface NotesDesktopApi {
   openExternalLink(url: string): Promise<boolean>
   saveImageAsset(input: SaveImageAssetInput): Promise<ImageAsset>
   createNote(folderId: string | null): Promise<OfflineNote>
+  openQuickCapture(): Promise<boolean>
+  hideQuickCapture(): Promise<boolean>
+  getQuickCaptureSettings(): Promise<{ shortcut: string, folderId: string | null }>
+  saveQuickCaptureSettings(input: { shortcut: string, folderId: string | null }): Promise<{ shortcut: string, folderId: string | null }>
+  createQuickNote(input: { title: string, content: string, folderId: string | null }): Promise<OfflineNote>
+  onQuickCaptureFocus(callback: () => void): () => void
+  onOpenQuickCaptureSettings(callback: () => void): () => void
+  /** 监听菜单栏打开通用设置的请求。 */
+  onOpenGeneralSettings(callback: () => void): () => void
+  /** 监听主进程捕获的快速记录 Escape 按键。 */
+  onQuickCaptureEscape(callback: () => void): () => void
   updateNote(noteId: string, patch: NotePatch): Promise<OfflineNote | null>
   listNoteHistory(noteId: string): Promise<NoteHistory[]>
   restoreNoteHistory(noteId: string, historyId: string): Promise<OfflineNote | null>
@@ -181,6 +192,7 @@ export interface NotesDesktopApi {
   emptyTrash(): Promise<number>
   createFolder(name: string, parentId?: string | null): Promise<NoteFolder>
   renameFolder(folderId: string, name: string): Promise<NoteFolder | null>
+  moveFolder(folderId: string, parentId: string | null, beforeFolderId: string | null): Promise<NoteFolder>
   setFolderDeleted(folderId: string): Promise<boolean>
   restoreFolder(folderId: string): Promise<boolean>
   deleteFolderPermanently(folderId: string): Promise<boolean>
@@ -191,6 +203,8 @@ export interface NotesDesktopApi {
   exportFullBackup(): Promise<DataTransferResult>
   importMarkdown(folderId: string | null): Promise<DataTransferResult>
   importFullBackup(): Promise<DataTransferResult>
+  /** 监听菜单栏打开导入导出窗口的请求。 */
+  onOpenDataTransfer(callback: () => void): () => void
   listDatabaseBackups(): Promise<DatabaseBackup[]>
   /** 获取当前档案的备份状态。 */
   getDatabaseBackupStatus(): Promise<DatabaseBackupStatus>
