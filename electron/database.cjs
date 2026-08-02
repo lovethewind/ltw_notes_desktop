@@ -594,6 +594,37 @@ function createRepository(database) {
     return note
   }
 
+  /**
+   * 复制一篇笔记到指定文件夹。
+   *
+   * @param {string} noteId 原笔记 ID。
+   * @param {string | null | undefined} targetFolderId 目标文件夹 ID；省略时保留原位置。
+   * @param {string | undefined} requestedTitle 用户指定的副本标题。
+   * @returns {Record<string, any>} 新建的笔记副本。
+   */
+  const duplicateNote = database.transaction((noteId, targetFolderId = undefined, requestedTitle = undefined) => {
+    const source = database.prepare("SELECT * FROM notes WHERE id = ?").get(noteId)
+    if (!source || source.is_deleted) throw new Error("原笔记不存在或已被删除")
+    const folderId = targetFolderId === undefined ? source.folder_id : targetFolderId || null
+    if (folderId) {
+      const folder = getFolder(folderId)
+      if (!folder || folder.isDeleted) throw new Error("目标文件夹不存在")
+    }
+    const id = randomUUID()
+    const timestamp = nowIso()
+    const defaultTitle = `${source.title.slice(0, 97)} 副本`
+    const title = (typeof requestedTitle === "string" ? requestedTitle.trim().slice(0, 100) : "") || defaultTitle
+    const content = localizeImageAssetReferences(source.content)
+    database.prepare(`
+      INSERT INTO notes(id, folder_id, title, content, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?)
+    `).run(id, folderId, title, content, timestamp, timestamp)
+    replaceNoteTags(id, selectTagsForNote.all(noteId).map((tag) => tag.name))
+    const note = getNote(id)
+    enqueue("note", id, "upsert", note)
+    return note
+  })
+
   /** 创建一篇已填写内容的快速记录。 */
   const createQuickNote = database.transaction((input = {}) => {
     const content = validateNoteContent(typeof input.content === "string" ? input.content.trim() : "")
@@ -658,18 +689,46 @@ function createRepository(database) {
    */
   function listNoteHistory(noteId) {
     return database.prepare(`
-      SELECT id, note_id AS noteId, title, content, folder_id AS folderId,
+      SELECT id, note_id AS noteId, title, substr(content, 1, 480) AS contentPrefix,
+             folder_id AS folderId,
              tag_names AS tagNames, created_at AS createdAt
       FROM note_history
       WHERE note_id = ?
       ORDER BY created_at DESC
       LIMIT 50
     `).all(noteId).map((history) => ({
+      id: history.id,
+      noteId: history.noteId,
+      title: history.title,
+      content: "",
+      folderId: history.folderId,
+      tagNames: JSON.parse(history.tagNames || "[]"),
+      createdAt: history.createdAt,
+      contentPreview: createHistoryContentPreview(history.contentPrefix)
+    }))
+  }
+
+  /**
+   * 按需查询一条历史版本的完整正文。
+   *
+   * @param {string} noteId 笔记 ID。
+   * @param {string} historyId 历史版本 ID。
+   * @returns {Record<string, any> | null} 历史版本详情，不存在时返回空值。
+   */
+  function getNoteHistory(noteId, historyId) {
+    const history = database.prepare(`
+      SELECT id, note_id AS noteId, title, content, folder_id AS folderId,
+             tag_names AS tagNames, created_at AS createdAt
+      FROM note_history
+      WHERE id = ? AND note_id = ?
+    `).get(historyId, noteId)
+    if (!history) return null
+    return {
       ...history,
       content: localizeImageAssetReferences(history.content),
       tagNames: JSON.parse(history.tagNames || "[]"),
-      contentPreview: createHistoryContentPreview(history.content)
-    }))
+      contentPreview: createHistoryContentPreview(history.content.slice(0, 480))
+    }
   }
 
   /**
@@ -1479,16 +1538,24 @@ function createRepository(database) {
       content: expandImageAssetReferences(history.content),
       tagNames: JSON.parse(history.tagNames || "[]")
     }))
-    return { folders: allFolders, tags: allTags, notes, histories, tombstones }
+    return {
+      folders: allFolders,
+      tags: allTags,
+      notes,
+      histories,
+      tombstones,
+      outboxIds: rows.map((row) => row.id)
+    }
   }
 
   /**
    * 应用云端合并结果并保留正文冲突副本。
    *
    * @param {Record<string, any>} result 云端同步结果。
+   * @param {number[] | null} acknowledgedOutboxIds 本轮已发送并可确认的待同步记录 ID。
    * @returns {{ conflictCount: number }} 应用结果。
    */
-  const applySyncResult = database.transaction((result) => {
+  const applySyncResult = database.transaction((result, acknowledgedOutboxIds = null) => {
     const snapshot = result.snapshot || { folders: [], tags: [], notes: [] }
     const hasHistorySnapshot = Array.isArray(snapshot.histories)
     const conflictIds = new Set(result.conflictClientIds || [])
@@ -1533,11 +1600,32 @@ function createRepository(database) {
       enqueue("note", conflictId, "upsert", getNote(conflictId))
     }
 
-    database.prepare("DELETE FROM outbox WHERE entity_id NOT IN (SELECT id FROM notes WHERE dirty = 1 AND server_id IS NULL)")
-      .run()
+    const confirmedIds = Array.isArray(acknowledgedOutboxIds)
+      ? acknowledgedOutboxIds
+      : database.prepare("SELECT id FROM outbox").all().map((row) => row.id)
+    if (confirmedIds.length) {
+      const placeholders = confirmedIds.map(() => "?").join(",")
+      database.prepare(`DELETE FROM outbox WHERE id IN (${placeholders})`).run(...confirmedIds)
+    }
+    const pendingMutations = database.prepare(`
+      SELECT entity_type AS entityType, entity_id AS entityId
+      FROM outbox
+    `).all()
+    const pendingMutationIds = new Map()
+    for (const item of pendingMutations) {
+      if (!pendingMutationIds.has(item.entityType)) pendingMutationIds.set(item.entityType, new Set())
+      pendingMutationIds.get(item.entityType).add(item.entityId)
+    }
 
     const folderLocalIds = new Map()
     for (const remote of snapshot.folders || []) {
+      if (pendingMutationIds.get("folder")?.has(remote.clientId)) {
+        const pendingLocal = database.prepare(`
+          SELECT id FROM folders WHERE server_id = ? OR id = ? LIMIT 1
+        `).get(String(remote.serverId), remote.clientId)
+        if (pendingLocal) folderLocalIds.set(remote.clientId, pendingLocal.id)
+        continue
+      }
       let local = database.prepare(`
         SELECT id FROM folders WHERE server_id = ? OR id = ? LIMIT 1
       `).get(String(remote.serverId), remote.clientId)
@@ -1581,6 +1669,7 @@ function createRepository(database) {
       folderLocalIds.set(remote.clientId, localId)
     }
     for (const remote of snapshot.folders || []) {
+      if (pendingMutationIds.get("folder")?.has(remote.clientId)) continue
       database.prepare(`
         UPDATE folders SET parent_id = ?, deleted_root_id = ? WHERE id = ?
       `).run(
@@ -1592,6 +1681,13 @@ function createRepository(database) {
 
     const tagLocalIds = new Map()
     for (const remote of snapshot.tags || []) {
+      if (pendingMutationIds.get("tag")?.has(remote.clientId)) {
+        const pendingLocal = database.prepare(`
+          SELECT id FROM tags WHERE server_id = ? OR id = ? LIMIT 1
+        `).get(String(remote.serverId), remote.clientId)
+        if (pendingLocal) tagLocalIds.set(remote.clientId, pendingLocal.id)
+        continue
+      }
       let local = database.prepare(`
         SELECT id FROM tags WHERE server_id = ? OR id = ? OR name = ? COLLATE NOCASE LIMIT 1
       `).get(String(remote.serverId), remote.clientId, remote.name)
@@ -1621,6 +1717,13 @@ function createRepository(database) {
 
     const noteLocalIds = new Map()
     for (const remote of snapshot.notes || []) {
+      if (pendingMutationIds.get("note")?.has(remote.clientId)) {
+        const pendingLocal = database.prepare(`
+          SELECT id FROM notes WHERE server_id = ? OR id = ? LIMIT 1
+        `).get(String(remote.serverId), remote.clientId)
+        if (pendingLocal) noteLocalIds.set(remote.clientId, pendingLocal.id)
+        continue
+      }
       let local = database.prepare(`
         SELECT id FROM notes WHERE server_id = ? OR id = ? LIMIT 1
       `).get(String(remote.serverId), remote.clientId)
@@ -1766,9 +1869,11 @@ function createRepository(database) {
     relocateImageAssetPaths,
     listWorkspace,
     createNote,
+    duplicateNote,
     createQuickNote,
     updateNote,
     listNoteHistory,
+    getNoteHistory,
     restoreNoteHistory,
     deleteNoteHistory,
     setNoteDeleted,

@@ -120,7 +120,47 @@ function createMarkdownZip(backup) {
   return zip.toBuffer()
 }
 
+/**
+ * 直接读取 Markdown ZIP 中的文档，并保留压缩包内部目录层级。
+ *
+ * @param {Buffer|string} source ZIP 文件内容或本地路径。
+ * @returns {Array<{ title: string, content: string, tagNames: string[], folderPath: string[] }>} Markdown 文档列表。
+ */
+function collectMarkdownDocumentsFromZip(source) {
+  const zip = new AdmZip(source)
+  const documents = []
+  for (const entry of zip.getEntries()) {
+    const entryName = String(entry.entryName || "").replace(/\\/g, "/")
+    const pathParts = entryName.split("/").filter(Boolean)
+    if (
+      entryName.startsWith("/")
+      || /^[a-zA-Z]:\//.test(entryName)
+      || pathParts.includes("..")
+    ) {
+      throw new Error(`压缩包包含不安全路径：${entryName}`)
+    }
+    if (
+      entry.isDirectory
+      || !pathParts.length
+      || pathParts.includes("__MACOSX")
+      || pathParts.some((part) => part === ".DS_Store" || part.startsWith("._"))
+    ) {
+      continue
+    }
+    const fileName = pathParts.at(-1)
+    const extension = fileName.includes(".") ? `.${fileName.split(".").at(-1).toLowerCase()}` : ""
+    if (![".md", ".markdown"].includes(extension)) continue
+    const content = entry.getData().toString("utf8")
+    documents.push({
+      ...parseMarkdownDocument(content, fileName.slice(0, -extension.length)),
+      folderPath: pathParts.slice(0, -1)
+    })
+  }
+  return documents
+}
+
 module.exports = {
+  collectMarkdownDocumentsFromZip,
   createMarkdownDocument,
   createMarkdownZip,
   parseMarkdownDocument,

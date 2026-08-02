@@ -22,6 +22,17 @@ contextBridge.exposeInMainWorld("notesDesktop", {
   openExternalLink: (url) => ipcRenderer.invoke("external-link:open", url),
   saveImageAsset: (input) => ipcRenderer.invoke("asset:save-image", input),
   createNote: (folderId) => ipcRenderer.invoke("note:create", folderId),
+  /**
+   * 复制笔记到指定文件夹。
+   *
+   * @param {string} noteId 原笔记 ID。
+   * @param {string | null} targetFolderId 目标文件夹 ID，空值表示未分类。
+   * @param {string} title 副本标题。
+   * @returns {Promise<Record<string, any>>} 新建的笔记副本。
+   */
+  duplicateNote: (noteId, targetFolderId, title) => (
+    ipcRenderer.invoke("note:duplicate", noteId, targetFolderId, title)
+  ),
   openQuickCapture: () => ipcRenderer.invoke("quick-capture:open"),
   hideQuickCapture: () => ipcRenderer.invoke("quick-capture:hide"),
   getQuickCaptureSettings: () => ipcRenderer.invoke("quick-capture:settings:get"),
@@ -49,6 +60,17 @@ contextBridge.exposeInMainWorld("notesDesktop", {
     return () => ipcRenderer.removeListener("general-settings:open", listener)
   },
   /**
+   * 监听桌面菜单发起的搜索操作。
+   *
+   * @param {(target: "workspace" | "quick-open" | "current-note") => void} callback 搜索操作回调。
+   * @returns {() => void} 取消监听函数。
+   */
+  onOpenSearch: (callback) => {
+    const listener = (_event, target) => callback(target)
+    ipcRenderer.on("search:open", listener)
+    return () => ipcRenderer.removeListener("search:open", listener)
+  },
+  /**
    * 监听主进程捕获的快速记录 Escape 按键。
    *
    * @param {() => void} callback Escape 按键回调。
@@ -61,6 +83,7 @@ contextBridge.exposeInMainWorld("notesDesktop", {
   },
   updateNote: (noteId, patch) => ipcRenderer.invoke("note:update", noteId, patch),
   listNoteHistory: (noteId) => ipcRenderer.invoke("note-history:list", noteId),
+  getNoteHistory: (noteId, historyId) => ipcRenderer.invoke("note-history:detail", noteId, historyId),
   restoreNoteHistory: (noteId, historyId) => ipcRenderer.invoke("note-history:restore", noteId, historyId),
   deleteNoteHistory: (noteId, historyId) => ipcRenderer.invoke("note-history:delete", noteId, historyId),
   setNoteDeleted: (noteId, deleted) => ipcRenderer.invoke("note:set-deleted", noteId, deleted),

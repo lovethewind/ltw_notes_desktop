@@ -42,6 +42,18 @@ export function formatNoteExcerpt(content: string): string {
 }
 
 /**
+ * 从有限正文前缀生成侧边栏短摘要。
+ *
+ * :param content: 笔记正文。
+ * :param maxLength: 摘要最大字符数。
+ * :return: 最长为指定字符数的单行摘要。
+ */
+export function formatNotePreview(content: string, maxLength: number = 120): string {
+  const scanLength = Math.max(512, maxLength * 4)
+  return formatNoteExcerpt(content.slice(0, scanLength)).slice(0, maxLength)
+}
+
+/**
  * 判断笔记标题或正文是否匹配搜索词。
  *
  * :param note: 待搜索笔记。
@@ -68,9 +80,9 @@ export function formatNoteSearchExcerpt(
   note: { content: string },
   keyword: string
 ): string {
-  const excerpt = formatNoteExcerpt(note.content)
   const normalizedKeyword = keyword.trim().toLocaleLowerCase()
-  if (!normalizedKeyword) return excerpt
+  if (!normalizedKeyword) return formatNotePreview(note.content)
+  const excerpt = formatNoteExcerpt(note.content)
   const matchIndex = excerpt.toLocaleLowerCase().indexOf(normalizedKeyword)
   if (matchIndex < 0) return excerpt
   const start = Math.max(0, matchIndex - 28)

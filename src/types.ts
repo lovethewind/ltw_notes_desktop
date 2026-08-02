@@ -172,6 +172,8 @@ export interface NotesDesktopApi {
   openExternalLink(url: string): Promise<boolean>
   saveImageAsset(input: SaveImageAssetInput): Promise<ImageAsset>
   createNote(folderId: string | null): Promise<OfflineNote>
+  /** 复制笔记到指定文件夹。 */
+  duplicateNote(noteId: string, targetFolderId: string | null, title: string): Promise<OfflineNote>
   openQuickCapture(): Promise<boolean>
   hideQuickCapture(): Promise<boolean>
   getQuickCaptureSettings(): Promise<{ shortcut: string, folderId: string | null }>
@@ -181,10 +183,13 @@ export interface NotesDesktopApi {
   onOpenQuickCaptureSettings(callback: () => void): () => void
   /** 监听菜单栏打开通用设置的请求。 */
   onOpenGeneralSettings(callback: () => void): () => void
+  /** 监听菜单栏发起的搜索操作。 */
+  onOpenSearch(callback: (target: 'workspace' | 'quick-open' | 'current-note') => void): () => void
   /** 监听主进程捕获的快速记录 Escape 按键。 */
   onQuickCaptureEscape(callback: () => void): () => void
   updateNote(noteId: string, patch: NotePatch): Promise<OfflineNote | null>
   listNoteHistory(noteId: string): Promise<NoteHistory[]>
+  getNoteHistory(noteId: string, historyId: string): Promise<NoteHistory | null>
   restoreNoteHistory(noteId: string, historyId: string): Promise<OfflineNote | null>
   deleteNoteHistory(noteId: string, historyId: string): Promise<boolean>
   setNoteDeleted(noteId: string, deleted: boolean): Promise<OfflineNote | null>

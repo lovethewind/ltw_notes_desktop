@@ -18,6 +18,7 @@ const {
 } = require("electron")
 const { openNotesDatabase } = require("./database.cjs")
 const {
+  collectMarkdownDocumentsFromZip,
   createMarkdownDocument,
   createMarkdownZip,
   parseMarkdownDocument,
@@ -960,16 +961,17 @@ async function performSync() {
     try {
       await uploadPendingImageAssets(controller.signal)
       const batch = repository.getSyncBatch()
+      const { outboxIds, ...syncPayload } = batch
       const response = await requestBackendJson(`${syncSettings.backendUrl}/api/note-sync/push`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
           web_token: syncSettings.token
         },
-        body: JSON.stringify(batch),
+        body: JSON.stringify(syncPayload),
         signal: controller.signal
       })
-      const applied = repository.applySyncResult(response.data || {})
+      const applied = repository.applySyncResult(response.data || {}, outboxIds)
       await cacheRemoteImages(controller.signal)
       await cacheRemoteAttachments(controller.signal)
       const lastSuccessAt = new Date().toISOString()
@@ -1174,21 +1176,28 @@ async function collectMarkdownDocuments(rootPath, currentPath = rootPath) {
 }
 
 /**
- * 选择 Markdown 文件夹并导入指定文件夹。
+ * 选择 Markdown 文件夹或 ZIP 压缩包并导入指定文件夹。
  *
  * @param {string | null} folderId 目标文件夹 ID。
  * @returns {Promise<Record<string, any>>} 导入结果。
  */
 async function importMarkdownFiles(folderId) {
   const result = await dialog.showOpenDialog(mainWindow, {
-    title: "选择 Markdown 文件夹",
-    properties: ["openDirectory", "createDirectory"]
+    title: "选择 Markdown 文件夹或 ZIP 压缩包",
+    properties: ["openFile", "openDirectory", "createDirectory"],
+    filters: [{ name: "Markdown ZIP 压缩包", extensions: ["zip"] }]
   })
   if (result.canceled || !result.filePaths[0]) return { canceled: true }
   const sourcePath = result.filePaths[0]
-  const documents = await collectMarkdownDocuments(sourcePath)
-  if (!documents.length) throw new Error("所选文件夹中没有 Markdown 文件")
-  const sourceFolderName = path.basename(sourcePath) || `Markdown 导入 ${getExportTimestamp()}`
+  const sourceStats = await fs.promises.stat(sourcePath)
+  const isZipSource = sourceStats.isFile() && path.extname(sourcePath).toLowerCase() === ".zip"
+  if (sourceStats.isFile() && !isZipSource) throw new Error("请选择 ZIP 压缩包或 Markdown 文件夹")
+  const documents = isZipSource
+    ? collectMarkdownDocumentsFromZip(await fs.promises.readFile(sourcePath))
+    : await collectMarkdownDocuments(sourcePath)
+  if (!documents.length) throw new Error("所选内容中没有 Markdown 文件")
+  const sourceFolderName = isZipSource ? "" : path.basename(sourcePath)
+  const sourceLabel = path.basename(sourcePath) || `Markdown 导入 ${getExportTimestamp()}`
   const imported = applyLocalMutation(() => repository.importMarkdownDocuments(
     documents,
     folderId,
@@ -1197,7 +1206,7 @@ async function importMarkdownFiles(folderId) {
   mainWindow?.webContents.send("workspace:changed")
   return {
     canceled: false,
-    message: `已从“${sourceFolderName}”导入 ${imported.importedNotes} 篇 Markdown 笔记`,
+    message: `已从“${sourceLabel}”导入 ${imported.importedNotes} 篇 Markdown 笔记`,
     ...imported
   }
 }
@@ -1558,6 +1567,9 @@ function registerIpcHandlers() {
   ipcMain.handle("note:create", (_event, folderId) => (
     applyLocalMutation(() => repository.createNote(folderId || null))
   ))
+  ipcMain.handle("note:duplicate", (_event, noteId, targetFolderId, title) => (
+    applyLocalMutation(() => repository.duplicateNote(noteId, targetFolderId, title))
+  ))
   ipcMain.handle("quick-capture:open", () => {
     showQuickCaptureWindow()
     return true
@@ -1599,10 +1611,12 @@ function registerIpcHandlers() {
   ipcMain.handle("note:update", (_event, noteId, patch) => (
     applyLocalMutation(() => repository.updateNote(noteId, patch))
   ))
-  ipcMain.handle("note-history:list", async (_event, noteId) => {
-    await performSync()
+  ipcMain.handle("note-history:list", (_event, noteId) => {
     return repository.listNoteHistory(noteId)
   })
+  ipcMain.handle("note-history:detail", (_event, noteId, historyId) => (
+    repository.getNoteHistory(noteId, historyId)
+  ))
   ipcMain.handle("note-history:restore", (_event, noteId, historyId) => {
     const restored = repository.restoreNoteHistory(noteId, historyId)
     if (restored) requestImmediateSync()
@@ -1730,6 +1744,26 @@ function installMenu() {
         { label: "复制", role: "copy" },
         { label: "粘贴", role: "paste" },
         { label: "全选", role: "selectAll" }
+      ]
+    },
+    {
+      label: "搜索",
+      submenu: [
+        {
+          label: "搜索全部笔记…",
+          accelerator: "CmdOrCtrl+K",
+          click: () => mainWindow?.webContents.send("search:open", "workspace")
+        },
+        {
+          label: "快速打开…",
+          click: () => mainWindow?.webContents.send("search:open", "quick-open")
+        },
+        { type: "separator" },
+        {
+          label: "在当前笔记中查找",
+          accelerator: "CmdOrCtrl+F",
+          click: () => mainWindow?.webContents.send("search:open", "current-note")
+        }
       ]
     },
     {

@@ -1,6 +1,8 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import { Icon } from '@iconify/vue'
+import DOMPurify from 'dompurify'
+import { marked } from 'marked'
 import {
   formatNoteExcerpt as getNoteExcerpt,
   formatNoteUpdatedTime as formatTime,
@@ -9,6 +11,16 @@ import {
   type NoteNavigationKind
 } from './utils/note-workspace'
 import { collectBlockedFolderDropIds, getDragAutoScrollDelta } from './utils/resource-drag'
+import {
+  activateNoteInCurrentTab,
+  activateNoteInNewTab,
+  closeOtherNoteTabs,
+  closeNoteTab as getClosedNoteTabs,
+  closeNoteTabsToRight,
+  partitionNoteTabs,
+  reconcileNoteTabs,
+  type NoteTabsState
+} from './utils/note-tabs'
 import NoteNavigation from './components/NoteNavigation.vue'
 import FolderTreeItem from './components/FolderTreeItem.vue'
 import MarkdownVisualEditor from './components/MarkdownVisualEditor.vue'
@@ -33,6 +45,7 @@ import type {
 
 type FilterKind = 'all' | 'pinned' | 'trash' | 'folder' | 'tag'
 type SaveState = 'idle' | 'saving' | 'saved' | 'error'
+type SearchMenuTarget = 'workspace' | 'quick-open' | 'current-note'
 
 interface ActiveFilter {
   kind: FilterKind
@@ -85,6 +98,12 @@ interface QuickOpenResult {
 const workspace = reactive<WorkspaceData>({ folders: [], tags: [], notes: [], pendingCount: 0 })
 const activeFilter = reactive<ActiveFilter>({ kind: 'all', id: null })
 const activeNoteId = ref<string | null>(null)
+const openNoteIds = ref<string[]>([])
+const activeTabNoteId = ref<string | null>(null)
+const noteTabBarElement = ref<HTMLElement | null>(null)
+const noteTabBarWidth = ref(0)
+const noteTabOverflowVisible = ref(false)
+const tabContextMenu = reactive({ visible: false, x: 0, y: 0, noteId: null as string | null })
 const searchKeyword = ref('')
 const searchInput = ref<HTMLInputElement | null>(null)
 const noteFindVisible = ref(false)
@@ -103,11 +122,23 @@ const historyVisible = ref(false)
 const noteHistories = ref<NoteHistory[]>([])
 const selectedHistoryId = ref<string | null>(null)
 const historyLoading = ref(false)
+const historyDetailLoading = ref(false)
 const actionError = ref('')
 const updateDialogVisible = ref(false)
 const updateChecking = ref(false)
 const updateError = ref('')
 const updateResult = ref<UpdateCheckResult | null>(null)
+
+/**
+ * 将新版本发布说明渲染为经过净化的 HTML。
+ *
+ * :return: 可安全展示的发布说明 HTML。
+ */
+const renderedUpdateReleaseNotes = computed<string>(() => {
+  const releaseNotes = updateResult.value?.releaseNotes
+  if (updateResult.value?.status !== 'available' || !releaseNotes) return ''
+  return DOMPurify.sanitize(marked.parse(releaseNotes, { async: false }))
+})
 const syncDialogVisible = ref(false)
 const generalSettingsVisible = ref(false)
 const generalSettingsSaving = ref(false)
@@ -146,6 +177,11 @@ const databaseBackupStatus = reactive<DatabaseBackupStatus>({
 const databaseBackupSettings = reactive<DatabaseBackupSettings>({ schedule: 'daily', retention: 10 })
 const markdownImportTargetVisible = ref(false)
 const markdownImportTargetFolderId = ref<string | null>(null)
+const duplicateNoteVisible = ref(false)
+const duplicateNoteBusy = ref(false)
+const duplicateNoteSource = ref<OfflineNote | null>(null)
+const duplicateNoteTargetFolderId = ref<string | null>(null)
+const duplicateNoteTitle = ref('')
 const verifiedBackendUrl = ref('')
 const syncSettings = reactive<SyncSettingsView>({
   backendUrl: 'https://lovethewind.cn',
@@ -236,6 +272,7 @@ let disposeOpenNoteLink: (() => void) | null = null
 let disposeCheckForUpdates: (() => void) | null = null
 let disposeOpenDataTransfer: (() => void) | null = null
 let disposeOpenGeneralSettings: (() => void) | null = null
+let disposeOpenSearch: (() => void) | null = null
 let disposeDatabaseBackupStatus: (() => void) | null = null
 let disposeSyncAuthResult: (() => void) | null = null
 let disposeSyncStatus: (() => void) | null = null
@@ -243,8 +280,28 @@ let disposeWorkspaceChanged: (() => void) | null = null
 let syncBrowserLoginTimer: ReturnType<typeof setTimeout> | null = null
 let resourceAutoScrollFrame: number | null = null
 let resourceAutoScrollDelta = 0
+let noteTabResizeObserver: ResizeObserver | null = null
 
 const activeNote = computed(() => workspace.notes.find((note) => note.id === activeNoteId.value) ?? null)
+const openNoteTabs = computed<OfflineNote[]>(() => openNoteIds.value
+  .map((noteId) => workspace.notes.find((note) => note.id === noteId && !note.isDeleted))
+  .filter((note): note is OfflineNote => Boolean(note)))
+const partitionedNoteTabs = computed(() => {
+  if (!noteTabBarWidth.value) {
+    return partitionNoteTabs(openNoteIds.value, activeTabNoteId.value, openNoteIds.value.length)
+  }
+  const withoutOverflow = Math.max(1, Math.floor(noteTabBarWidth.value / 160))
+  const maxVisible = openNoteIds.value.length > withoutOverflow
+    ? Math.max(1, Math.floor((noteTabBarWidth.value - 42) / 160))
+    : withoutOverflow
+  return partitionNoteTabs(openNoteIds.value, activeTabNoteId.value, maxVisible)
+})
+const visibleNoteTabs = computed<OfflineNote[]>(() => partitionedNoteTabs.value.visibleNoteIds
+  .map((noteId) => openNoteTabs.value.find((note) => note.id === noteId))
+  .filter((note): note is OfflineNote => Boolean(note)))
+const overflowNoteTabs = computed<OfflineNote[]>(() => partitionedNoteTabs.value.overflowNoteIds
+  .map((noteId) => openNoteTabs.value.find((note) => note.id === noteId))
+  .filter((note): note is OfflineNote => Boolean(note)))
 const allCount = computed(() => workspace.notes.filter((note) => !note.isDeleted).length)
 const pinnedCount = computed(() => workspace.notes.filter((note) => !note.isDeleted && note.isPinned).length)
 const trashCount = computed(() => workspace.notes.filter((note) => note.isDeleted).length)
@@ -259,6 +316,30 @@ const recycleRootFolders = computed(() => {
     || folder.deletedRootId !== workspace.folders.find((item) => item.id === folder.parentId)?.deletedRootId
   ))
 })
+
+/**
+ * 一次性统计每个文件夹及其父级路径中的笔记数量。
+ *
+ * :param folders: 待统计的文件夹。
+ * :param notes: 待统计的笔记。
+ * :return: 文件夹 ID 到后代笔记总数的映射。
+ */
+function buildFolderNoteCounts(folders: NoteFolder[], notes: OfflineNote[]): Map<string, number> {
+  const counts = new Map<string, number>()
+  const foldersById = new Map(folders.map((folder) => [folder.id, folder]))
+  for (const note of notes) {
+    let folderId = note.folderId
+    const visited = new Set<string>()
+    while (folderId && !visited.has(folderId)) {
+      visited.add(folderId)
+      counts.set(folderId, (counts.get(folderId) ?? 0) + 1)
+      folderId = foldersById.get(folderId)?.parentId ?? null
+    }
+  }
+  return counts
+}
+
+const recycleFolderNoteCounts = computed(() => buildFolderNoteCounts(deletedFolders.value, deletedNotes.value))
 const standaloneDeletedNotes = computed(() => deletedNotes.value.filter((note) => {
   if (note.deletedByFolderId) return false
   return !deletedFolders.value.some((folder) => folder.id === note.folderId)
@@ -296,7 +377,7 @@ const explorerNotes = computed(() => {
   })
 })
 const searchFolderIds = computed(() => {
-  if (!searchKeyword.value.trim()) return null
+  if (!searchKeyword.value.trim() && activeFilter.kind !== 'tag') return null
   const folderById = new Map(workspace.folders.map((folder) => [folder.id, folder]))
   const visibleIds = new Set<string>()
   for (const note of explorerNotes.value) {
@@ -328,6 +409,7 @@ const explorerUnclassifiedExpanded = computed(() => (
 const rootFolders = computed(() => explorerFolders.value.filter((folder) => (
   !folder.isDeleted && folder.parentId === null
 )))
+const folderNoteCounts = computed(() => buildFolderNoteCounts(explorerFolders.value, explorerNotes.value))
 const resourceDragEnabled = computed(() => activeFilter.kind === 'all' && !searchKeyword.value.trim())
 const blockedFolderDropIds = computed(() => collectBlockedFolderDropIds(
   draggedResource.value?.kind === 'folder' ? draggedResource.value.id : null,
@@ -731,6 +813,42 @@ function openQuickOpen(): void {
   quickOpenKeyword.value = ''
   quickOpenActiveIndex.value = 0
   void nextTick(() => quickOpenInput.value?.focus())
+}
+
+/**
+ * 打开当前笔记查找栏并聚焦关键词输入框。
+ *
+ * :return: 无返回值。
+ */
+function openCurrentNoteFind(): void {
+  if (!activeNote.value) return
+  noteFindVisible.value = true
+  void nextTick(() => {
+    noteFindInput.value?.focus()
+    noteFindInput.value?.select()
+  })
+}
+
+/**
+ * 响应桌面菜单中的搜索操作。
+ *
+ * :param target: 搜索入口类型。
+ * :return: 无返回值。
+ */
+function handleSearchMenuCommand(target: SearchMenuTarget): void {
+  if (target === 'quick-open') {
+    openQuickOpen()
+    return
+  }
+  if (target === 'current-note') {
+    openCurrentNoteFind()
+    return
+  }
+  setFilter('all')
+  void nextTick(() => {
+    searchInput.value?.focus()
+    searchInput.value?.select()
+  })
 }
 
 /**
@@ -1359,6 +1477,156 @@ async function selectNote(note: OfflineNote): Promise<void> {
 }
 
 /**
+ * 应用新的笔记标签状态。
+ *
+ * :param state: 新的标签状态。
+ * :return: 无返回值。
+ */
+function applyNoteTabsState(state: NoteTabsState): void {
+  openNoteIds.value = state.noteIds
+  activeTabNoteId.value = state.activeNoteId
+}
+
+/**
+ * 将普通笔记打开操作同步到当前标签。
+ *
+ * :param noteId: 当前打开的笔记 ID。
+ * :return: 无返回值。
+ */
+function syncCurrentNoteTab(noteId: string | null): void {
+  if (!noteId) {
+    activeTabNoteId.value = null
+    return
+  }
+  applyNoteTabsState(activateNoteInCurrentTab({
+    noteIds: openNoteIds.value,
+    activeNoteId: activeTabNoteId.value
+  }, noteId))
+}
+
+/**
+ * 在新标签页中打开指定笔记。
+ *
+ * :param note: 待打开的笔记。
+ * :return: 笔记切换完成后的 Promise。
+ */
+async function openNoteInNewTab(note: OfflineNote): Promise<void> {
+  applyNoteTabsState(activateNoteInNewTab({
+    noteIds: openNoteIds.value,
+    activeNoteId: activeTabNoteId.value
+  }, note.id))
+  await selectNote(note)
+}
+
+/**
+ * 从右键菜单在新标签页中打开笔记。
+ *
+ * :return: 笔记切换完成后的 Promise。
+ */
+async function openContextNoteInNewTab(): Promise<void> {
+  const note = contextMenu.note
+  closeContextMenu()
+  if (note) await openNoteInNewTab(note)
+}
+
+/**
+ * 切换到已打开的笔记标签。
+ *
+ * :param note: 待切换的笔记。
+ * :return: 笔记切换完成后的 Promise。
+ */
+async function switchNoteTab(note: OfflineNote): Promise<void> {
+  activeTabNoteId.value = note.id
+  await selectNote(note)
+}
+
+/**
+ * 关闭笔记标签，并在需要时切换到相邻笔记。
+ *
+ * :param noteId: 待关闭标签对应的笔记 ID。
+ * :return: 标签关闭完成后的 Promise。
+ */
+async function closeNoteTab(noteId: string): Promise<void> {
+  const nextState = getClosedNoteTabs({
+    noteIds: openNoteIds.value,
+    activeNoteId: activeTabNoteId.value
+  }, noteId)
+  await applyClosedNoteTabs(nextState)
+}
+
+/**
+ * 应用关闭操作后的标签状态，并在当前标签变化时切换笔记。
+ *
+ * :param nextState: 关闭操作后的标签状态。
+ * :return: 标签状态应用完成后的 Promise。
+ */
+async function applyClosedNoteTabs(nextState: NoteTabsState): Promise<void> {
+  applyNoteTabsState(nextState)
+  if (activeNoteId.value === nextState.activeNoteId) return
+  const nextNote = workspace.notes.find((note) => note.id === nextState.activeNoteId && !note.isDeleted)
+  if (nextNote) {
+    await selectNote(nextNote)
+    return
+  }
+  await flushSave()
+  activeNoteId.value = null
+}
+
+/**
+ * 打开标签右键菜单。
+ *
+ * :param event: 鼠标右键事件。
+ * :param noteId: 标签对应的笔记 ID。
+ * :return: 无返回值。
+ */
+function openNoteTabContextMenu(event: MouseEvent, noteId: string): void {
+  noteTabOverflowVisible.value = false
+  Object.assign(tabContextMenu, {
+    visible: true,
+    x: Math.min(event.clientX, window.innerWidth - 190),
+    y: Math.min(event.clientY, window.innerHeight - 170),
+    noteId
+  })
+}
+
+/**
+ * 执行标签关闭菜单命令。
+ *
+ * :param command: 标签关闭命令。
+ * :return: 标签关闭完成后的 Promise。
+ */
+async function handleNoteTabCloseCommand(command: 'close' | 'others' | 'right'): Promise<void> {
+  const noteId = tabContextMenu.noteId
+  tabContextMenu.visible = false
+  if (!noteId) return
+  const state = { noteIds: openNoteIds.value, activeNoteId: activeTabNoteId.value }
+  if (command === 'close') await applyClosedNoteTabs(getClosedNoteTabs(state, noteId))
+  if (command === 'others') await applyClosedNoteTabs(closeOtherNoteTabs(state, noteId))
+  if (command === 'right') await applyClosedNoteTabs(closeNoteTabsToRight(state, noteId))
+}
+
+/**
+ * 从溢出列表切换到指定笔记。
+ *
+ * :param note: 待切换的笔记。
+ * :return: 笔记切换完成后的 Promise。
+ */
+async function chooseOverflowNoteTab(note: OfflineNote): Promise<void> {
+  noteTabOverflowVisible.value = false
+  await switchNoteTab(note)
+}
+
+/**
+ * 更新标签栏可用宽度。
+ *
+ * :param entries: 尺寸监听结果。
+ * :return: 无返回值。
+ */
+function updateNoteTabBarWidth(entries: ResizeObserverEntry[]): void {
+  noteTabBarWidth.value = entries[0]?.contentRect.width ?? noteTabBarElement.value?.clientWidth ?? 0
+}
+
+/**
  * 接收编辑器内容变化，仅写入变化所属的当前笔记。
  *
  * :param value: 最新 Markdown 内容。
@@ -1474,15 +1742,48 @@ async function flushSave(): Promise<void> {
  */
 async function openNoteHistory(): Promise<void> {
   if (!activeNoteId.value) return
-  await flushSave()
   historyVisible.value = true
   historyLoading.value = true
   try {
+    await flushSave()
     noteHistories.value = await window.notesDesktop.listNoteHistory(activeNoteId.value)
     selectedHistoryId.value = noteHistories.value[0]?.id ?? null
   } finally {
     historyLoading.value = false
   }
+  await loadSelectedHistory(selectedHistoryId.value)
+}
+
+/**
+ * 按需加载选中历史版本的完整正文。
+ *
+ * :param historyId: 历史版本 ID。
+ * :return: 详情加载完成后的 Promise。
+ */
+async function loadSelectedHistory(historyId: string | null): Promise<void> {
+  if (!activeNoteId.value || !historyId) return
+  const existing = noteHistories.value.find((history) => history.id === historyId)
+  if (existing?.content) return
+  historyDetailLoading.value = true
+  try {
+    const detail = await window.notesDesktop.getNoteHistory(activeNoteId.value, historyId)
+    if (!detail || selectedHistoryId.value !== historyId) return
+    const index = noteHistories.value.findIndex((history) => history.id === historyId)
+    if (index >= 0) noteHistories.value[index] = detail
+  } finally {
+    if (selectedHistoryId.value === historyId) historyDetailLoading.value = false
+  }
+}
+
+/**
+ * 选择历史版本并加载完整正文。
+ *
+ * :param historyId: 历史版本 ID。
+ * :return: 详情加载完成后的 Promise。
+ */
+async function selectHistory(historyId: string): Promise<void> {
+  selectedHistoryId.value = historyId
+  await loadSelectedHistory(historyId)
 }
 
 /**
@@ -1555,6 +1856,52 @@ async function createNoteInFolder(folderId: string | null): Promise<void> {
     unclassifiedExpanded.value = true
   }
   await selectNote(note)
+}
+
+/**
+ * 打开笔记复制位置选择窗口。
+ *
+ * :param note: 待复制的原笔记。
+ * :return: 无返回值。
+ */
+function openDuplicateNoteDialog(note: OfflineNote): void {
+  duplicateNoteSource.value = note
+  duplicateNoteTargetFolderId.value = note.folderId
+  duplicateNoteTitle.value = `${note.title.slice(0, 97)} 副本`
+  duplicateNoteVisible.value = true
+}
+
+/**
+ * 将选中的笔记复制到目标文件夹并打开副本。
+ *
+ * :return: 复制完成后的 Promise。
+ */
+async function submitDuplicateNote(): Promise<void> {
+  const source = duplicateNoteSource.value
+  if (!source || duplicateNoteBusy.value) return
+  duplicateNoteBusy.value = true
+  try {
+    await flushSave()
+    const note = await window.notesDesktop.duplicateNote(
+      source.id,
+      duplicateNoteTargetFolderId.value,
+      duplicateNoteTitle.value
+    )
+    workspace.notes.unshift(note)
+    workspace.pendingCount += 1
+    if (note.folderId) {
+      expandedFolderIds.value = new Set([...expandedFolderIds.value, note.folderId])
+    } else {
+      unclassifiedExpanded.value = true
+    }
+    duplicateNoteVisible.value = false
+    duplicateNoteSource.value = null
+    await selectNote(note)
+  } catch (error) {
+    actionError.value = error instanceof Error ? error.message : '复制笔记失败'
+  } finally {
+    duplicateNoteBusy.value = false
+  }
 }
 
 /**
@@ -2140,11 +2487,12 @@ async function handleFolderContextCommand(
  * :return: 命令完成后的 Promise。
  */
 async function handleNoteContextCommand(
-  command: 'copy-link' | 'pin' | 'trash' | 'restore' | 'delete'
+  command: 'duplicate' | 'copy-link' | 'pin' | 'trash' | 'restore' | 'delete'
 ): Promise<void> {
   const note = contextMenu.note
   closeContextMenu()
   if (!note) return
+  if (command === 'duplicate') openDuplicateNoteDialog(note)
   if (command === 'copy-link') await copyNoteLink(note)
   if (command === 'pin') await setNotePinned(note, !note.isPinned)
   if (command === 'trash') await setNoteDeleted(note, true)
@@ -2388,11 +2736,7 @@ function handleShortcut(event: KeyboardEvent): void {
   }
   if (event.key.toLocaleLowerCase() === 'f' && activeNote.value) {
     event.preventDefault()
-    noteFindVisible.value = true
-    void nextTick(() => {
-      noteFindInput.value?.focus()
-      noteFindInput.value?.select()
-    })
+    openCurrentNoteFind()
   }
 }
 
@@ -2490,10 +2834,26 @@ watch(activeNoteId, () => {
   noteFindKeyword.value = ''
   Object.assign(noteFindResult, { count: 0, index: -1 })
 })
+watch(activeNoteId, syncCurrentNoteTab)
+watch(() => workspace.notes.map((note) => `${note.id}:${note.isDeleted}`).join('|'), () => {
+  applyNoteTabsState(reconcileNoteTabs({
+    noteIds: openNoteIds.value,
+    activeNoteId: activeTabNoteId.value
+  }, workspace.notes.filter((note) => !note.isDeleted).map((note) => note.id)))
+})
 watch(quickOpenKeyword, () => {
   quickOpenActiveIndex.value = 0
 })
+watch(noteTabBarElement, (element, previousElement) => {
+  if (previousElement) noteTabResizeObserver?.unobserve(previousElement)
+  if (element) {
+    noteTabBarWidth.value = element.clientWidth
+    noteTabResizeObserver?.observe(element)
+  }
+})
 onMounted(() => {
+  noteTabResizeObserver = new ResizeObserver(updateNoteTabBarWidth)
+  if (noteTabBarElement.value) noteTabResizeObserver.observe(noteTabBarElement.value)
   window.addEventListener('keydown', handleShortcut)
   window.addEventListener('drop', finishResourceDrag)
   window.addEventListener('dragend', finishResourceDrag)
@@ -2509,6 +2869,7 @@ onMounted(() => {
   disposeCheckForUpdates = window.notesDesktop.onCheckForUpdates((silent) => void runUpdateCheck(silent))
   disposeOpenDataTransfer = window.notesDesktop.onOpenDataTransfer(openDataTransfer)
   disposeOpenGeneralSettings = window.notesDesktop.onOpenGeneralSettings(() => void openGeneralSettings())
+  disposeOpenSearch = window.notesDesktop.onOpenSearch(handleSearchMenuCommand)
   disposeDatabaseBackupStatus = window.notesDesktop.onDatabaseBackupStatus((status) => {
     Object.assign(databaseBackupStatus, status)
   })
@@ -2530,6 +2891,8 @@ onMounted(() => {
     })
 })
 onBeforeUnmount(() => {
+  noteTabResizeObserver?.disconnect()
+  noteTabResizeObserver = null
   window.removeEventListener('keydown', handleShortcut)
   window.removeEventListener('drop', finishResourceDrag)
   window.removeEventListener('dragend', finishResourceDrag)
@@ -2551,6 +2914,8 @@ onBeforeUnmount(() => {
   disposeOpenDataTransfer = null
   disposeOpenGeneralSettings?.()
   disposeOpenGeneralSettings = null
+  disposeOpenSearch?.()
+  disposeOpenSearch = null
   disposeDatabaseBackupStatus?.()
   disposeDatabaseBackupStatus = null
   disposeSyncAuthResult?.()
@@ -2571,7 +2936,7 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <div :class="['desktop-shell', { 'tree-lines-hidden': !showTreeLines }]" @click="createMenuVisible = false; closeContextMenu(); closePropertyPickers()">
+  <div :class="['desktop-shell', { 'tree-lines-hidden': !showTreeLines }]" @click="createMenuVisible = false; closeContextMenu(); closePropertyPickers(); noteTabOverflowVisible = false; tabContextMenu.visible = false">
     <Transition name="editor-feedback">
       <div v-if="linkCopyFeedback" class="editor-feedback">{{ linkCopyFeedback }}</div>
     </Transition>
@@ -2696,7 +3061,7 @@ onBeforeUnmount(() => {
           <div class="nav-scroll-list">
             <div v-if="loading" class="sidebar-placeholder">正在读取本地数据库…</div>
             <div
-              v-if="!searchKeyword.trim() || getUnclassifiedNotes().length"
+              v-if="!searchFolderIds || getUnclassifiedNotes().length"
               class="nav-resource-group unclassified-group"
               @dragover="resourceDragEnabled && $event.preventDefault()"
               @drop="dropResourceAtRoot"
@@ -2742,6 +3107,7 @@ onBeforeUnmount(() => {
               :search-keyword="searchKeyword"
               :drag-enabled="resourceDragEnabled"
               :blocked-folder-ids="blockedFolderDropIds"
+              :folder-note-counts="folderNoteCounts"
               @toggle="toggleFolder"
               @select-note="selectNote"
               @folder-context="openFolderContextMenu"
@@ -2749,7 +3115,7 @@ onBeforeUnmount(() => {
               @resource-drag-start="startResourceDrag"
               @resource-drop="dropResourceOnFolder"
             />
-            <p v-if="searchKeyword.trim() && !rootFolders.length && !getUnclassifiedNotes().length" class="nav-empty">没有找到匹配笔记</p>
+            <p v-if="searchFolderIds && !rootFolders.length && !getUnclassifiedNotes().length" class="nav-empty">没有找到匹配笔记</p>
             <p v-else-if="!workspace.folders.length" class="nav-empty">还没有文件夹</p>
           </div>
         </section>
@@ -2804,6 +3170,7 @@ onBeforeUnmount(() => {
               :expanded-folder-ids="expandedFolderIds"
               :active-note-id="activeNoteId"
               :active-folder-id="null"
+              :folder-note-counts="recycleFolderNoteCounts"
               recycle
               @toggle="toggleFolder"
               @select-note="selectNote"
@@ -2873,6 +3240,57 @@ onBeforeUnmount(() => {
       </aside>
 
       <section class="editor-panel">
+        <nav v-if="openNoteTabs.length" ref="noteTabBarElement" class="note-tab-bar" aria-label="已打开笔记" @click.stop>
+          <div class="note-tab-scroll">
+            <div
+              v-for="note in visibleNoteTabs"
+              :key="note.id"
+              :class="['note-tab', { active: note.id === activeTabNoteId }]"
+              @contextmenu.prevent="openNoteTabContextMenu($event, note.id)"
+            >
+              <button class="note-tab-main" type="button" @click="switchNoteTab(note)">
+                <Icon icon="material-symbols:description-outline-rounded" />
+                <span>{{ note.title || '无标题笔记' }}</span>
+              </button>
+              <button
+                class="note-tab-close"
+                type="button"
+                :aria-label="`关闭 ${note.title || '无标题笔记'}`"
+                @click.stop="closeNoteTab(note.id)"
+              >
+                <Icon icon="material-symbols:close-rounded" />
+              </button>
+            </div>
+          </div>
+          <div v-if="overflowNoteTabs.length" class="note-tab-overflow">
+            <button
+              class="note-tab-overflow-trigger"
+              type="button"
+              :aria-expanded="noteTabOverflowVisible"
+              aria-label="显示更多标签"
+              @click="noteTabOverflowVisible = !noteTabOverflowVisible"
+            >
+              <Icon icon="material-symbols:keyboard-arrow-down-rounded" />
+              <small>{{ overflowNoteTabs.length }}</small>
+            </button>
+            <div v-if="noteTabOverflowVisible" class="note-tab-overflow-menu">
+              <div
+                v-for="note in overflowNoteTabs"
+                :key="note.id"
+                class="note-tab-overflow-item"
+                @contextmenu.prevent="openNoteTabContextMenu($event, note.id)"
+              >
+                <button type="button" @click="chooseOverflowNoteTab(note)">
+                  <Icon icon="material-symbols:description-outline-rounded" />
+                  <span>{{ note.title || '无标题笔记' }}</span>
+                </button>
+                <button type="button" :aria-label="`关闭 ${note.title || '无标题笔记'}`" @click="closeNoteTab(note.id)">
+                  <Icon icon="material-symbols:close-rounded" />
+                </button>
+              </div>
+            </div>
+          </div>
+        </nav>
         <template v-if="activeNote">
           <div class="editor-meta">
             <div class="editor-title-row">
@@ -2898,7 +3316,6 @@ onBeforeUnmount(() => {
               >
                 <Icon icon="material-symbols:history-rounded" />
               </button>
-            </div>
             <div class="properties-row">
               <div class="note-property-control">
                 <span class="note-property-label"><Icon icon="material-symbols:folder-outline-rounded" />文件夹</span>
@@ -2975,6 +3392,7 @@ onBeforeUnmount(() => {
                   </div>
                 </div>
               </div>
+            </div>
             </div>
           </div>
 
@@ -3054,6 +3472,13 @@ onBeforeUnmount(() => {
         </button>
       </template>
       <template v-else-if="contextMenu.note && !contextMenu.note.isDeleted">
+        <button type="button" role="menuitem" @click="openContextNoteInNewTab">
+          <Icon icon="material-symbols:tab-new-right-outline-rounded" /><span>在新标签页打开</span>
+        </button>
+        <div class="context-menu-divider"></div>
+        <button type="button" role="menuitem" @click="handleNoteContextCommand('duplicate')">
+          <Icon icon="material-symbols:content-copy-outline-rounded" /><span>复制到…</span>
+        </button>
         <button type="button" role="menuitem" @click="handleNoteContextCommand('copy-link')">
           <Icon icon="material-symbols:link-rounded" /><span>复制链接</span>
         </button>
@@ -3077,8 +3502,66 @@ onBeforeUnmount(() => {
       </template>
     </div>
 
+    <div
+      v-if="tabContextMenu.visible"
+      class="resource-context-menu note-tab-context-menu"
+      role="menu"
+      :style="{ left: `${tabContextMenu.x}px`, top: `${tabContextMenu.y}px` }"
+      @click.stop
+    >
+      <button type="button" role="menuitem" @click="handleNoteTabCloseCommand('close')">
+        <Icon icon="material-symbols:close-rounded" /><span>关闭标签</span>
+      </button>
+      <button type="button" role="menuitem" @click="handleNoteTabCloseCommand('others')">
+        <Icon icon="material-symbols:tab-close-right-outline-rounded" /><span>关闭其他标签</span>
+      </button>
+      <button type="button" role="menuitem" @click="handleNoteTabCloseCommand('right')">
+        <Icon icon="material-symbols:keyboard-tab-rounded" /><span>关闭右侧标签</span>
+      </button>
+    </div>
+
+    <div v-if="duplicateNoteVisible" class="dialog-backdrop" @click.self="!duplicateNoteBusy && (duplicateNoteVisible = false)">
+      <section class="folder-dialog import-target-dialog" role="dialog" aria-modal="true" aria-label="选择笔记副本位置">
+        <button class="dialog-close-button" type="button" aria-label="关闭复制笔记窗口" :disabled="duplicateNoteBusy" @click="duplicateNoteVisible = false"><Icon icon="tabler:x" /></button>
+        <div class="dialog-icon"><Icon icon="material-symbols:content-copy-outline-rounded" /></div>
+        <h2>复制笔记</h2>
+        <p>修改副本名称并选择保存位置，默认与原笔记相同。</p>
+        <input v-model="duplicateNoteTitle" class="duplicate-note-title" autofocus maxlength="100" aria-label="副本名称" placeholder="输入副本名称" />
+        <div class="import-target-list" role="listbox" aria-label="笔记副本位置">
+          <button
+            :class="['folder-picker-option', { selected: duplicateNoteTargetFolderId === null }]"
+            type="button"
+            role="option"
+            :aria-selected="duplicateNoteTargetFolderId === null"
+            @click="duplicateNoteTargetFolderId = null"
+          >
+            <Icon icon="tabler:folders" /><span>未分类</span><Icon v-if="duplicateNoteTargetFolderId === null" icon="material-symbols:check-rounded" />
+          </button>
+          <button
+            v-for="folder in folderOptions"
+            :key="folder.id"
+            :class="['folder-picker-option', { selected: duplicateNoteTargetFolderId === folder.id }]"
+            :style="{ '--folder-depth': folder.depth }"
+            type="button"
+            role="option"
+            :aria-selected="duplicateNoteTargetFolderId === folder.id"
+            @click="duplicateNoteTargetFolderId = folder.id"
+          >
+            <Icon icon="material-symbols:folder-outline-rounded" /><span>{{ folder.name }}</span><Icon v-if="duplicateNoteTargetFolderId === folder.id" icon="material-symbols:check-rounded" />
+          </button>
+        </div>
+        <div>
+          <button type="button" :disabled="duplicateNoteBusy" @click="duplicateNoteVisible = false">取消</button>
+          <button class="primary" type="button" :disabled="duplicateNoteBusy" @click="submitDuplicateNote">
+            {{ duplicateNoteBusy ? '正在复制' : '复制到此处' }}
+          </button>
+        </div>
+      </section>
+    </div>
+
     <div v-if="folderDialogVisible" class="dialog-backdrop" @click.self="folderDialogVisible = false">
       <form class="folder-dialog" @submit.prevent="submitFolder">
+        <button class="dialog-close-button" type="button" aria-label="关闭文件夹窗口" @click="folderDialogVisible = false"><Icon icon="tabler:x" /></button>
         <div class="dialog-icon"><Icon :icon="folderDialogMode === 'rename' ? 'tabler:pencil' : 'tabler:folder-plus'" /></div>
         <h2>{{ folderDialogMode === 'rename' ? '重命名文件夹' : folderDialogParentId ? '新建子文件夹' : '新建文件夹' }}</h2>
         <p>{{ folderDialogMode === 'rename' ? '输入一个更清晰的文件夹名称。' : folderDialogParentId ? `新文件夹将放在“${workspace.folders.find((folder) => folder.id === folderDialogParentId)?.name ?? '上级文件夹'}”中。` : '用文件夹把相关笔记放在一起。' }}</p>
@@ -3089,6 +3572,7 @@ onBeforeUnmount(() => {
 
     <div v-if="tagDialogVisible" class="dialog-backdrop" @click.self="tagDialogVisible = false">
       <form class="folder-dialog tag-dialog" @submit.prevent="submitTag">
+        <button class="dialog-close-button" type="button" aria-label="关闭标签窗口" @click="tagDialogVisible = false"><Icon icon="tabler:x" /></button>
         <div class="dialog-icon"><Icon icon="tabler:tag-plus" /></div>
         <h2>新建标签</h2>
         <p>{{ tagDialogAttachToDraft ? '创建后会自动添加到当前笔记。' : '创建后可以在任意笔记中选择使用。' }}</p>
@@ -3099,6 +3583,7 @@ onBeforeUnmount(() => {
 
     <div v-if="quickOpenVisible" class="dialog-backdrop quick-open-backdrop" @click.self="quickOpenVisible = false">
       <section class="quick-open-dialog" role="dialog" aria-modal="true" aria-label="快速打开笔记">
+        <button class="dialog-close-button" type="button" aria-label="关闭快速打开窗口" @click="quickOpenVisible = false"><Icon icon="tabler:x" /></button>
         <div class="quick-open-search">
           <Icon icon="tabler:search" />
           <input
@@ -3154,6 +3639,7 @@ onBeforeUnmount(() => {
 
     <div v-if="generalSettingsVisible" class="dialog-backdrop" @click.self="generalSettingsVisible = false">
       <form class="folder-dialog general-settings-dialog" aria-label="通用设置" @submit.prevent="saveGeneralSettings">
+        <button class="dialog-close-button" type="button" aria-label="关闭通用设置" :disabled="generalSettingsSaving" @click="generalSettingsVisible = false"><Icon icon="tabler:x" /></button>
         <div class="dialog-icon"><Icon icon="tabler:settings" /></div>
         <h2>通用设置</h2>
         <p>配置快速记录和笔记列表的显示方式。</p>
@@ -3214,9 +3700,11 @@ onBeforeUnmount(() => {
 
     <div v-if="syncDialogVisible" class="dialog-backdrop" @click.self="syncDialogVisible = false">
       <form class="folder-dialog sync-dialog" @submit.prevent="saveSyncSettings">
+        <button class="dialog-close-button" type="button" aria-label="关闭同步设置" :disabled="syncSaving || syncTesting" @click="syncDialogVisible = false"><Icon icon="tabler:x" /></button>
         <div class="dialog-icon"><Icon icon="tabler:cloud-cog" /></div>
         <h2>同步设置</h2>
         <p>推荐在浏览器中完成登录或微信扫码授权，应用不会接触你的密码。连接后会自动同步，并在正文冲突时保留本地副本。</p>
+        <p class="sync-default-address">线上默认地址：https://lovethewind.cn（后端与网页通用）</p>
         <div class="sync-form-fields">
           <label>
             <span>后端地址</span>
@@ -3279,13 +3767,14 @@ onBeforeUnmount(() => {
 
     <div v-if="dataTransferVisible" class="dialog-backdrop" @click.self="!dataTransferBusy && (dataTransferVisible = false)">
       <section class="folder-dialog data-transfer-dialog" role="dialog" aria-modal="true" aria-label="导入导出">
+        <button class="dialog-close-button" type="button" aria-label="关闭导入导出窗口" :disabled="dataTransferBusy" @click="dataTransferVisible = false"><Icon icon="tabler:x" /></button>
         <div class="dialog-icon"><Icon icon="tabler:archive" /></div>
         <h2>导入导出</h2>
         <p>备份、迁移或批量导入笔记，导入内容不会覆盖现有数据。</p>
         <div class="data-transfer-grid">
           <button class="markdown-folder-import-action" type="button" :disabled="dataTransferBusy" @click="openMarkdownImportTarget">
             <Icon icon="tabler:folder-down" />
-            <span><strong>导入 Markdown 文件夹</strong><small>选择导入位置并保留目录层级</small></span>
+            <span><strong>导入 Markdown 文件夹或 ZIP</strong><small>直接读取压缩包内容并保留目录层级</small></span>
           </button>
           <button type="button" :disabled="dataTransferBusy || !activeNote" @click="exportCurrentNoteMarkdown">
             <Icon icon="tabler:file-export" />
@@ -3319,6 +3808,7 @@ onBeforeUnmount(() => {
 
     <div v-if="databaseBackupVisible" class="dialog-backdrop" @click.self="!databaseBackupBusy && (databaseBackupVisible = false)">
       <section class="folder-dialog database-backup-dialog" role="dialog" aria-modal="true" aria-label="自动备份管理">
+        <button class="dialog-close-button" type="button" aria-label="关闭自动备份窗口" :disabled="databaseBackupBusy" @click="databaseBackupVisible = false"><Icon icon="tabler:x" /></button>
         <div class="dialog-icon"><Icon icon="tabler:database-heart" /></div>
         <h2>自动备份管理</h2>
         <p>每个域名和用户档案独立备份，每天自动保存一次 SQLite 与附件，最多保留最近 10 份。</p>
@@ -3380,6 +3870,7 @@ onBeforeUnmount(() => {
 
     <div v-if="markdownImportTargetVisible" class="dialog-backdrop import-target-backdrop" @click.self="markdownImportTargetVisible = false">
       <section class="folder-dialog import-target-dialog" role="dialog" aria-modal="true" aria-label="选择导入位置">
+        <button class="dialog-close-button" type="button" aria-label="关闭导入位置窗口" @click="markdownImportTargetVisible = false"><Icon icon="tabler:x" /></button>
         <div class="dialog-icon"><Icon icon="tabler:folder-down" /></div>
         <h2>选择导入位置</h2>
         <p>来源同名文件夹已存在时会合并目录并新增笔记，不会覆盖原有笔记。</p>
@@ -3408,7 +3899,7 @@ onBeforeUnmount(() => {
         </div>
         <div>
           <button type="button" @click="markdownImportTargetVisible = false">取消</button>
-          <button class="primary" type="button" @click="importMarkdownNotes">选择本地文件夹</button>
+          <button class="primary" type="button" @click="importMarkdownNotes">选择文件夹或 ZIP 压缩包</button>
         </div>
       </section>
     </div>
@@ -3435,7 +3926,7 @@ onBeforeUnmount(() => {
               :key="history.id"
               :class="{ active: history.id === selectedHistoryId }"
               type="button"
-              @click="selectedHistoryId = history.id"
+              @click="selectHistory(history.id)"
             >
               <strong>{{ history.title || '无标题笔记' }}</strong>
               <small>{{ history.contentPreview }}</small>
@@ -3444,7 +3935,8 @@ onBeforeUnmount(() => {
           </aside>
           <article v-if="selectedHistory" class="history-preview">
             <h3>{{ selectedHistory.title || '无标题笔记' }}</h3>
-            <div class="history-editor-preview">
+            <div v-if="historyDetailLoading || !selectedHistory.content" class="history-empty">正在读取版本内容…</div>
+            <div v-else class="history-editor-preview">
               <MarkdownVisualEditor
                 :key="selectedHistory.id"
                 :value="selectedHistory.content"
@@ -3468,6 +3960,7 @@ onBeforeUnmount(() => {
 
     <div v-if="confirmationDialog.visible" class="dialog-backdrop" @click.self="resolveConfirmation(false)">
       <section class="folder-dialog confirmation-dialog" role="alertdialog" aria-modal="true" :aria-labelledby="'confirmation-dialog-title'">
+        <button class="dialog-close-button" type="button" aria-label="关闭确认窗口" @click="resolveConfirmation(false)"><Icon icon="tabler:x" /></button>
         <div class="dialog-icon danger"><Icon icon="tabler:alert-triangle" /></div>
         <h2 id="confirmation-dialog-title">{{ confirmationDialog.title }}</h2>
         <p>{{ confirmationDialog.message }}</p>
@@ -3480,6 +3973,7 @@ onBeforeUnmount(() => {
 
     <div v-if="updateDialogVisible" class="dialog-backdrop" @click.self="!updateChecking && (updateDialogVisible = false)">
       <section class="folder-dialog update-dialog" role="dialog" aria-modal="true" aria-labelledby="update-dialog-title">
+        <button class="dialog-close-button" type="button" aria-label="关闭更新窗口" :disabled="updateChecking" @click="updateDialogVisible = false"><Icon icon="tabler:x" /></button>
         <div class="dialog-icon"><Icon :icon="updateChecking ? 'tabler:loader-2' : updateResult?.status === 'available' ? 'tabler:sparkles' : updateError ? 'tabler:alert-circle' : 'tabler:circle-check'" /></div>
         <h2 id="update-dialog-title">
           {{ updateChecking ? '正在检查更新' : updateError ? '检查更新失败' : updateResult?.status === 'available' ? '发现新版本' : updateResult?.status === 'unpublished' ? '暂无发布版本' : '已是最新版本' }}
@@ -3491,7 +3985,11 @@ onBeforeUnmount(() => {
         <template v-else-if="updateResult">
           <p v-if="updateResult.status === 'unpublished'">当前版本 {{ updateResult.currentVersion }}。GitHub 仓库还没有正式 Release，发布首个版本后即可正常检查更新。</p>
           <p v-else>当前版本 {{ updateResult.currentVersion }}，最新版本 {{ updateResult.latestVersion }}。</p>
-          <div v-if="updateResult.status === 'available' && updateResult.releaseNotes" class="update-release-notes">{{ updateResult.releaseNotes }}</div>
+          <div
+            v-if="renderedUpdateReleaseNotes"
+            class="update-release-notes"
+            v-html="renderedUpdateReleaseNotes"
+          ></div>
         </template>
         <div>
           <button v-if="updateError" type="button" @click="runUpdateCheck(false)">重新检查</button>

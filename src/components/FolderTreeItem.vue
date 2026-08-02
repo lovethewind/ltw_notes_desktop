@@ -20,6 +20,7 @@ const props = defineProps<{
   searchKeyword?: string
   dragEnabled?: boolean
   blockedFolderIds?: Set<string>
+  folderNoteCounts: Map<string, number>
 }>()
 
 const emit = defineEmits<{
@@ -153,26 +154,6 @@ onBeforeUnmount(() => {
 })
 
 /**
- * 统计文件夹及其全部后代中的笔记数量。
- *
- * :param folderId: 文件夹 ID。
- * :param visited: 已访问文件夹集合，用于防止异常循环关系。
- * :return: 文件夹树中的笔记总数。
- */
-function countFolderNotes(folderId: string, visited: Set<string> = new Set()): number {
-  if (visited.has(folderId)) return 0
-  const nextVisited = new Set(visited).add(folderId)
-  const ownCount = props.notes.filter((note) => note.folderId === folderId).length
-  const childCount = props.folders
-    .filter((folder) => (
-      folder.parentId === folderId
-      && folder.isDeleted === Boolean(props.recycle)
-    ))
-    .reduce((total, folder) => total + countFolderNotes(folder.id, nextVisited), 0)
-  return ownCount + childCount
-}
-
-/**
  * 向上转发文件夹右键事件。
  *
  * :param event: 鼠标事件。
@@ -240,7 +221,7 @@ function openNoteContext(event: MouseEvent, note: OfflineNote): void {
           ? 'material-symbols:folder-open-outline-rounded'
           : 'material-symbols:folder-outline-rounded'" />
         <span>{{ folder.name }}</span>
-        <small>{{ countFolderNotes(folder.id) }}</small>
+        <small>{{ folderNoteCounts.get(folder.id) ?? 0 }}</small>
       </button>
     </div>
 
@@ -258,6 +239,7 @@ function openNoteContext(event: MouseEvent, note: OfflineNote): void {
         :search-keyword="searchKeyword"
         :drag-enabled="dragEnabled"
         :blocked-folder-ids="blockedFolderIds"
+        :folder-note-counts="folderNoteCounts"
         @toggle="emit('toggle', $event)"
         @select-note="emit('selectNote', $event)"
         @folder-context="forwardFolderContext"

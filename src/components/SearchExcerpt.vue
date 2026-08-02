@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed } from 'vue'
-import { formatNoteSearchExcerpt } from '../utils/note-workspace'
+import { formatNotePreview, formatNoteSearchExcerpt } from '../utils/note-workspace'
 
 const props = defineProps<{ content: string, keyword: string }>()
 
@@ -30,7 +30,9 @@ function splitSearchText(text: string, keyword: string): Array<{ text: string, m
 }
 
 const parts = computed(() => splitSearchText(
-  formatNoteSearchExcerpt({ content: props.content }, props.keyword),
+  props.keyword.trim()
+    ? formatNoteSearchExcerpt({ content: props.content }, props.keyword)
+    : formatNotePreview(props.content),
   props.keyword
 ))
 </script>
