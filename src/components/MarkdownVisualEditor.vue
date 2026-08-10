@@ -1063,7 +1063,7 @@ async function createEditor(): Promise<void> {
       [Crepe.Feature.LinkTooltip]: { inputPlaceholder: '粘贴链接地址…' },
       [Crepe.Feature.CodeMirror]: {
         searchPlaceholder: '搜索代码语言', noResultText: '没有匹配结果', copyText: '复制',
-        onCopy: () => showFeedback('复制成功'),
+        onCopy: () => showFeedback('代码已复制'),
         previewToggleText: (previewOnlyMode: boolean) => previewOnlyMode ? '编辑' : '隐藏'
       },
       [Crepe.Feature.TopBar]: {

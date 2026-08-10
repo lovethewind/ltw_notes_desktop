@@ -103,6 +103,7 @@ const activeTabNoteId = ref<string | null>(null)
 const noteTabBarElement = ref<HTMLElement | null>(null)
 const noteTabBarWidth = ref(0)
 const noteTabOverflowVisible = ref(false)
+const noteTabContextMenuElement = ref<HTMLElement | null>(null)
 const tabContextMenu = reactive({ visible: false, x: 0, y: 0, noteId: null as string | null })
 const searchKeyword = ref('')
 const searchInput = ref<HTMLInputElement | null>(null)
@@ -211,6 +212,8 @@ const folderDialogParentId = ref<string | null>(null)
 const folderName = ref('')
 const createMenuVisible = ref(false)
 const folderPickerVisible = ref(false)
+const folderPickerSearchKeyword = ref('')
+const folderPickerSearchInput = ref<HTMLInputElement | null>(null)
 const tagPickerVisible = ref(false)
 const tagSearchKeyword = ref('')
 const tagDialogVisible = ref(false)
@@ -236,6 +239,7 @@ const contextMenu = reactive<ResourceContextMenu>({
   note: null,
   tag: null
 })
+const resourceContextMenuElement = ref<HTMLElement | null>(null)
 const confirmationDialog = reactive<ConfirmationDialogState>({
   visible: false,
   title: '',
@@ -443,6 +447,11 @@ const folderOptions = computed(() => {
   appendFolderOptions(null, 0)
   return options
 })
+const filteredFolderOptions = computed(() => {
+  const keyword = folderPickerSearchKeyword.value.trim().toLocaleLowerCase()
+  if (!keyword) return folderOptions.value
+  return folderOptions.value.filter((folder) => folder.name.toLocaleLowerCase().includes(keyword))
+})
 const quickOpenResults = computed<QuickOpenResult[]>(() => {
   const keyword = quickOpenKeyword.value.trim().toLocaleLowerCase()
   const folderById = new Map(workspace.folders.map((folder) => [folder.id, folder]))
@@ -504,6 +513,12 @@ const filterTitle = computed(() => {
 const syncStatusLabel = computed(() => syncSettings.configured
   ? syncStatus.message || syncSettings.accountLabel || '同步已连接'
   : '未配置同步')
+const syncActionLabel = computed(() => {
+  if (!syncSettings.configured) return '配置同步'
+  return workspace.pendingCount
+    ? `同步全部笔记（${workspace.pendingCount} 项待同步）`
+    : '同步全部笔记'
+})
 const syncStatusIcon = computed(() => {
   if (!syncSettings.configured) return 'tabler:cloud-off'
   if (syncStatus.state === 'syncing') return 'tabler:loader-2'
@@ -1582,11 +1597,14 @@ async function applyClosedNoteTabs(nextState: NoteTabsState): Promise<void> {
 function openNoteTabContextMenu(event: MouseEvent, noteId: string): void {
   noteTabOverflowVisible.value = false
   Object.assign(tabContextMenu, {
-    visible: true,
-    x: Math.min(event.clientX, window.innerWidth - 190),
-    y: Math.min(event.clientY, window.innerHeight - 170),
     noteId
   })
+  void positionContextMenuInViewport(
+    () => noteTabContextMenuElement.value,
+    tabContextMenu,
+    event.clientX,
+    event.clientY
+  )
 }
 
 /**
@@ -1951,7 +1969,9 @@ function closePropertyPickers(): void {
 function toggleFolderPicker(): void {
   const nextVisible = !folderPickerVisible.value
   closePropertyPickers()
+  folderPickerSearchKeyword.value = ''
   folderPickerVisible.value = nextVisible
+  if (nextVisible) void nextTick(() => folderPickerSearchInput.value?.focus())
 }
 
 /**
@@ -2379,6 +2399,42 @@ function closeContextMenu(): void {
   contextMenu.tag = null
 }
 
+const CONTEXT_MENU_MARGIN = 12
+const CONTEXT_MENU_MIN_TOP = 64
+
+/**
+ * 菜单渲染后按真实宽高修正位置，避免靠近视口边缘时被裁切。
+ *
+ * :param getMenuElement: 获取已渲染菜单元素的方法。
+ * :param position: 菜单的响应式位置和可见状态。
+ * :param preferredX: 指针期望横坐标。
+ * :param preferredY: 指针期望纵坐标。
+ * :return: 定位完成后的 Promise。
+ */
+async function positionContextMenuInViewport(
+  getMenuElement: () => HTMLElement | null,
+  position: { visible: boolean, x: number, y: number },
+  preferredX: number,
+  preferredY: number
+): Promise<void> {
+  position.x = Math.max(CONTEXT_MENU_MARGIN, preferredX)
+  position.y = Math.max(CONTEXT_MENU_MIN_TOP, preferredY)
+  position.visible = true
+  await nextTick()
+  if (!position.visible) return
+
+  const menuRect = getMenuElement()?.getBoundingClientRect()
+  if (!menuRect) return
+  position.x = Math.max(
+    CONTEXT_MENU_MARGIN,
+    Math.min(preferredX, window.innerWidth - menuRect.width - CONTEXT_MENU_MARGIN)
+  )
+  position.y = Math.max(
+    CONTEXT_MENU_MIN_TOP,
+    Math.min(preferredY, window.innerHeight - menuRect.height - CONTEXT_MENU_MARGIN)
+  )
+}
+
 /**
  * 根据指针位置打开文件夹右键菜单。
  *
@@ -2392,9 +2448,12 @@ function openFolderContextMenu(event: MouseEvent, folder: NoteFolder): void {
   contextMenu.folder = folder
   contextMenu.note = null
   contextMenu.tag = null
-  contextMenu.x = Math.max(12, Math.min(event.clientX, window.innerWidth - 216))
-  contextMenu.y = Math.max(64, Math.min(event.clientY, window.innerHeight - 216))
-  contextMenu.visible = true
+  void positionContextMenuInViewport(
+    () => resourceContextMenuElement.value,
+    contextMenu,
+    event.clientX,
+    event.clientY
+  )
 }
 
 /**
@@ -2410,9 +2469,12 @@ function openNoteContextMenu(event: MouseEvent, note: OfflineNote): void {
   contextMenu.folder = null
   contextMenu.note = note
   contextMenu.tag = null
-  contextMenu.x = Math.max(12, Math.min(event.clientX, window.innerWidth - 216))
-  contextMenu.y = Math.max(64, Math.min(event.clientY, window.innerHeight - 190))
-  contextMenu.visible = true
+  void positionContextMenuInViewport(
+    () => resourceContextMenuElement.value,
+    contextMenu,
+    event.clientX,
+    event.clientY
+  )
 }
 
 /**
@@ -2428,9 +2490,12 @@ function openTagContextMenu(event: MouseEvent, tag: NoteTag): void {
   contextMenu.folder = null
   contextMenu.note = null
   contextMenu.tag = tag
-  contextMenu.x = Math.max(12, Math.min(event.clientX, window.innerWidth - 216))
-  contextMenu.y = Math.max(64, Math.min(event.clientY, window.innerHeight - 86))
-  contextMenu.visible = true
+  void positionContextMenuInViewport(
+    () => resourceContextMenuElement.value,
+    contextMenu,
+    event.clientX,
+    event.clientY
+  )
 }
 
 /**
@@ -2445,9 +2510,12 @@ function openUnclassifiedContextMenu(event: MouseEvent): void {
   contextMenu.folder = null
   contextMenu.note = null
   contextMenu.tag = null
-  contextMenu.x = Math.max(12, Math.min(event.clientX, window.innerWidth - 216))
-  contextMenu.y = Math.max(64, Math.min(event.clientY, window.innerHeight - 86))
-  contextMenu.visible = true
+  void positionContextMenuInViewport(
+    () => resourceContextMenuElement.value,
+    contextMenu,
+    event.clientX,
+    event.clientY
+  )
 }
 
 /**
@@ -2957,35 +3025,38 @@ onBeforeUnmount(() => {
             <Icon :icon="option.icon" />
           </button>
         </div>
-        <button
-          :class="['sync-state', { configured: syncSettings.configured, syncing: syncStatus.state === 'syncing', error: syncStatus.state === 'error' }]"
-          type="button"
-          aria-label="同步设置"
-          @click.stop="openSyncSettings"
-        >
-          <Icon :class="{ spinning: syncStatus.state === 'syncing' }" :icon="syncStatusIcon" />
-          <span>{{ syncStatusLabel }}</span>
-        </button>
-        <button
-          class="pull-latest-button"
-          type="button"
-          :disabled="syncStatus.state === 'syncing'"
-          aria-label="从服务器拉取最新数据"
-          @click.stop="pullLatestData"
-        >
-          <Icon icon="tabler:cloud-download" />
-          <span>拉取最新</span>
-        </button>
+        <div class="sync-control">
+          <button
+            class="sync-state"
+            :class="{ configured: syncSettings.configured, syncing: syncStatus.state === 'syncing', error: syncStatus.state === 'error' }"
+            type="button"
+            :disabled="syncStatus.state === 'syncing'"
+            :aria-label="syncActionLabel"
+            :data-tooltip="syncActionLabel"
+            @click.stop="pullLatestData"
+          >
+            <Icon :class="{ spinning: syncStatus.state === 'syncing' }" :icon="syncStatusIcon" />
+            <span>{{ syncStatusLabel }}</span>
+          </button>
+          <button
+            class="sync-settings-button"
+            type="button"
+            aria-label="同步设置"
+            data-tooltip="同步设置"
+            @click.stop="openSyncSettings"
+          >
+            <Icon icon="tabler:settings" />
+          </button>
+        </div>
         <button
           class="data-transfer-button"
           type="button"
           aria-label="导入导出"
+          data-tooltip="导入导出"
           @click.stop="openDataTransfer"
         >
           <Icon icon="tabler:package-import" />
-          <span>导入导出</span>
         </button>
-        <div class="local-state"><Icon icon="tabler:database" />SQLite 本地库</div>
       </div>
     </header>
 
@@ -3295,18 +3366,18 @@ onBeforeUnmount(() => {
           <div class="editor-meta">
             <div class="editor-title-row">
               <input v-model="draft.title" class="title-input" maxlength="100" aria-label="笔记标题" />
-              <span :class="['editor-save-status', `is-${saveState}`]" role="status">
-                {{ saveStatusLabel }}
-              </span>
               <button
-                class="editor-header-button is-save"
+                v-if="saveState === 'error'"
+                class="editor-save-status is-error is-retry"
                 type="button"
-                :disabled="saveState === 'saving'"
+                aria-label="保存失败，点击重试"
                 @click="saveDraft"
               >
-                <Icon icon="tabler:device-floppy" />
-                <span>保存</span>
+                保存失败 · 重试
               </button>
+              <span v-else :class="['editor-save-status', `is-${saveState}`]" role="status">
+                {{ saveStatusLabel }}
+              </span>
               <button
                 class="editor-header-button is-history"
                 type="button"
@@ -3331,13 +3402,23 @@ onBeforeUnmount(() => {
                   </button>
                   <div v-if="folderPickerVisible" class="property-popover folder-picker-menu" role="listbox" aria-label="选择文件夹">
                     <div class="property-popover-title"><span>移动到文件夹</span><small>{{ folderOptions.length }} 个</small></div>
+                    <label class="folder-picker-search">
+                      <Icon icon="material-symbols:search-rounded" />
+                      <input
+                        ref="folderPickerSearchInput"
+                        v-model="folderPickerSearchKeyword"
+                        type="search"
+                        placeholder="搜索文件夹"
+                        aria-label="搜索文件夹"
+                      />
+                    </label>
                     <button :class="['folder-picker-option', { selected: draft.folderId === null }]" type="button" role="option" :aria-selected="draft.folderId === null" @click="selectDraftFolder(null)">
                       <Icon icon="tabler:folder-question" /><span>未分类</span><Icon v-if="draft.folderId === null" icon="material-symbols:check-rounded" />
                     </button>
                     <div class="property-popover-divider"></div>
                     <div class="folder-picker-scroll">
                       <button
-                        v-for="folder in folderOptions"
+                        v-for="folder in filteredFolderOptions"
                         :key="folder.id"
                         :class="['folder-picker-option', { selected: draft.folderId === folder.id }]"
                         :style="{ '--folder-depth': folder.depth }"
@@ -3348,6 +3429,7 @@ onBeforeUnmount(() => {
                       >
                         <Icon icon="material-symbols:folder-outline-rounded" /><span>{{ folder.name }}</span><Icon v-if="draft.folderId === folder.id" icon="material-symbols:check-rounded" />
                       </button>
+                      <p v-if="!filteredFolderOptions.length" class="folder-picker-empty">没有匹配的文件夹</p>
                     </div>
                   </div>
                 </div>
@@ -3431,6 +3513,7 @@ onBeforeUnmount(() => {
 
     <div
       v-if="contextMenu.visible"
+      ref="resourceContextMenuElement"
       class="resource-context-menu"
       role="menu"
       :style="{ left: `${contextMenu.x}px`, top: `${contextMenu.y}px` }"
@@ -3504,6 +3587,7 @@ onBeforeUnmount(() => {
 
     <div
       v-if="tabContextMenu.visible"
+      ref="noteTabContextMenuElement"
       class="resource-context-menu note-tab-context-menu"
       role="menu"
       :style="{ left: `${tabContextMenu.x}px`, top: `${tabContextMenu.y}px` }"
