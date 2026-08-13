@@ -26,16 +26,21 @@ import FolderTreeItem from './components/FolderTreeItem.vue'
 import MarkdownVisualEditor from './components/MarkdownVisualEditor.vue'
 import SearchExcerpt from './components/SearchExcerpt.vue'
 import type {
+  AttachmentInventory,
+  AttachmentInventoryItem,
+  AttachmentNoteReference,
   DatabaseBackup,
   DatabaseBackupStatus,
   DatabaseBackupSettings,
   DataTransferResult,
   NoteFolder,
+  NoteConflictPair,
   NoteHistory,
   NotePatch,
   NoteTag,
   OfflineNote,
   SyncConnectionResult,
+  SyncResultChange,
   SyncSettingsView,
   SyncStatus,
   ThemeMode,
@@ -141,6 +146,10 @@ const renderedUpdateReleaseNotes = computed<string>(() => {
   return DOMPurify.sanitize(marked.parse(releaseNotes, { async: false }))
 })
 const syncDialogVisible = ref(false)
+const conflictCenterVisible = ref(false)
+const selectedConflictNoteId = ref('')
+const conflictResolving = ref(false)
+const conflictError = ref('')
 const generalSettingsVisible = ref(false)
 const generalSettingsSaving = ref(false)
 const generalSettingsMessage = ref('')
@@ -165,6 +174,32 @@ const syncSaving = ref(false)
 const dataTransferVisible = ref(false)
 const dataTransferBusy = ref(false)
 const dataTransferMessage = ref('')
+const attachmentManagerVisible = ref(false)
+const attachmentManagerLoading = ref(false)
+const attachmentOperationId = ref('')
+const attachmentManagerMessage = ref('')
+const attachmentSearchKeyword = ref('')
+const attachmentKindFilter = ref<'all' | 'image' | 'document' | 'other'>('all')
+const attachmentStateFilter = ref<'all' | 'uploaded' | 'pending' | 'missing' | 'corrupt' | 'orphan'>('all')
+const attachmentSourceFilter = ref<'all' | 'managed' | 'external-cache'>('all')
+const attachmentKindOptions: Array<{ value: 'all' | 'image' | 'document' | 'other', label: string }> = [
+  { value: 'all', label: '全部' },
+  { value: 'image', label: '图片' },
+  { value: 'document', label: '文档' },
+  { value: 'other', label: '其他' }
+]
+const attachmentInventory = ref<AttachmentInventory>({
+  items: [],
+  totalCount: 0,
+  localBytes: 0,
+  uploadedCount: 0,
+  pendingCount: 0,
+  missingCount: 0,
+  corruptCount: 0,
+  orphanCount: 0,
+  managedCount: 0,
+  externalCacheCount: 0
+})
 const databaseBackupVisible = ref(false)
 const databaseBackupBusy = ref(false)
 const databaseBackupMessage = ref('')
@@ -203,7 +238,8 @@ const syncConnectionResult = reactive<SyncConnectionResult>({
 const syncStatus = reactive<SyncStatus>({
   state: 'idle',
   message: '仅保存在本机',
-  lastSuccessAt: ''
+  lastSuccessAt: '',
+  history: []
 })
 const folderDialogVisible = ref(false)
 const folderDialogMode = ref<'create' | 'rename'>('create')
@@ -525,6 +561,70 @@ const syncStatusIcon = computed(() => {
   if (syncStatus.state === 'error') return 'tabler:cloud-exclamation'
   return 'tabler:cloud-check'
 })
+const syncCenterStateTitle = computed(() => {
+  if (!syncSettings.configured) return '连接云端，开启自动同步'
+  if (syncStatus.state === 'syncing') return '正在同步全部数据'
+  if (syncStatus.state === 'error') return '上次同步未完成'
+  if (workspace.pendingCount) return `${workspace.pendingCount} 项本地变更等待同步`
+  return syncStatus.lastSuccessAt ? '所有数据已同步' : '云端同步已就绪'
+})
+const syncCenterActionLabel = computed(() => syncStatus.state === 'syncing'
+  ? '正在同步…'
+  : syncStatus.state === 'error' ? '重试同步'
+    : workspace.pendingCount ? `同步 ${workspace.pendingCount} 项变更` : '立即检查云端')
+const syncCenterLastSuccessLabel = computed(() => syncStatus.lastSuccessAt
+  ? formatDatabaseBackupTime(syncStatus.lastSuccessAt)
+  : '尚未完成首次同步')
+const syncResultChangeCount = computed(() => syncStatus.lastResult
+  ? syncStatus.lastResult.uploadedCount + syncStatus.lastResult.downloadedCount + syncStatus.lastResult.deletedCount
+  : 0)
+const noteConflicts = computed<NoteConflictPair[]>(() => workspace.notes
+  .filter((note) => Boolean(note.conflictSourceId))
+  .map((conflict) => ({
+    conflict,
+    original: workspace.notes.find((note) => note.id === conflict.conflictSourceId),
+  }))
+  .filter((pair): pair is NoteConflictPair => Boolean(pair.original)))
+const selectedNoteConflict = computed(() => noteConflicts.value.find(
+  (pair) => pair.conflict.id === selectedConflictNoteId.value,
+) || noteConflicts.value[0] || null)
+const filteredAttachments = computed(() => {
+  const keyword = attachmentSearchKeyword.value.trim().toLocaleLowerCase()
+  return attachmentInventory.value.items.filter((asset) => {
+    if (attachmentKindFilter.value !== 'all' && asset.kind !== attachmentKindFilter.value) return false
+    if (attachmentSourceFilter.value !== 'all' && asset.sourceKind !== attachmentSourceFilter.value) return false
+    if (attachmentStateFilter.value === 'orphan' && !asset.isOrphan) return false
+    if (
+      attachmentStateFilter.value !== 'all'
+      && attachmentStateFilter.value !== 'orphan'
+      && asset.state !== attachmentStateFilter.value
+    ) return false
+    if (!keyword) return true
+    return [
+      asset.fileName,
+      asset.mimeType,
+      asset.sourceHost,
+      ...asset.noteReferences.map((note) => note.title)
+    ].some((value) => value.toLocaleLowerCase().includes(keyword))
+  })
+})
+
+function formatSyncDuration(durationMs: number): string {
+  if (durationMs < 1000) return `${Math.max(0, Math.round(durationMs))} 毫秒`
+  return `${(durationMs / 1000).toFixed(durationMs < 10_000 ? 1 : 0)} 秒`
+}
+
+function getSyncResultChangeLabel(change: SyncResultChange): string {
+  if (change.kind === 'upload') return '本地上传'
+  if (change.kind === 'download') return '云端更新'
+  return '已删除'
+}
+
+function getSyncResultChangeIcon(change: SyncResultChange): string {
+  if (change.kind === 'upload') return 'tabler:cloud-upload'
+  if (change.kind === 'download') return 'tabler:cloud-download'
+  return 'tabler:trash'
+}
 const saveStatusLabel = computed(() => {
   if (saveState.value === 'saving') return '正在保存'
   if (saveState.value === 'error') return '保存失败'
@@ -973,6 +1073,237 @@ async function saveGeneralSettings(): Promise<void> {
 }
 
 /**
+ * 将附件字节数格式化为易读文本。
+ *
+ * :param bytes: 字节数。
+ * :return: 易读容量文本。
+ */
+function formatAttachmentSize(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(bytes < 10 * 1024 ? 1 : 0)} KB`
+  if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`
+  return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`
+}
+
+/** 返回附件分类对应的图标。 */
+function getAttachmentKindIcon(asset: AttachmentInventoryItem): string {
+  if (asset.kind === 'image') return 'tabler:photo'
+  if (asset.kind === 'document') return 'tabler:file-text'
+  return 'tabler:file'
+}
+
+/** 返回附件本地与云端状态文案。 */
+function getAttachmentStateLabel(asset: AttachmentInventoryItem): string {
+  if (asset.state === 'missing') return '文件缺失'
+  if (asset.state === 'corrupt') return '校验异常'
+  if (asset.state === 'pending') return '待上传'
+  return '已上传'
+}
+
+/** 返回附件来源及远程主机文案。 */
+function getAttachmentSourceLabel(asset: AttachmentInventoryItem): string {
+  if (asset.sourceKind === 'external-cache') {
+    return asset.sourceHost ? `外链缓存 · ${asset.sourceHost}` : '外链缓存'
+  }
+  if (!asset.remoteUrl) return '本地附件'
+  return asset.sourceHost ? `笔记附件 · ${asset.sourceHost}` : '笔记附件'
+}
+
+/** 从主进程刷新附件管理清单。 */
+async function loadAttachmentInventory(showLoading = true): Promise<void> {
+  if (showLoading) attachmentManagerLoading.value = true
+  try {
+    attachmentInventory.value = await window.notesDesktop.listAttachmentInventory()
+  } finally {
+    if (showLoading) attachmentManagerLoading.value = false
+  }
+}
+
+/** 保存当前草稿后打开附件管理中心。 */
+async function openAttachmentManager(): Promise<void> {
+  attachmentManagerVisible.value = true
+  attachmentManagerMessage.value = ''
+  attachmentSearchKeyword.value = ''
+  attachmentKindFilter.value = 'all'
+  attachmentStateFilter.value = 'all'
+  attachmentSourceFilter.value = 'all'
+  try {
+    await flushSave()
+    await loadAttachmentInventory()
+  } catch (error) {
+    attachmentManagerMessage.value = error instanceof Error ? error.message : '附件清单加载失败'
+    attachmentManagerLoading.value = false
+  }
+}
+
+/** 关闭附件管理中心。 */
+function closeAttachmentManager(): void {
+  if (attachmentOperationId.value) return
+  attachmentManagerVisible.value = false
+  attachmentManagerMessage.value = ''
+}
+
+/** 使用系统默认应用打开附件。 */
+async function openManagedAttachment(asset: AttachmentInventoryItem): Promise<void> {
+  attachmentOperationId.value = asset.id
+  attachmentManagerMessage.value = ''
+  try {
+    await window.notesDesktop.openAttachment(asset.id)
+  } catch (error) {
+    attachmentManagerMessage.value = error instanceof Error ? error.message : '附件打开失败'
+  } finally {
+    attachmentOperationId.value = ''
+  }
+}
+
+/** 在 Finder 中显示附件文件。 */
+async function revealManagedAttachment(asset: AttachmentInventoryItem): Promise<void> {
+  attachmentOperationId.value = asset.id
+  attachmentManagerMessage.value = ''
+  try {
+    await window.notesDesktop.revealAttachment(asset.id)
+  } catch (error) {
+    attachmentManagerMessage.value = error instanceof Error ? error.message : '无法打开附件所在目录'
+  } finally {
+    attachmentOperationId.value = ''
+  }
+}
+
+/** 关闭附件中心并定位引用附件的指定笔记。 */
+async function locateAttachmentReference(reference: AttachmentNoteReference): Promise<void> {
+  let note = workspace.notes.find((item) => item.id === reference.id)
+  if (!note) {
+    await refreshWorkspace()
+    note = workspace.notes.find((item) => item.id === reference.id)
+  }
+  if (!note) {
+    attachmentManagerMessage.value = '引用笔记已不存在'
+    return
+  }
+  attachmentManagerVisible.value = false
+  searchKeyword.value = ''
+  setFilter(note.isDeleted ? 'trash' : 'all')
+  await selectNote(note)
+}
+
+/** 触发全库同步并刷新当前附件的上传状态。 */
+async function retryManagedAttachmentUpload(asset: AttachmentInventoryItem): Promise<void> {
+  if (!syncSettings.configured) {
+    attachmentManagerMessage.value = '请先在同步中心连接云端账号'
+    return
+  }
+  if (!asset.localExists) {
+    attachmentManagerMessage.value = '本地文件缺失，无法重新上传'
+    return
+  }
+  attachmentOperationId.value = asset.id
+  attachmentManagerMessage.value = '正在重新上传并同步…'
+  try {
+    const status = await window.notesDesktop.runSync()
+    Object.assign(syncStatus, status)
+    if (status.state === 'error') throw new Error(status.message || '附件上传失败')
+    await loadAttachmentInventory(false)
+    const updated = attachmentInventory.value.items.find((item) => item.id === asset.id)
+    attachmentManagerMessage.value = updated?.state === 'uploaded'
+      ? `“${asset.fileName}”已上传`
+      : status.message || '同步已完成'
+  } catch (error) {
+    attachmentManagerMessage.value = error instanceof Error ? error.message : '附件上传失败'
+  } finally {
+    attachmentOperationId.value = ''
+  }
+}
+
+/** 校验全部附件，并尽量重下缺失文件或重传待上传文件。 */
+async function repairAttachmentIntegrity(): Promise<void> {
+  attachmentOperationId.value = '__repair_attachment_integrity__'
+  attachmentManagerMessage.value = '正在校验附件并修复可恢复项目…'
+  try {
+    const result = await window.notesDesktop.repairAttachmentIntegrity()
+    await loadAttachmentInventory(false)
+    if (!result.candidateCount) {
+      attachmentManagerMessage.value = '当前没有需要检查的附件'
+      return
+    }
+    if (result.failedCount) {
+      const examples = result.failures.slice(0, 3).map((failure) => `“${failure.fileName}”`).join('、')
+      attachmentManagerMessage.value = `已检查 ${result.candidateCount} 个附件，修复 ${result.repairedCount} 个，${result.failedCount} 个未能修复：${examples}`
+      return
+    }
+    attachmentManagerMessage.value = result.repairedCount
+      ? `检查完成：${result.healthyCount} 个正常，修复 ${result.repairedCount} 个（重下 ${result.downloadedCount}、上传 ${result.uploadedCount}）`
+      : `检查完成，${result.healthyCount} 个附件全部正常`
+  } catch (error) {
+    attachmentManagerMessage.value = error instanceof Error ? error.message : '附件完整性检查失败'
+  } finally {
+    attachmentOperationId.value = ''
+  }
+}
+
+/** 确认后清理孤立附件记录并将本地文件移入废纸篓。 */
+async function cleanOrphanAttachment(asset: AttachmentInventoryItem): Promise<void> {
+  await flushSave()
+  await loadAttachmentInventory(false)
+  const current = attachmentInventory.value.items.find((item) => item.id === asset.id)
+  if (!current?.isOrphan) {
+    attachmentManagerMessage.value = '附件已有笔记引用，已取消清理'
+    return
+  }
+  const confirmed = await requestConfirmation(
+    '清理这个附件？',
+    `“${current.fileName}”未被当前笔记或历史版本引用。本地文件将移入废纸篓，已上传的云端文件不会被删除。`,
+    '清理附件'
+  )
+  if (!confirmed) return
+  attachmentOperationId.value = current.id
+  attachmentManagerMessage.value = ''
+  try {
+    const result = await window.notesDesktop.deleteOrphanAttachment(current.id)
+    await loadAttachmentInventory(false)
+    attachmentManagerMessage.value = result.removedLocalFile
+      ? `“${current.fileName}”已移入废纸篓`
+      : `“${current.fileName}”的无效记录已清理`
+  } catch (error) {
+    attachmentManagerMessage.value = error instanceof Error ? error.message : '附件清理失败'
+  } finally {
+    attachmentOperationId.value = ''
+  }
+}
+
+/** 重新扫描并确认后，一次清理当前全部孤立附件。 */
+async function cleanAllOrphanAttachments(): Promise<void> {
+  await flushSave()
+  await loadAttachmentInventory(false)
+  const candidates = attachmentInventory.value.items.filter((asset) => asset.isOrphan)
+  if (!candidates.length) {
+    attachmentManagerMessage.value = '当前没有可清理的孤立附件'
+    return
+  }
+  const localBytes = candidates.reduce((total, asset) => total + asset.localBytes, 0)
+  const confirmed = await requestConfirmation(
+    `一键清理 ${candidates.length} 个孤立附件？`,
+    `这些附件未被当前笔记或历史版本引用，共占用 ${formatAttachmentSize(localBytes)}。本地文件将移入废纸篓，已上传的云端文件不会被删除。`,
+    '一键清理'
+  )
+  if (!confirmed) return
+  attachmentOperationId.value = '__all_orphan_attachments__'
+  attachmentManagerMessage.value = '正在清理孤立附件…'
+  try {
+    const result = await window.notesDesktop.deleteAllOrphanAttachments(
+      candidates.map((asset) => asset.id)
+    )
+    await loadAttachmentInventory(false)
+    attachmentManagerMessage.value = result.failedCount
+      ? `已清理 ${result.removedCount} 个附件，${result.failedCount} 个未能清理，可再次尝试`
+      : `已清理 ${result.removedCount} 个孤立附件，其中 ${result.removedLocalFileCount} 个本地文件已移入废纸篓`
+  } catch (error) {
+    attachmentManagerMessage.value = error instanceof Error ? error.message : '孤立附件批量清理失败'
+  } finally {
+    attachmentOperationId.value = ''
+  }
+}
+
+/**
  * 打开导入导出数据管理窗口。
  *
  * :return: 无返回值。
@@ -1280,6 +1611,49 @@ async function openSyncSettings(): Promise<void> {
   syncConnectionResult.ok = false
   syncConnectionResult.message = ''
   syncDialogVisible.value = true
+}
+
+/** 打开冲突处理中心并默认选中第一项。 */
+function openConflictCenter(): void {
+  const firstConflict = noteConflicts.value[0]
+  if (!firstConflict) return
+  selectedConflictNoteId.value = firstConflict.conflict.id
+  conflictError.value = ''
+  syncDialogVisible.value = false
+  conflictCenterVisible.value = true
+}
+
+/** 关闭冲突处理中心，可返回同步中心。 */
+function closeConflictCenter(reopenSyncCenter = true): void {
+  if (conflictResolving.value) return
+  conflictCenterVisible.value = false
+  selectedConflictNoteId.value = ''
+  conflictError.value = ''
+  if (reopenSyncCenter) syncDialogVisible.value = true
+}
+
+/** 应用选定的冲突处理策略并刷新本地工作区。 */
+async function resolveSelectedNoteConflict(strategy: 'local' | 'remote' | 'both'): Promise<void> {
+  const pair = selectedNoteConflict.value
+  if (!pair || conflictResolving.value) return
+  conflictResolving.value = true
+  conflictError.value = ''
+  try {
+    await flushSave()
+    await window.notesDesktop.resolveNoteConflict(pair.conflict.id, strategy)
+    await refreshWorkspace()
+    const nextConflict = noteConflicts.value[0]
+    if (nextConflict) selectedConflictNoteId.value = nextConflict.conflict.id
+    else {
+      conflictCenterVisible.value = false
+      selectedConflictNoteId.value = ''
+      syncDialogVisible.value = true
+    }
+  } catch (error) {
+    conflictError.value = error instanceof Error ? error.message : '冲突处理失败'
+  } finally {
+    conflictResolving.value = false
+  }
 }
 
 /**
@@ -2766,6 +3140,18 @@ async function removeTag(tag: NoteTag): Promise<void> {
  */
 function handleShortcut(event: KeyboardEvent): void {
   if (event.key === 'Escape') {
+    if (confirmationDialog.visible) {
+      resolveConfirmation(false)
+      return
+    }
+    if (attachmentManagerVisible.value) {
+      closeAttachmentManager()
+      return
+    }
+    if (conflictCenterVisible.value) {
+      closeConflictCenter(true)
+      return
+    }
     if (quickOpenVisible.value) {
       quickOpenVisible.value = false
       return
@@ -2774,7 +3160,6 @@ function handleShortcut(event: KeyboardEvent): void {
       closeCurrentNoteFind()
       return
     }
-    if (confirmationDialog.visible) resolveConfirmation(false)
     generalSettingsVisible.value = false
     generalShortcutRecording.value = false
     quickOpenShortcutRecording.value = false
@@ -3056,6 +3441,15 @@ onBeforeUnmount(() => {
           @click.stop="openDataTransfer"
         >
           <Icon icon="tabler:package-import" />
+        </button>
+        <button
+          class="attachment-manager-button"
+          type="button"
+          aria-label="附件管理"
+          data-tooltip="附件管理"
+          @click.stop="openAttachmentManager"
+        >
+          <Icon icon="tabler:paperclip" />
         </button>
       </div>
     </header>
@@ -3782,71 +4176,329 @@ onBeforeUnmount(() => {
       </form>
     </div>
 
-    <div v-if="syncDialogVisible" class="dialog-backdrop" @click.self="syncDialogVisible = false">
-      <form class="folder-dialog sync-dialog" @submit.prevent="saveSyncSettings">
+    <div v-if="syncDialogVisible" class="dialog-backdrop sync-dialog-backdrop" @click.self="syncDialogVisible = false">
+      <form class="folder-dialog sync-dialog sync-center-dialog" @submit.prevent="saveSyncSettings">
         <button class="dialog-close-button" type="button" aria-label="关闭同步设置" :disabled="syncSaving || syncTesting" @click="syncDialogVisible = false"><Icon icon="tabler:x" /></button>
-        <div class="dialog-icon"><Icon icon="tabler:cloud-cog" /></div>
-        <h2>同步设置</h2>
-        <p>推荐在浏览器中完成登录或微信扫码授权，应用不会接触你的密码。连接后会自动同步，并在正文冲突时保留本地副本。</p>
-        <p class="sync-default-address">线上默认地址：https://lovethewind.cn（后端与网页通用）</p>
-        <div class="sync-form-fields">
-          <label>
-            <span>后端地址</span>
-            <input v-model="syncForm.backendUrl" type="url" autocomplete="url" placeholder="https://lovethewind.cn" />
-          </label>
-          <label>
-            <span>网页地址</span>
-            <input v-model="syncForm.webUrl" type="url" autocomplete="url" placeholder="https://lovethewind.cn" />
-          </label>
-          <div class="browser-login-actions">
-            <button
-              class="browser-login-button"
-              type="button"
-              :disabled="syncBrowserLoginPending"
-              @click="startBrowserSyncLogin"
-            >
-              <Icon :icon="syncBrowserLoginPending ? 'tabler:loader-2' : 'tabler:external-link'" />
-              {{ syncBrowserLoginPending ? '等待浏览器授权…' : '使用浏览器安全登录' }}
-            </button>
-            <button
-              v-if="syncBrowserLoginPending"
-              class="browser-login-cancel"
-              type="button"
-              @click="cancelBrowserSyncLogin"
-            >
-              取消
-            </button>
+        <header class="sync-center-heading">
+          <div :class="['dialog-icon', { success: syncStatus.state === 'success' && syncStatus.lastResult }]"><Icon :icon="syncStatus.state === 'success' && syncStatus.lastResult ? 'tabler:circle-check' : 'tabler:cloud-cog'" /></div>
+          <div>
+            <span class="sync-center-eyebrow">云端同步</span>
+            <h2 v-if="syncStatus.state === 'success' && syncStatus.lastResult">同步完成</h2>
+            <template v-else><h2>同步中心</h2></template>
+            <p v-if="syncStatus.state === 'success' && syncStatus.lastResult">本次同步已完成，所有设备数据保持一致。</p>
+            <p v-else>笔记库会作为一个整体同步，确保不同设备上的目录、标签和附件保持一致。</p>
           </div>
-          <div class="sync-login-divider"><span>或使用账号密码测试连接</span></div>
-          <div class="sync-account-grid">
-            <label>
-              <span>账号</span>
-              <input v-model="syncForm.username" autocomplete="username" placeholder="首次连接时填写" />
-            </label>
-            <label>
-              <span>密码</span>
-              <input v-model="syncForm.password" type="password" autocomplete="current-password" placeholder="不会保存密码" />
-            </label>
+          <span v-if="syncSettings.configured" class="sync-account-badge"><Icon icon="tabler:user-check" />{{ syncSettings.accountLabel || '账号已连接' }}</span>
+        </header>
+
+        <template v-if="syncSettings.configured">
+          <section class="sync-center-overview" :class="{ syncing: syncStatus.state === 'syncing', error: syncStatus.state === 'error' }" aria-live="polite">
+            <span class="sync-center-state-icon"><Icon :class="{ spinning: syncStatus.state === 'syncing' }" :icon="syncStatusIcon" /></span>
+            <div>
+              <strong>{{ syncCenterStateTitle }}</strong>
+              <small>{{ syncStatus.message || '自动同步已开启，本地变化会进入待同步队列' }}</small>
+            </div>
+            <button class="sync-center-primary-action" type="button" :disabled="syncStatus.state === 'syncing'" @click="pullLatestData">
+              {{ syncCenterActionLabel }}
+            </button>
+          </section>
+
+          <template v-if="syncStatus.lastResult">
+            <section class="sync-result-summary">
+              <div class="sync-result-summary-heading">
+                <div><strong>本次变更</strong><small>{{ syncResultChangeCount }} 项数据变化</small></div>
+                <span>完成于 {{ formatDatabaseBackupTime(syncStatus.lastResult.completedAt) }} · 用时 {{ formatSyncDuration(syncStatus.lastResult.durationMs) }}</span>
+              </div>
+              <div class="sync-result-metrics">
+                <article class="upload"><Icon icon="tabler:cloud-upload" /><div><small>上传</small><strong>{{ syncStatus.lastResult.uploadedCount }}</strong></div></article>
+                <article class="download"><Icon icon="tabler:cloud-download" /><div><small>下载</small><strong>{{ syncStatus.lastResult.downloadedCount }}</strong></div></article>
+                <article class="delete"><Icon icon="tabler:trash" /><div><small>删除</small><strong>{{ syncStatus.lastResult.deletedCount }}</strong></div></article>
+                <article class="attachment"><Icon icon="tabler:paperclip" /><div><small>附件</small><strong>{{ syncStatus.lastResult.attachmentCount }}</strong></div></article>
+              </div>
+            </section>
+
+            <section class="sync-result-detail-section">
+              <div class="sync-result-section-heading"><strong>变更详情</strong><small>最多展示最近 6 项</small></div>
+              <div v-if="syncStatus.lastResult.changes.length" class="sync-result-change-list">
+                <article v-for="change in syncStatus.lastResult.changes" :key="`${change.kind}-${change.entityType}-${change.id}`">
+                  <span :class="['sync-result-change-icon', change.kind]"><Icon :icon="getSyncResultChangeIcon(change)" /></span>
+                  <div><strong>{{ change.title }}</strong><small>{{ change.entityType === 'history' ? '历史版本' : change.entityType === 'folder' ? '文件夹' : change.entityType === 'tag' ? '标签' : '笔记' }}</small></div>
+                  <span :class="['sync-result-change-badge', change.kind]">{{ getSyncResultChangeLabel(change) }}</span>
+                </article>
+              </div>
+              <div v-else class="sync-result-empty"><Icon icon="tabler:checks" />本次已完成云端校验，没有内容变化</div>
+            </section>
+
+            <div :class="['sync-result-conflicts', { warning: noteConflicts.length }]">
+              <Icon :icon="noteConflicts.length ? 'tabler:alert-triangle' : 'tabler:shield-check'" />
+              <div>
+                <strong>待处理冲突</strong>
+                <small v-if="noteConflicts.length">{{ noteConflicts.length }} 个冲突副本已安全保留，可对比后选择版本</small>
+                <small v-else>0 个冲突，无需处理</small>
+              </div>
+              <button v-if="noteConflicts.length" type="button" @click="openConflictCenter">立即处理</button>
+            </div>
+
+            <details class="sync-result-scope">
+              <summary><span><Icon icon="tabler:database" /><strong>查看同步范围</strong></span><Icon icon="tabler:chevron-down" /></summary>
+              <div class="sync-scope-grid">
+                <article><Icon icon="tabler:notes" /><div><strong>笔记与回收站</strong><small>{{ workspace.notes.length }} 篇笔记</small></div></article>
+                <article><Icon icon="tabler:folders" /><div><strong>文件夹与标签</strong><small>{{ workspace.folders.length }} 个文件夹 · {{ workspace.tags.length }} 个标签</small></div></article>
+                <article><Icon icon="tabler:photo" /><div><strong>图片与附件</strong><small>随正文上传并离线缓存</small></div></article>
+                <article><Icon icon="tabler:history" /><div><strong>历史与冲突副本</strong><small>同步历史版本，冲突时保留副本</small></div></article>
+              </div>
+            </details>
+
+            <details class="sync-history">
+              <summary>
+                <span><Icon icon="tabler:history" /><span><strong>最近同步记录</strong><small>本地保留最近 20 次成功同步</small></span></span>
+                <span class="sync-history-count">{{ syncStatus.history?.length || 0 }} 次 <Icon icon="tabler:chevron-down" /></span>
+              </summary>
+              <div v-if="syncStatus.history?.length" class="sync-history-list">
+                <article v-for="result in syncStatus.history.slice(0, 5)" :key="result.completedAt">
+                  <span class="sync-history-state"><Icon icon="tabler:circle-check" /></span>
+                  <div>
+                    <strong>{{ formatDatabaseBackupTime(result.completedAt) }}</strong>
+                    <small>上传 {{ result.uploadedCount }} · 下载 {{ result.downloadedCount }} · 删除 {{ result.deletedCount }} · 附件 {{ result.attachmentCount }}</small>
+                  </div>
+                  <span :class="['sync-history-meta', { warning: result.conflictCount }]">
+                    {{ result.conflictCount ? `${result.conflictCount} 个冲突` : formatSyncDuration(result.durationMs) }}
+                  </span>
+                </article>
+              </div>
+              <p v-else class="sync-history-empty">完成首次同步后，这里会显示同步记录。</p>
+            </details>
+          </template>
+
+          <template v-else>
+            <div class="sync-center-metrics">
+              <article><Icon icon="tabler:cloud-upload" /><div><strong>{{ workspace.pendingCount }}</strong><small>本地待上传</small></div></article>
+              <article><Icon icon="tabler:cloud-download" /><div><small>云端变更</small><strong>同步时检查</strong></div></article>
+              <article><Icon icon="tabler:refresh" /><div><strong>已开启</strong><small>自动同步</small></div></article>
+            </div>
+
+            <section class="sync-scope-section">
+              <div class="sync-scope-heading">
+                <div><strong>同步范围</strong><small>不是只同步当前笔记</small></div>
+                <span><Icon icon="tabler:database" />全部本地数据</span>
+              </div>
+              <div class="sync-scope-grid">
+                <article><Icon icon="tabler:notes" /><div><strong>笔记与回收站</strong><small>{{ workspace.notes.length }} 篇笔记</small></div></article>
+                <article><Icon icon="tabler:folders" /><div><strong>文件夹与标签</strong><small>{{ workspace.folders.length }} 个文件夹 · {{ workspace.tags.length }} 个标签</small></div></article>
+                <article><Icon icon="tabler:photo" /><div><strong>图片与附件</strong><small>随正文上传并离线缓存</small></div></article>
+                <article><Icon icon="tabler:history" /><div><strong>历史与冲突副本</strong><small>同步历史版本，冲突时保留副本</small></div></article>
+              </div>
+            </section>
+
+            <div class="sync-center-last-result">
+              <Icon :icon="syncStatus.state === 'error' ? 'tabler:alert-triangle' : 'tabler:clock-check'" />
+              <div><strong>最近成功同步</strong><small>{{ syncCenterLastSuccessLabel }}</small></div>
+              <span>{{ syncStatus.state === 'error' ? syncStatus.message : '本机数据可离线使用' }}</span>
+            </div>
+          </template>
+
+          <details class="sync-advanced-settings">
+            <summary>
+              <span><Icon icon="tabler:settings" /><span><strong>连接设置</strong><small>地址、连接测试与账号管理</small></span></span>
+              <Icon icon="tabler:chevron-down" />
+            </summary>
+            <div class="sync-advanced-settings-body">
+              <p class="sync-default-address">线上默认地址：https://lovethewind.cn（后端与网页通用）</p>
+              <div class="sync-form-fields is-compact">
+                <label><span>后端地址</span><input v-model="syncForm.backendUrl" type="url" autocomplete="url" placeholder="https://lovethewind.cn" /></label>
+                <label><span>网页地址</span><input v-model="syncForm.webUrl" type="url" autocomplete="url" placeholder="https://lovethewind.cn" /></label>
+              </div>
+              <div v-if="syncConnectionResult.message" :class="['sync-connection-result', { success: syncConnectionResult.ok }]">
+                <Icon :class="{ spinning: syncTesting }" :icon="syncConnectionResult.ok ? 'tabler:circle-check' : syncTesting ? 'tabler:loader-2' : 'tabler:alert-circle'" />
+                <span>{{ syncConnectionResult.message }}</span>
+              </div>
+              <div class="sync-dialog-actions is-inline">
+                <button class="disconnect" type="button" @click="disconnectSyncAccount">断开账号</button>
+                <span></span>
+                <button type="button" :disabled="syncTesting" @click="testSyncConnection">{{ syncTesting ? '测试中…' : '测试连接' }}</button>
+                <button class="primary" type="submit" :disabled="!canSaveSyncSettings">{{ syncSaving ? '保存中…' : '保存设置' }}</button>
+              </div>
+            </div>
+          </details>
+        </template>
+
+        <template v-else>
+          <div class="sync-setup-intro"><Icon icon="tabler:shield-lock" /><div><strong>先连接你的云端账号</strong><small>推荐使用浏览器登录或微信扫码，应用不会接触你的密码。</small></div></div>
+          <p class="sync-default-address">线上默认地址：https://lovethewind.cn（后端与网页通用）</p>
+          <div class="sync-form-fields">
+            <label><span>后端地址</span><input v-model="syncForm.backendUrl" type="url" autocomplete="url" placeholder="https://lovethewind.cn" /></label>
+            <label><span>网页地址</span><input v-model="syncForm.webUrl" type="url" autocomplete="url" placeholder="https://lovethewind.cn" /></label>
+            <div class="browser-login-actions">
+              <button class="browser-login-button" type="button" :disabled="syncBrowserLoginPending" @click="startBrowserSyncLogin">
+                <Icon :icon="syncBrowserLoginPending ? 'tabler:loader-2' : 'tabler:external-link'" />
+                {{ syncBrowserLoginPending ? '等待浏览器授权…' : '使用浏览器安全登录' }}
+              </button>
+              <button v-if="syncBrowserLoginPending" class="browser-login-cancel" type="button" @click="cancelBrowserSyncLogin">取消</button>
+            </div>
+            <div class="sync-login-divider"><span>或使用账号密码测试连接</span></div>
+            <div class="sync-account-grid">
+              <label><span>账号</span><input v-model="syncForm.username" autocomplete="username" placeholder="首次连接时填写" /></label>
+              <label><span>密码</span><input v-model="syncForm.password" type="password" autocomplete="current-password" placeholder="不会保存密码" /></label>
+            </div>
           </div>
-        </div>
-        <div v-if="syncConnectionResult.message" :class="['sync-connection-result', { success: syncConnectionResult.ok }]">
-          <Icon
-            :class="{ spinning: syncTesting }"
-            :icon="syncConnectionResult.ok ? 'tabler:circle-check' : syncTesting ? 'tabler:loader-2' : 'tabler:alert-circle'"
-          />
-          <span>{{ syncConnectionResult.message }}</span>
-        </div>
-        <div class="sync-dialog-actions">
-          <button v-if="syncSettings.configured" class="disconnect" type="button" @click="disconnectSyncAccount">断开账号</button>
-          <span></span>
-          <button type="button" :disabled="syncTesting" @click="testSyncConnection">
-            {{ syncTesting ? '测试中…' : '测试连接' }}
-          </button>
-          <button class="primary" type="submit" :disabled="!canSaveSyncSettings">
-            {{ syncSaving ? '保存中…' : '保存设置' }}
-          </button>
-        </div>
+          <div v-if="syncConnectionResult.message" :class="['sync-connection-result', { success: syncConnectionResult.ok }]">
+            <Icon :class="{ spinning: syncTesting }" :icon="syncConnectionResult.ok ? 'tabler:circle-check' : syncTesting ? 'tabler:loader-2' : 'tabler:alert-circle'" />
+            <span>{{ syncConnectionResult.message }}</span>
+          </div>
+          <div class="sync-dialog-actions">
+            <span></span>
+            <button type="button" :disabled="syncTesting" @click="testSyncConnection">{{ syncTesting ? '测试中…' : '测试连接' }}</button>
+            <button class="primary" type="submit" :disabled="!canSaveSyncSettings">{{ syncSaving ? '保存中…' : '保存设置' }}</button>
+          </div>
+        </template>
       </form>
+    </div>
+
+    <div v-if="conflictCenterVisible" class="dialog-backdrop conflict-center-backdrop" @click.self="closeConflictCenter(true)">
+      <section class="conflict-center-dialog" role="dialog" aria-modal="true" aria-labelledby="conflict-center-title">
+        <header>
+          <div class="dialog-icon danger"><Icon icon="tabler:git-compare" /></div>
+          <div>
+            <span>同步冲突</span>
+            <h2 id="conflict-center-title">选择要保留的版本</h2>
+            <p>处理前请对比两侧内容。被替换的版本仍会保存在笔记历史中。</p>
+          </div>
+          <span class="conflict-center-progress">{{ noteConflicts.length }} 项待处理</span>
+          <button type="button" aria-label="关闭冲突处理中心" :disabled="conflictResolving" @click="closeConflictCenter(true)"><Icon icon="tabler:x" /></button>
+        </header>
+
+        <div v-if="selectedNoteConflict" class="conflict-center-body">
+          <aside v-if="noteConflicts.length > 1" class="conflict-note-list">
+            <button
+              v-for="pair in noteConflicts"
+              :key="pair.conflict.id"
+              :class="{ active: pair.conflict.id === selectedNoteConflict.conflict.id }"
+              type="button"
+              @click="selectedConflictNoteId = pair.conflict.id"
+            >
+              <Icon icon="tabler:file-alert" />
+              <span><strong>{{ pair.original.title }}</strong><small>{{ formatTime(pair.conflict.updatedAt) }}</small></span>
+            </button>
+          </aside>
+
+          <div class="conflict-compare-grid">
+            <article class="conflict-version local">
+              <div class="conflict-version-heading">
+                <span><Icon icon="tabler:device-laptop" /></span>
+                <div><strong>本地冲突版本</strong><small>{{ selectedNoteConflict.conflict.title }}</small></div>
+              </div>
+              <div class="conflict-version-content">
+                <MarkdownVisualEditor :value="selectedNoteConflict.conflict.content" readonly :show-toolbar="false" :show-outline="false" />
+              </div>
+            </article>
+            <article class="conflict-version remote">
+              <div class="conflict-version-heading">
+                <span><Icon icon="tabler:cloud" /></span>
+                <div><strong>当前云端版本</strong><small>{{ selectedNoteConflict.original.title }}</small></div>
+              </div>
+              <div class="conflict-version-content">
+                <MarkdownVisualEditor :value="selectedNoteConflict.original.content" readonly :show-toolbar="false" :show-outline="false" />
+              </div>
+            </article>
+          </div>
+        </div>
+
+        <p v-if="conflictError" class="conflict-center-error"><Icon icon="tabler:alert-circle" />{{ conflictError }}</p>
+        <footer>
+          <span>处理后将自动进入同步队列</span>
+          <button type="button" :disabled="conflictResolving || !selectedNoteConflict" @click="resolveSelectedNoteConflict('local')">保留本地</button>
+          <button type="button" :disabled="conflictResolving || !selectedNoteConflict" @click="resolveSelectedNoteConflict('remote')">采用云端</button>
+          <button class="primary" type="button" :disabled="conflictResolving || !selectedNoteConflict" @click="resolveSelectedNoteConflict('both')">
+            {{ conflictResolving ? '处理中…' : '两份都保留' }}
+          </button>
+        </footer>
+      </section>
+    </div>
+
+    <div v-if="attachmentManagerVisible" class="dialog-backdrop attachment-manager-backdrop" @click.self="closeAttachmentManager">
+      <section class="attachment-manager-dialog" role="dialog" aria-modal="true" aria-labelledby="attachment-manager-title">
+        <header class="attachment-manager-heading">
+          <div class="dialog-icon"><Icon icon="tabler:paperclip" /></div>
+          <div>
+            <span>本地资源</span>
+            <h2 id="attachment-manager-title">附件管理</h2>
+            <p>笔记附件与外链资源都会离线缓存，并按来源区分管理。</p>
+          </div>
+          <button type="button" aria-label="关闭附件管理" :disabled="Boolean(attachmentOperationId)" @click="closeAttachmentManager"><Icon icon="tabler:x" /></button>
+        </header>
+
+        <section class="attachment-manager-stats" aria-label="附件统计">
+          <article><Icon icon="tabler:database" /><div><small>本地占用</small><strong>{{ formatAttachmentSize(attachmentInventory.localBytes) }}</strong></div></article>
+          <article><Icon icon="tabler:cloud-upload" /><div><small>待上传</small><strong>{{ attachmentInventory.pendingCount }}</strong></div></article>
+          <article :class="{ warning: attachmentInventory.missingCount }"><Icon icon="tabler:file-off" /><div><small>文件缺失</small><strong>{{ attachmentInventory.missingCount }}</strong></div></article>
+          <article :class="{ warning: attachmentInventory.corruptCount }"><Icon icon="tabler:shield-exclamation" /><div><small>校验异常</small><strong>{{ attachmentInventory.corruptCount }}</strong></div></article>
+          <article :class="{ warning: attachmentInventory.orphanCount }"><Icon icon="tabler:unlink" /><div><small>孤立附件</small><strong>{{ attachmentInventory.orphanCount }}</strong></div></article>
+        </section>
+
+        <div class="attachment-manager-toolbar">
+          <div class="attachment-kind-filter" role="group" aria-label="附件类型">
+            <button v-for="option in attachmentKindOptions" :key="option.value" :class="{ active: attachmentKindFilter === option.value }" type="button" @click="attachmentKindFilter = option.value">
+              {{ option.label }}
+            </button>
+          </div>
+          <label class="attachment-manager-search"><Icon icon="tabler:search" /><input v-model="attachmentSearchKeyword" placeholder="搜索附件、域名或引用笔记" /></label>
+          <select v-model="attachmentSourceFilter" aria-label="筛选附件来源">
+            <option value="all">全部来源</option>
+            <option value="managed">笔记附件</option>
+            <option value="external-cache">外链缓存</option>
+          </select>
+          <select v-model="attachmentStateFilter" aria-label="筛选附件状态">
+            <option value="all">全部状态</option>
+            <option value="uploaded">已上传</option>
+            <option value="pending">待上传</option>
+            <option value="missing">文件缺失</option>
+            <option value="corrupt">校验异常</option>
+            <option value="orphan">孤立附件</option>
+          </select>
+        </div>
+
+        <p v-if="attachmentManagerMessage" class="attachment-manager-message" aria-live="polite"><Icon :class="{ spinning: attachmentOperationId === '__repair_attachment_integrity__' }" :icon="attachmentOperationId === '__repair_attachment_integrity__' ? 'tabler:loader-2' : 'tabler:info-circle'" />{{ attachmentManagerMessage }}</p>
+
+        <div v-if="attachmentManagerLoading" class="attachment-manager-empty"><Icon class="spinning" icon="tabler:loader-2" />正在扫描附件引用…</div>
+        <div v-else-if="filteredAttachments.length" class="attachment-manager-list">
+          <article v-for="asset in filteredAttachments" :key="asset.id" :class="{ orphan: asset.isOrphan, missing: asset.state === 'missing', corrupt: asset.state === 'corrupt' }">
+            <span :class="['attachment-kind-icon', asset.kind]"><Icon :icon="getAttachmentKindIcon(asset)" /></span>
+            <div class="attachment-item-main">
+              <strong :title="asset.fileName">{{ asset.fileName }}</strong>
+              <div class="attachment-item-badges">
+                <span class="attachment-detail-badge">{{ formatAttachmentSize(asset.localExists ? asset.localBytes : asset.byteSize) }} · {{ asset.mimeType || '未知类型' }}</span>
+                <span :class="['attachment-source-badge', asset.sourceKind]" :title="asset.sourceHost || undefined">{{ getAttachmentSourceLabel(asset) }}</span>
+                <span :class="['attachment-state-badge', asset.state]">{{ getAttachmentStateLabel(asset) }}</span>
+                <span v-if="asset.isOrphan" class="attachment-orphan-badge">无引用</span>
+                <span v-else class="attachment-reference-badge">{{ asset.noteReferences.length }} 篇笔记 · {{ asset.historyReferenceCount }} 个历史版本</span>
+              </div>
+            </div>
+            <details v-if="asset.noteReferences.length" class="attachment-reference-picker">
+              <summary><Icon icon="tabler:location" />定位笔记<Icon icon="tabler:chevron-down" /></summary>
+              <div>
+                <button v-for="reference in asset.noteReferences" :key="reference.id" type="button" @click="locateAttachmentReference(reference)">
+                  <Icon :icon="reference.isDeleted ? 'tabler:trash' : 'tabler:note'" />
+                  <span>{{ reference.title }}</span>
+                </button>
+              </div>
+            </details>
+            <div class="attachment-item-actions">
+              <button v-if="asset.localExists" type="button" :disabled="Boolean(attachmentOperationId)" @click="openManagedAttachment(asset)"><Icon icon="tabler:external-link" />打开文件</button>
+              <button v-if="asset.localExists" type="button" :disabled="Boolean(attachmentOperationId)" @click="revealManagedAttachment(asset)"><Icon icon="tabler:folder-open" />所在目录</button>
+              <button v-if="asset.state === 'pending'" type="button" :disabled="Boolean(attachmentOperationId)" @click="retryManagedAttachmentUpload(asset)"><Icon icon="tabler:refresh" />重试上传</button>
+              <button v-if="asset.isOrphan" class="danger" type="button" :disabled="Boolean(attachmentOperationId)" @click="cleanOrphanAttachment(asset)"><Icon icon="tabler:trash" />清理附件</button>
+            </div>
+          </article>
+        </div>
+        <div v-else class="attachment-manager-empty"><Icon icon="tabler:paperclip-off" />{{ attachmentInventory.totalCount ? '没有符合筛选条件的附件' : '还没有保存任何附件' }}</div>
+
+        <footer>
+          <span>共 {{ attachmentInventory.totalCount }} 个本地资源：{{ attachmentInventory.managedCount }} 个笔记附件，{{ attachmentInventory.externalCacheCount }} 个外链缓存</span>
+          <button class="integrity-repair-button" type="button" :disabled="Boolean(attachmentOperationId) || !attachmentInventory.totalCount" @click="repairAttachmentIntegrity"><Icon :class="{ spinning: attachmentOperationId === '__repair_attachment_integrity__' }" :icon="attachmentOperationId === '__repair_attachment_integrity__' ? 'tabler:loader-2' : 'tabler:shield-check'" />{{ attachmentOperationId === '__repair_attachment_integrity__' ? '检查修复中…' : '检查并修复' }}</button>
+          <button class="danger bulk-cleanup-button" type="button" :disabled="Boolean(attachmentOperationId) || !attachmentInventory.orphanCount" @click="cleanAllOrphanAttachments"><Icon icon="tabler:trash" />一键清理</button>
+          <button type="button" :disabled="Boolean(attachmentOperationId)" @click="closeAttachmentManager">关闭</button>
+        </footer>
+      </section>
     </div>
 
     <div v-if="dataTransferVisible" class="dialog-backdrop" @click.self="!dataTransferBusy && (dataTransferVisible = false)">
@@ -3854,27 +4506,27 @@ onBeforeUnmount(() => {
         <button class="dialog-close-button" type="button" aria-label="关闭导入导出窗口" :disabled="dataTransferBusy" @click="dataTransferVisible = false"><Icon icon="tabler:x" /></button>
         <div class="dialog-icon"><Icon icon="tabler:archive" /></div>
         <h2>导入导出</h2>
-        <p>备份、迁移或批量导入笔记，导入内容不会覆盖现有数据。</p>
+        <p>完整备份用于本应用恢复；通用 Markdown 用于其他软件，资源文件随 ZIP 保存。</p>
         <div class="data-transfer-grid">
           <button class="markdown-folder-import-action" type="button" :disabled="dataTransferBusy" @click="openMarkdownImportTarget">
             <Icon icon="tabler:folder-down" />
-            <span><strong>导入 Markdown 文件夹或 ZIP</strong><small>直接读取压缩包内容并保留目录层级</small></span>
+            <span><strong>导入 Markdown 文件夹或 ZIP</strong><small>恢复 ZIP 内相对资源并保留目录层级</small></span>
           </button>
           <button type="button" :disabled="dataTransferBusy || !activeNote" @click="exportCurrentNoteMarkdown">
             <Icon icon="tabler:file-export" />
-            <span><strong>导出当前笔记</strong><small>保存为 Markdown 文件</small></span>
+            <span><strong>导出当前笔记</strong><small>单个 .md，资源保留原始地址</small></span>
           </button>
           <button type="button" :disabled="dataTransferBusy" @click="exportAllNotesMarkdown">
             <Icon icon="tabler:folder-share" />
-            <span><strong>导出全部 Markdown</strong><small>保留文件夹层级的 ZIP</small></span>
+            <span><strong>导出通用 Markdown</strong><small>ZIP 内含 Markdown 与原始资源文件</small></span>
           </button>
           <button type="button" :disabled="dataTransferBusy" @click="importCompleteBackup">
             <Icon icon="tabler:database-import" />
-            <span><strong>导入完整备份</strong><small>生成独立目录副本</small></span>
+            <span><strong>导入完整备份</strong><small>读取新版 .xynotes 并生成独立副本</small></span>
           </button>
           <button type="button" :disabled="dataTransferBusy" @click="exportCompleteBackup">
             <Icon icon="tabler:database-export" />
-            <span><strong>创建完整备份</strong><small>包含标签、回收站和历史版本</small></span>
+            <span><strong>创建完整备份</strong><small>原始附件随 .xynotes 完整保存</small></span>
           </button>
           <button type="button" :disabled="dataTransferBusy" @click="openDatabaseBackupManager">
             <Icon icon="tabler:database-cog" />
@@ -4042,7 +4694,7 @@ onBeforeUnmount(() => {
       </section>
     </div>
 
-    <div v-if="confirmationDialog.visible" class="dialog-backdrop" @click.self="resolveConfirmation(false)">
+    <div v-if="confirmationDialog.visible" class="dialog-backdrop confirmation-backdrop" @click.self="resolveConfirmation(false)">
       <section class="folder-dialog confirmation-dialog" role="alertdialog" aria-modal="true" :aria-labelledby="'confirmation-dialog-title'">
         <button class="dialog-close-button" type="button" aria-label="关闭确认窗口" @click="resolveConfirmation(false)"><Icon icon="tabler:x" /></button>
         <div class="dialog-icon danger"><Icon icon="tabler:alert-triangle" /></div>

@@ -12,6 +12,21 @@
     <Transition name="editor-feedback">
       <div v-if="feedbackText" class="editor-feedback" role="status">{{ feedbackText }}</div>
     </Transition>
+    <Teleport to="body">
+      <div
+        v-if="imageContextMenu.visible"
+        ref="imageContextMenuElement"
+        class="resource-context-menu image-context-menu"
+        role="menu"
+        aria-label="图片操作"
+        :style="{ left: `${imageContextMenu.x}px`, top: `${imageContextMenu.y}px` }"
+        @pointerdown.stop
+      >
+        <button type="button" role="menuitem" @click="copyImageAddress">
+          <Icon icon="tabler:link" />复制图片地址
+        </button>
+      </div>
+    </Teleport>
     <input
       ref="attachmentInputRef"
       class="attachment-file-input"
@@ -108,6 +123,7 @@ const emit = defineEmits<{
 const editorRootRef = ref<HTMLDivElement | null>(null)
 const editorScrollRef = ref<HTMLDivElement | null>(null)
 const attachmentInputRef = ref<HTMLInputElement | null>(null)
+const imageContextMenuElement = ref<HTMLDivElement | null>(null)
 const contentValue = ref(props.value)
 const outlineItems = ref<MarkdownOutlineItem[]>([])
 const outlineOpen = ref(true)
@@ -115,6 +131,7 @@ const previewMode = ref(false)
 const focusMode = ref(false)
 const activeOutlineIndex = ref(0)
 const feedbackText = ref('')
+const imageContextMenu = ref({ visible: false, x: 0, y: 0, address: '' })
 let editor: Crepe | null = null
 let editorReady = false
 let destroyed = false
@@ -193,6 +210,54 @@ function handleEditorLinkClick(event: MouseEvent): void {
   void window.notesDesktop.openExternalLink(href).catch((error: unknown) => {
     showFeedback(error instanceof Error ? error.message : '链接打开失败')
   })
+}
+
+/** 关闭正文图片右键菜单。 */
+function closeImageContextMenu(): void {
+  imageContextMenu.value.visible = false
+}
+
+/**
+ * 在正文图片旁显示复制地址菜单，并确保菜单不超出视口。
+ *
+ * :param event: 图片右键事件。
+ * :return: 无返回值。
+ */
+function handleImageContextMenu(event: MouseEvent): void {
+  const target = event.target instanceof Element ? event.target : null
+  const image = target?.closest<HTMLImageElement>('img')
+    || target?.closest<HTMLElement>('.image-wrapper')?.querySelector<HTMLImageElement>('img')
+  const address = image?.getAttribute('src') || image?.currentSrc || ''
+  if (!image || !address) return
+  event.preventDefault()
+  event.stopPropagation()
+  imageContextMenu.value = {
+    visible: true,
+    x: Math.min(event.clientX, window.innerWidth - 16),
+    y: Math.min(event.clientY, window.innerHeight - 16),
+    address
+  }
+  void nextTick(() => {
+    const menu = imageContextMenuElement.value
+    if (!menu) return
+    const bounds = menu.getBoundingClientRect()
+    imageContextMenu.value.x = Math.max(8, Math.min(imageContextMenu.value.x, window.innerWidth - bounds.width - 8))
+    imageContextMenu.value.y = Math.max(8, Math.min(imageContextMenu.value.y, window.innerHeight - bounds.height - 8))
+    menu.querySelector<HTMLButtonElement>('button')?.focus({ preventScroll: true })
+  })
+}
+
+/** 将右键图片在当前笔记中使用的地址复制到剪贴板。 */
+async function copyImageAddress(): Promise<void> {
+  const address = imageContextMenu.value.address
+  closeImageContextMenu()
+  if (!address) return
+  try {
+    await navigator.clipboard.writeText(imageContextMenu.value.address)
+    showFeedback(address.startsWith('xinyue-asset:') ? '本地图片地址已复制，仅本应用可用' : '图片地址已复制')
+  } catch {
+    showFeedback('复制失败，请检查剪贴板权限')
+  }
 }
 
 /**
@@ -937,6 +1002,7 @@ function insertParagraphBeforeLeadingCodeBlock(event: KeyboardEvent): boolean {
 function handleEditorDocumentKeydown(event: KeyboardEvent): void {
   if (insertParagraphBeforeLeadingCodeBlock(event)) return
   if (event.key !== 'Escape') return
+  closeImageContextMenu()
   closeToolbarMenus()
   if (focusMode.value) toggleFocusMode()
 }
@@ -1112,6 +1178,7 @@ async function createEditor(): Promise<void> {
   }
   localizeTopBar(editorRootRef.value)
   editorRootRef.value.addEventListener('click', handleEditorLinkClick)
+  editorRootRef.value.addEventListener('contextmenu', handleImageContextMenu)
   editorRootRef.value.addEventListener('click', handleJsonCodeFormatClick)
   editorRootRef.value.addEventListener('paste', handleAttachmentPaste, true)
   editorRootRef.value.addEventListener('dragover', handleAttachmentDragOver)
@@ -1234,6 +1301,8 @@ onMounted(() => {
   document.addEventListener('keyup', syncLinkModifierState)
   document.addEventListener('mousemove', syncLinkModifierState)
   window.addEventListener('blur', clearLinkModifierState)
+  document.addEventListener('pointerdown', closeImageContextMenu)
+  editorScrollRef.value?.addEventListener('scroll', closeImageContextMenu, { passive: true })
   void createEditor()
 })
 onBeforeUnmount(() => {
@@ -1247,11 +1316,14 @@ onBeforeUnmount(() => {
   document.removeEventListener('keyup', syncLinkModifierState)
   document.removeEventListener('mousemove', syncLinkModifierState)
   window.removeEventListener('blur', clearLinkModifierState)
+  document.removeEventListener('pointerdown', closeImageContextMenu)
+  editorScrollRef.value?.removeEventListener('scroll', closeImageContextMenu)
   readonlyObserver?.disconnect()
   readonlyObserver = null
   jsonFormatObserver?.disconnect()
   jsonFormatObserver = null
   editorRootRef.value?.removeEventListener('click', handleEditorLinkClick)
+  editorRootRef.value?.removeEventListener('contextmenu', handleImageContextMenu)
   editorRootRef.value?.removeEventListener('click', handleJsonCodeFormatClick)
   editorRootRef.value?.removeEventListener('paste', handleAttachmentPaste, true)
   editorRootRef.value?.removeEventListener('dragover', handleAttachmentDragOver)

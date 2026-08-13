@@ -21,6 +21,8 @@ const {
   collectMarkdownDocumentsFromZip,
   createMarkdownDocument,
   createMarkdownZip,
+  createPortableBackupArchive,
+  parsePortableBackupArchive,
   parseMarkdownDocument,
   sanitizeFileName
 } = require("./data-transfer.cjs")
@@ -46,6 +48,13 @@ const {
   loadQuickCaptureSettings,
   saveQuickCaptureSettings
 } = require("./quick-capture-settings.cjs")
+const { createSyncResultSummary } = require("./sync-result-summary.cjs")
+const { appendSyncHistory, loadSyncHistory } = require("./sync-history.cjs")
+const {
+  cleanAllOrphanAttachments: executeAttachmentCleanup
+} = require("./attachment-cleanup.cjs")
+const { classifyAttachmentSource } = require("./attachment-source.cjs")
+const { executeAttachmentIntegrityRepair } = require("./attachment-integrity.cjs")
 
 const DEFAULT_BACKEND_URL = "https://lovethewind.cn"
 const DEFAULT_WEB_URL = "https://lovethewind.cn"
@@ -91,7 +100,8 @@ let syncInFlight = null
 let automaticSyncTimer = null
 let pendingMutationSyncTimer = null
 let syncAfterCurrent = false
-let syncStatus = { state: "idle", message: "仅保存在本机", lastSuccessAt: "" }
+let syncStatus = { state: "idle", message: "仅保存在本机", lastSuccessAt: "", lastResult: null, history: [] }
+const attachmentIntegrityIssues = new Map()
 
 /** 注册快速记录全局快捷键，注册失败时恢复旧快捷键。 */
 function registerQuickCaptureShortcut(shortcut, previousShortcut = "") {
@@ -574,6 +584,7 @@ async function activateSyncProfile(settings) {
   syncSettings = settings
   repository = nextRepository
   if (profileChanged) {
+    restoreSyncHistory(nextProfilePath, Boolean(settings.token))
     previousRepository?.close()
     backupManager = createCurrentBackupManager()
     backupStatusTracker.reset()
@@ -610,6 +621,19 @@ function publishSyncStatus(nextStatus) {
   syncStatus = { ...syncStatus, ...nextStatus }
   if (mainWindow && !mainWindow.isDestroyed()) {
     mainWindow.webContents.send("sync:status", syncStatus)
+  }
+}
+
+/** 从当前账号档案恢复最近同步记录。 */
+function restoreSyncHistory(profilePath, configured) {
+  const history = loadSyncHistory(profilePath)
+  const lastResult = history[0] || null
+  syncStatus = {
+    state: configured && lastResult ? "success" : "idle",
+    message: configured && lastResult ? "已恢复最近同步记录" : "仅保存在本机",
+    lastSuccessAt: lastResult?.completedAt || "",
+    lastResult,
+    history
   }
 }
 
@@ -685,6 +709,142 @@ async function openAttachment(assetId) {
   const errorMessage = await shell.openPath(asset.localPath)
   if (errorMessage) throw new Error(errorMessage)
   return true
+}
+
+/** 根据 MIME 类型和扩展名返回附件管理分类。 */
+function getAttachmentKind(asset) {
+  const mimeType = String(asset.mimeType || "").toLowerCase()
+  const extension = path.extname(String(asset.fileName || "")).toLowerCase()
+  if (mimeType.startsWith("image/")) return "image"
+  if (
+    mimeType.startsWith("text/")
+    || /(?:pdf|json|xml|msword|officedocument|opendocument|rtf)/.test(mimeType)
+    || [".md", ".csv", ".tsv", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx", ".pdf"].includes(extension)
+  ) return "document"
+  return "other"
+}
+
+/** 返回附带本地文件状态和空间统计的附件管理清单。 */
+function listAttachmentInventory() {
+  const items = repository.listAttachmentInventory().map((asset) => {
+    let localBytes = 0
+    let localExists = false
+    try {
+      const stats = fs.statSync(asset.localPath)
+      localExists = stats.isFile()
+      if (localExists) localBytes = stats.size
+    } catch {
+      // 文件缺失会作为可筛选状态返回，不阻断清单加载。
+    }
+    const source = classifyAttachmentSource(asset, syncSettings)
+    const integrityIssue = attachmentIntegrityIssues.get(asset.id) || ""
+    return {
+      ...asset,
+      ...source,
+      kind: getAttachmentKind(asset),
+      localExists,
+      localBytes,
+      integrityIssue,
+      state: !localExists
+        ? "missing"
+        : integrityIssue === "corrupt" ? "corrupt" : asset.remoteUrl ? "uploaded" : "pending"
+    }
+  })
+  return {
+    items,
+    totalCount: items.length,
+    localBytes: items.reduce((total, asset) => total + asset.localBytes, 0),
+    uploadedCount: items.filter((asset) => asset.state === "uploaded").length,
+    pendingCount: items.filter((asset) => asset.state === "pending").length,
+    missingCount: items.filter((asset) => asset.state === "missing").length,
+    corruptCount: items.filter((asset) => asset.state === "corrupt").length,
+    orphanCount: items.filter((asset) => asset.isOrphan).length,
+    managedCount: items.filter((asset) => asset.sourceKind === "managed").length,
+    externalCacheCount: items.filter((asset) => asset.sourceKind === "external-cache").length
+  }
+}
+
+/** 下载指定附件的云端原始内容，并执行统一大小限制。 */
+async function downloadAttachmentBody(asset, signal) {
+  if (!asset.remoteUrl) throw new Error("附件没有云端地址")
+  const maximumBytes = String(asset.mimeType || "").startsWith("image/")
+    ? MAX_IMAGE_ASSET_BYTES
+    : MAX_ATTACHMENT_BYTES
+  const response = await net.fetch(asset.remoteUrl, {
+    signal,
+    bypassCustomProtocolHandlers: true
+  })
+  if (!response.ok) throw new Error(`云端附件下载失败（HTTP ${response.status}）`)
+  const declaredSize = Number(response.headers.get("content-length") || 0)
+  if (declaredSize > maximumBytes) throw new Error("云端附件超过大小限制")
+  const body = Buffer.from(await response.arrayBuffer())
+  if (body.length > maximumBytes) throw new Error("云端附件超过大小限制")
+  return body
+}
+
+/** 将校验通过的附件原子写回原本地路径。 */
+async function replaceLocalAttachment(asset, body) {
+  const localPath = String(asset.localPath || "")
+  if (!localPath) throw new Error("附件缺少本地存储路径")
+  await fs.promises.mkdir(path.dirname(localPath), { recursive: true })
+  const temporaryPath = `${localPath}.repair-${randomBytes(8).toString("hex")}`
+  try {
+    await fs.promises.writeFile(temporaryPath, body, { flag: "wx" })
+    await fs.promises.rename(temporaryPath, localPath)
+  } catch (error) {
+    await fs.promises.rm(temporaryPath, { force: true }).catch(() => {})
+    throw error
+  }
+}
+
+/** 在 Finder 中显示附件文件。 */
+async function revealAttachment(assetId) {
+  const asset = repository.getAsset(String(assetId || ""))
+  if (!asset?.localPath || !fs.existsSync(asset.localPath)) throw new Error("附件文件不存在")
+  shell.showItemInFolder(asset.localPath)
+  return true
+}
+
+/** 清理未被当前笔记或历史版本引用的附件，并将本地文件移入废纸篓。 */
+async function deleteOrphanAttachment(assetId) {
+  const asset = repository.deleteOrphanAsset(String(assetId || ""))
+  if (!asset) throw new Error("附件不存在或已被清理")
+  if (!asset.localPath || !fs.existsSync(asset.localPath)) {
+    return { assetId: asset.id, removedLocalFile: false }
+  }
+  try {
+    await shell.trashItem(asset.localPath)
+    return { assetId: asset.id, removedLocalFile: true }
+  } catch (error) {
+    const restored = repository.createAsset({
+      id: asset.id,
+      fileName: asset.fileName,
+      mimeType: asset.mimeType,
+      byteSize: asset.byteSize,
+      sha256: asset.sha256,
+      localPath: asset.localPath
+    })
+    if (asset.remoteUrl) {
+      repository.markAssetUploaded(restored.id, asset.remoteUrl, asset.serverSourceId)
+    }
+    throw error
+  }
+}
+
+/** 批量清理用户已确认的孤立附件，单项失败不会中断后续附件。 */
+async function deleteAllOrphanAttachments(assetIds) {
+  const requestedIds = [...new Set(
+    (Array.isArray(assetIds) ? assetIds : [])
+      .map((assetId) => String(assetId || "").trim())
+      .filter(Boolean)
+  )]
+  const inventory = new Map(
+    repository.listAttachmentInventory().map((asset) => [asset.id, asset])
+  )
+  const candidates = requestedIds.map((assetId) => (
+    inventory.get(assetId) || { id: assetId, fileName: "未知附件" }
+  ))
+  return executeAttachmentCleanup(candidates, deleteOrphanAttachment)
 }
 
 /**
@@ -794,23 +954,6 @@ async function cacheRemoteAttachments(signal) {
 }
 
 /**
- * 将 Markdown 中的本地图片地址转换为可携带的数据地址。
- *
- * @param {unknown} content Markdown 正文。
- * @returns {Promise<string>} 可独立导出的 Markdown 正文。
- */
-async function embedLocalImageData(content) {
-  let markdown = String(content || "")
-  for (const asset of repository.listImageAssets()) {
-    if (!markdown.includes(asset.localUrl)) continue
-    const body = await fs.promises.readFile(asset.localPath)
-    const dataUrl = `data:${asset.mimeType};base64,${body.toString("base64")}`
-    markdown = markdown.split(asset.localUrl).join(dataUrl)
-  }
-  return markdown
-}
-
-/**
  * 创建包含本地图片文件的完整备份数据。
  *
  * @returns {Promise<Record<string, any>>} 完整备份数据。
@@ -842,8 +985,10 @@ async function restoreBackupImageAssets(backup) {
   const restoredBackup = structuredClone(backup)
   const assetIdMap = new Map()
   for (const asset of restoredBackup.assets || []) {
-    if (!asset?.dataBase64) continue
-    const body = Buffer.from(String(asset.dataBase64), "base64")
+    if (!asset?.data && !asset?.dataBase64) continue
+    const body = asset.data
+      ? Buffer.from(asset.data)
+      : Buffer.from(String(asset.dataBase64), "base64")
     const restored = await saveAttachment({
       id: String(asset.id || ""),
       fileName: String(asset.fileName || "备份图片"),
@@ -851,7 +996,7 @@ async function restoreBackupImageAssets(backup) {
       data: body
     }, false)
     if (asset.remoteUrl) {
-      repository.markImageAssetUploaded(
+      repository.markAssetUploaded(
         restored.id,
         String(asset.remoteUrl),
         asset.serverSourceId ? String(asset.serverSourceId) : null
@@ -866,6 +1011,8 @@ async function restoreBackupImageAssets(backup) {
         content = content
           .split(`${LOCAL_ASSET_PROTOCOL}://local/${sourceId}`)
           .join(`${LOCAL_ASSET_PROTOCOL}://local/${targetId}`)
+          .split(`https://xinyue-asset.local/${encodeURIComponent(sourceId)}`)
+          .join(`https://xinyue-asset.local/${encodeURIComponent(targetId)}`)
       }
       item.content = content
     }
@@ -874,15 +1021,53 @@ async function restoreBackupImageAssets(backup) {
 }
 
 /**
- * 上传所有尚未同步的本地图片。
+ * 为归档导出读取当前可用的附件原始文件。
  *
- * @param {AbortSignal} signal 请求中止信号。
- * @returns {Promise<number>} 成功上传的图片数量。
+ * @param {Record<string, any>} backup 仓储备份数据。
+ * @returns {Promise<Map<string, Buffer>>} 附件 ID 到原始内容的映射。
  */
-async function uploadPendingImageAssets(signal) {
-  const pendingAssets = repository.listPendingImageAssets()
-  for (const asset of pendingAssets) {
-    const signatureResponse = await requestBackendJson(
+async function readBackupAssetBodies(backup) {
+  const bodies = new Map()
+  await Promise.all((backup.assets || []).map(async (asset) => {
+    if (!asset.localPath) return
+    try {
+      bodies.set(asset.id, await fs.promises.readFile(asset.localPath))
+    } catch (error) {
+      if (error?.code !== "ENOENT") throw error
+    }
+  }))
+  return bodies
+}
+
+/**
+ * 将 Markdown ZIP 中的相对资源保存到附件目录并改写正文引用。
+ *
+ * @param {Array<Record<string, any>>} documents Markdown 文档。
+ * @returns {Promise<Array<Record<string, any>>>} 可写入数据库的文档。
+ */
+async function restoreMarkdownResources(documents) {
+  for (const document of documents) {
+    let content = String(document.content || "")
+    for (const resource of document.resources || []) {
+      const asset = await saveAttachment({
+        fileName: resource.fileName,
+        mimeType: resource.mimeType,
+        data: Buffer.from(resource.data)
+      }, false)
+      const targetUrl = String(resource.mimeType || "").startsWith("image/")
+        ? asset.localUrl
+        : `https://xinyue-asset.local/${encodeURIComponent(asset.id)}`
+      content = content.split(resource.sourceUrl).join(targetUrl)
+    }
+    document.content = content
+    delete document.resources
+  }
+  return documents
+}
+
+/** 上传单个待同步附件，并在成功后更新本地资源记录。 */
+async function uploadPendingAsset(asset, signal) {
+  const signatureResponse = await requestBackendJson(
       `${syncSettings.backendUrl}/api/oss/getSignatureUrl`,
       {
         method: "POST",
@@ -896,30 +1081,72 @@ async function uploadPendingImageAssets(signal) {
         }),
         signal
       }
-    )
-    const signature = signatureResponse.data || {}
-    const uploadUrl = String(signature.uploadUrl || signature.upload_url || "")
-    const remoteUrl = String(signature.url || "")
-    const serverSourceId = signature.sourceId || signature.source_id || null
-    if (!uploadUrl || !remoteUrl) throw new Error("图片上传签名不完整")
-    const uploadResponse = await net.fetch(uploadUrl, {
-      method: "PUT",
-      headers: {
-        ...(signature.signedHeaders || signature.signed_headers || {}),
-        "Content-Type": signature.contentType || signature.content_type || asset.mimeType,
-        "Content-Disposition": signature.contentDisposition || signature.content_disposition || "inline",
-        "x-oss-forbid-overwrite": "true"
-      },
-      body: await fs.promises.readFile(asset.localPath),
-      signal,
-      bypassCustomProtocolHandlers: true
-    })
-    if (!uploadResponse.ok) {
-      throw new Error(`附件上传失败（HTTP ${uploadResponse.status}）`)
-    }
-    repository.markAssetUploaded(asset.id, remoteUrl, serverSourceId)
+  )
+  const signature = signatureResponse.data || {}
+  const uploadUrl = String(signature.uploadUrl || signature.upload_url || "")
+  const remoteUrl = String(signature.url || "")
+  const serverSourceId = signature.sourceId || signature.source_id || null
+  if (!uploadUrl || !remoteUrl) throw new Error("附件上传签名不完整")
+  const uploadResponse = await net.fetch(uploadUrl, {
+    method: "PUT",
+    headers: {
+      ...(signature.signedHeaders || signature.signed_headers || {}),
+      "Content-Type": signature.contentType || signature.content_type || asset.mimeType,
+      "Content-Disposition": signature.contentDisposition || signature.content_disposition || "inline",
+      "x-oss-forbid-overwrite": "true"
+    },
+    body: await fs.promises.readFile(asset.localPath),
+    signal,
+    bypassCustomProtocolHandlers: true
+  })
+  if (!uploadResponse.ok) {
+    throw new Error(`附件上传失败（HTTP ${uploadResponse.status}）`)
   }
+  repository.markAssetUploaded(asset.id, remoteUrl, serverSourceId)
+}
+
+/** 上传所有尚未同步的本地图片。 */
+async function uploadPendingImageAssets(signal) {
+  const pendingAssets = repository.listPendingImageAssets()
+  for (const asset of pendingAssets) await uploadPendingAsset(asset, signal)
   return pendingAssets.length
+}
+
+/** 校验全部附件，并修复可从云端恢复或可重新上传的项目。 */
+async function repairAttachmentIntegrity() {
+  if (syncInFlight) await syncInFlight
+  attachmentIntegrityIssues.clear()
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), 5 * 60_000)
+  try {
+    const result = await executeAttachmentIntegrityRepair(
+      repository.listAttachmentInventory(),
+      {
+        readLocal: async (asset) => {
+          try {
+            return await fs.promises.readFile(asset.localPath)
+          } catch (error) {
+            if (error?.code === "ENOENT") return null
+            throw error
+          }
+        },
+        download: (asset) => downloadAttachmentBody(asset, controller.signal),
+        writeLocal: replaceLocalAttachment,
+        upload: async (asset) => {
+          if (!syncSettings.token) throw new Error("未连接云端，无法上传本地附件")
+          await uploadPendingAsset(asset, controller.signal)
+        }
+      }
+    )
+    for (const failure of result.failures) {
+      if (["missing", "corrupt"].includes(failure.issue)) {
+        attachmentIntegrityIssues.set(failure.assetId, failure.issue)
+      }
+    }
+    return result
+  } finally {
+    clearTimeout(timer)
+  }
 }
 
 /**
@@ -955,12 +1182,14 @@ async function performSync() {
     return syncStatus
   }
   syncInFlight = (async () => {
+    const startedAt = new Date().toISOString()
     publishSyncStatus({ state: "syncing", message: "正在同步…" })
     const controller = new AbortController()
     const timer = setTimeout(() => controller.abort(), 60_000)
     try {
-      await uploadPendingImageAssets(controller.signal)
+      const uploadedAssetCount = await uploadPendingImageAssets(controller.signal)
       const batch = repository.getSyncBatch()
+      const beforeWorkspace = repository.listWorkspace()
       const { outboxIds, ...syncPayload } = batch
       const response = await requestBackendJson(`${syncSettings.backendUrl}/api/note-sync/push`, {
         method: "POST",
@@ -975,10 +1204,28 @@ async function performSync() {
       await cacheRemoteImages(controller.signal)
       await cacheRemoteAttachments(controller.signal)
       const lastSuccessAt = new Date().toISOString()
+      const lastResult = createSyncResultSummary({
+        batch,
+        beforeWorkspace,
+        afterWorkspace: repository.listWorkspace(),
+        uploadedAssetCount,
+        conflictCount: applied.conflictCount,
+        startedAt,
+        completedAt: lastSuccessAt
+      })
       const message = applied.conflictCount
         ? `已同步，保留 ${applied.conflictCount} 个冲突副本`
         : "已同步到云端"
-      publishSyncStatus({ state: "success", message, lastSuccessAt })
+      let history = [lastResult, ...(syncStatus.history || [])].slice(0, 20)
+      try {
+        history = await appendSyncHistory(
+          getBackendProfilePath(syncSettings.backendUrl, syncSettings.accountId),
+          lastResult
+        )
+      } catch (error) {
+        console.warn("保存同步历史失败，本次结果仅保留在内存中", error)
+      }
+      publishSyncStatus({ state: "success", message, lastSuccessAt, lastResult, history })
       if (mainWindow && !mainWindow.isDestroyed()) {
         mainWindow.webContents.send("workspace:changed")
       }
@@ -1091,9 +1338,20 @@ async function exportNoteMarkdown(noteId) {
     filters: [{ name: "Markdown", extensions: ["md"] }]
   })
   if (result.canceled || !result.filePath) return { canceled: true }
-  const portableNote = { ...note, content: await embedLocalImageData(note.content) }
+  const portableNote = { ...note, content: repository.expandAssetReferences(note.content) }
   await fs.promises.writeFile(result.filePath, createMarkdownDocument(portableNote), "utf8")
-  return { canceled: false, message: "当前笔记已导出", filePath: result.filePath }
+  const unresolvedCount = repository.listAssets().filter((asset) => (
+    !asset.remoteUrl
+    && [asset.localUrl, `https://xinyue-asset.local/${encodeURIComponent(asset.id)}`]
+      .some((reference) => portableNote.content.includes(reference))
+  )).length
+  return {
+    canceled: false,
+    message: unresolvedCount
+      ? `当前笔记已导出；${unresolvedCount} 个未上传附件仍使用本应用本地地址`
+      : "当前笔记已导出，资源保留原始地址",
+    filePath: result.filePath
+  }
 }
 
 /**
@@ -1109,10 +1367,11 @@ async function exportAllMarkdown() {
   })
   if (result.canceled || !result.filePath) return { canceled: true }
   const backup = repository.exportBackup()
-  backup.notes = await Promise.all(backup.notes.map(async (note) => ({
-    ...note,
-    content: await embedLocalImageData(note.content)
-  })))
+  const assetBodies = await readBackupAssetBodies(backup)
+  backup.assets = (backup.assets || []).map((asset) => ({
+    ...asset,
+    data: assetBodies.get(asset.id)
+  }))
   await fs.promises.writeFile(result.filePath, createMarkdownZip(backup))
   const noteCount = backup.notes.filter((note) => !note.isDeleted).length
   return {
@@ -1123,7 +1382,7 @@ async function exportAllMarkdown() {
 }
 
 /**
- * 导出包含历史版本的完整 JSON 备份。
+ * 导出包含历史版本和原始附件的完整 .xynotes 备份。
  *
  * @returns {Promise<Record<string, any>>} 导出结果。
  */
@@ -1131,11 +1390,12 @@ async function exportFullBackup() {
   const result = await dialog.showSaveDialog(mainWindow, {
     title: "创建完整备份",
     defaultPath: `心悦笔记-完整备份-${getExportTimestamp()}.xynotes`,
-    filters: [{ name: "心悦笔记备份", extensions: ["xynotes", "json"] }]
+    filters: [{ name: "心悦笔记备份", extensions: ["xynotes"] }]
   })
   if (result.canceled || !result.filePath) return { canceled: true }
-  const backup = await createFullBackupPayload()
-  await fs.promises.writeFile(result.filePath, JSON.stringify(backup, null, 2), "utf8")
+  const backup = repository.exportBackup()
+  const assetBodies = await readBackupAssetBodies(backup)
+  await fs.promises.writeFile(result.filePath, createPortableBackupArchive(backup, assetBodies))
   return {
     canceled: false,
     message: `完整备份已创建，包含 ${backup.notes.length} 篇笔记`,
@@ -1196,6 +1456,7 @@ async function importMarkdownFiles(folderId) {
     ? collectMarkdownDocumentsFromZip(await fs.promises.readFile(sourcePath))
     : await collectMarkdownDocuments(sourcePath)
   if (!documents.length) throw new Error("所选内容中没有 Markdown 文件")
+  await restoreMarkdownResources(documents)
   const sourceFolderName = isZipSource ? "" : path.basename(sourcePath)
   const sourceLabel = path.basename(sourcePath) || `Markdown 导入 ${getExportTimestamp()}`
   const imported = applyLocalMutation(() => repository.importMarkdownDocuments(
@@ -1220,16 +1481,11 @@ async function importFullBackup() {
   const result = await dialog.showOpenDialog(mainWindow, {
     title: "导入完整备份",
     properties: ["openFile"],
-    filters: [{ name: "心悦笔记备份", extensions: ["xynotes", "json"] }]
+    filters: [{ name: "心悦笔记备份", extensions: ["xynotes"] }]
   })
   if (result.canceled || !result.filePaths[0]) return { canceled: true }
-  const content = await fs.promises.readFile(result.filePaths[0], "utf8")
-  let backup
-  try {
-    backup = JSON.parse(content)
-  } catch {
-    throw new Error("备份文件不是有效的 JSON")
-  }
+  const content = await fs.promises.readFile(result.filePaths[0])
+  const backup = parsePortableBackupArchive(content)
   const restoredBackup = await restoreBackupImageAssets(backup)
   await createCurrentDatabaseBackup("before-import")
   const imported = applyLocalMutation(() => repository.importBackup(restoredBackup))
@@ -1360,7 +1616,7 @@ async function clearSyncSettings() {
   }
   pendingSyncConnection = null
   await activateSyncProfile(nextSettings)
-  publishSyncStatus({ state: "idle", message: "仅保存在本机", lastSuccessAt: "" })
+  publishSyncStatus({ state: "idle", message: "仅保存在本机", lastSuccessAt: "", lastResult: null, history: [] })
   return getSyncSettingsView()
 }
 
@@ -1562,6 +1818,11 @@ function registerIpcHandlers() {
   })
   ipcMain.handle("asset:save-attachment", (_event, input) => saveAttachment(input || {}))
   ipcMain.handle("asset:open", (_event, assetId) => openAttachment(assetId))
+  ipcMain.handle("asset-management:list", () => listAttachmentInventory())
+  ipcMain.handle("asset-management:reveal", (_event, assetId) => revealAttachment(assetId))
+  ipcMain.handle("asset-management:delete-orphan", (_event, assetId) => deleteOrphanAttachment(assetId))
+  ipcMain.handle("asset-management:delete-all-orphans", (_event, assetIds) => deleteAllOrphanAttachments(assetIds))
+  ipcMain.handle("asset-management:repair-integrity", () => repairAttachmentIntegrity())
   ipcMain.handle("external-link:open", (_event, url) => openExternalLink(url))
   ipcMain.handle("asset:save-image", (_event, input) => saveImageAsset(input || {}))
   ipcMain.handle("note:create", (_event, folderId) => (
@@ -1610,6 +1871,9 @@ function registerIpcHandlers() {
   })
   ipcMain.handle("note:update", (_event, noteId, patch) => (
     applyLocalMutation(() => repository.updateNote(noteId, patch))
+  ))
+  ipcMain.handle("note-conflict:resolve", (_event, conflictNoteId, strategy) => (
+    applyLocalMutation(() => repository.resolveNoteConflict(conflictNoteId, strategy))
   ))
   ipcMain.handle("note-history:list", (_event, noteId) => {
     return repository.listNoteHistory(noteId)
@@ -1928,6 +2192,7 @@ app.whenReady().then(() => {
   const profilePath = getBackendProfilePath(syncSettings.backendUrl, syncSettings.accountId)
   const domainProfilePath = path.dirname(profilePath)
   repository = openBackendRepository(syncSettings.backendUrl, syncSettings.accountId)
+  restoreSyncHistory(profilePath, Boolean(syncSettings.token))
   backupManager = createCurrentBackupManager()
   repository.relocateImageAssetPaths(
     path.join(domainProfilePath, LOCAL_ASSET_DIRECTORY_NAME),

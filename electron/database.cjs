@@ -116,6 +116,7 @@ function openNotesDatabase(userDataPath) {
       is_deleted INTEGER NOT NULL DEFAULT 0,
       deleted_at TEXT,
       deleted_by_folder_id TEXT,
+      conflict_source_id TEXT REFERENCES notes(id) ON DELETE SET NULL,
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL,
       server_updated_at TEXT,
@@ -187,6 +188,9 @@ function openNotesDatabase(userDataPath) {
   if (!noteColumns.some((column) => column.name === "deleted_by_folder_id")) {
     database.exec("ALTER TABLE notes ADD COLUMN deleted_by_folder_id TEXT")
   }
+  if (!noteColumns.some((column) => column.name === "conflict_source_id")) {
+    database.exec("ALTER TABLE notes ADD COLUMN conflict_source_id TEXT REFERENCES notes(id) ON DELETE SET NULL")
+  }
   for (const tableName of ["folders", "tags", "notes"]) {
     const columns = database.prepare(`PRAGMA table_info(${tableName})`).all()
     if (!columns.some((column) => column.name === "server_updated_at")) {
@@ -216,6 +220,7 @@ function openNotesDatabase(userDataPath) {
   `)
   database.exec("CREATE INDEX IF NOT EXISTS idx_folders_parent ON folders(parent_id, sort_order)")
   database.exec("CREATE INDEX IF NOT EXISTS idx_folders_deleted ON folders(is_deleted, deleted_root_id)")
+  database.exec("CREATE INDEX IF NOT EXISTS idx_notes_conflict_source ON notes(conflict_source_id)")
   return createRepository(database)
 }
 
@@ -237,6 +242,7 @@ function mapNote(row, tags = []) {
     isDeleted: Boolean(row.is_deleted),
     deletedAt: row.deleted_at,
     deletedByFolderId: row.deleted_by_folder_id,
+    conflictSourceId: row.conflict_source_id || null,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
     serverUpdatedAt: row.server_updated_at,
@@ -500,6 +506,62 @@ function createRepository(database) {
       SELECT * FROM note_assets ORDER BY created_at
     `).all().map(mapImageAsset)
   }
+
+  /**
+   * 查询附件及其在当前笔记和历史版本中的引用情况。
+   *
+   * @returns {Array<Record<string, any>>} 附件管理清单。
+   */
+  function listAttachmentInventory() {
+    const assets = database.prepare("SELECT * FROM note_assets ORDER BY created_at DESC").all()
+    const notes = database.prepare(`
+      SELECT id, title, content, is_deleted AS isDeleted
+      FROM notes
+      ORDER BY updated_at DESC
+    `).all()
+    const histories = database.prepare("SELECT note_id AS noteId, content FROM note_history").all()
+    return assets.map((row) => {
+      const tokens = [
+        `${LOCAL_ASSET_URL_PREFIX}${row.id}`,
+        `${INTERNAL_ATTACHMENT_URL_PREFIX}${row.id}`,
+        row.remote_url
+      ].filter(Boolean)
+      const isReferenced = (content) => tokens.some((token) => String(content || "").includes(token))
+      const noteReferences = notes
+        .filter((note) => isReferenced(note.content))
+        .map((note) => ({
+          id: note.id,
+          title: note.title,
+          isDeleted: Boolean(note.isDeleted)
+        }))
+      const historyReferenceCount = histories.reduce(
+        (count, history) => count + Number(isReferenced(history.content)),
+        0
+      )
+      const referenceCount = noteReferences.length + historyReferenceCount
+      return {
+        ...mapImageAsset(row),
+        noteReferences,
+        historyReferenceCount,
+        referenceCount,
+        isOrphan: referenceCount === 0
+      }
+    })
+  }
+
+  /**
+   * 删除确认未被当前笔记或历史版本引用的附件记录。
+   *
+   * @param {string} assetId 附件资源 ID。
+   * @returns {Record<string, any> | null} 被删除的附件；不存在时返回空值。
+   */
+  const deleteOrphanAsset = database.transaction((assetId) => {
+    const asset = listAttachmentInventory().find((item) => item.id === assetId)
+    if (!asset) return null
+    if (!asset.isOrphan) throw new Error("附件仍被笔记引用，不能清理")
+    database.prepare("DELETE FROM note_assets WHERE id = ?").run(assetId)
+    return asset
+  })
 
   /**
    * 记录图片资源上传后的云端地址。
@@ -874,6 +936,101 @@ function createRepository(database) {
     const note = getNote(noteId)
     enqueue("note", noteId, "upsert", note)
     return note
+  })
+
+  /** 返回仍待处理且原笔记存在的同步冲突。 */
+  function listNoteConflicts() {
+    return database.prepare(`
+      SELECT id, conflict_source_id AS sourceId
+      FROM notes
+      WHERE conflict_source_id IS NOT NULL
+      ORDER BY updated_at DESC
+    `).all().map((row) => ({
+      original: getNote(row.sourceId),
+      conflict: getNote(row.id)
+    })).filter((pair) => pair.original && pair.conflict)
+  }
+
+  /** 将即将丢弃的冲突副本保存为原笔记的历史版本。 */
+  function preserveConflictAsHistory(originalId, conflict) {
+    const title = String(conflict.title || "")
+      .replace(/（冲突副本）$/, "")
+      .slice(0, 100) || "无标题笔记"
+    const tagNames = selectTagsForNote.all(conflict.id).map((tag) => tag.name)
+    database.prepare(`
+      INSERT INTO note_history(id, note_id, title, content, folder_id, tag_names, created_at, dirty)
+      VALUES (?, ?, ?, ?, ?, ?, ?, 1)
+    `).run(
+      randomUUID(),
+      originalId,
+      title,
+      validateNoteContent(conflict.content),
+      conflict.folder_id,
+      JSON.stringify(tagNames),
+      nowIso()
+    )
+    database.prepare(`
+      DELETE FROM note_history
+      WHERE note_id = ? AND id NOT IN (
+        SELECT id FROM note_history WHERE note_id = ? ORDER BY created_at DESC LIMIT 50
+      )
+    `).run(originalId, originalId)
+  }
+
+  /**
+   * 在一个事务内处理同步冲突。
+   *
+   * @param {string} conflictNoteId 冲突副本 ID。
+   * @param {"local" | "remote" | "both"} strategy 处理策略。
+   * @returns {{ strategy: string, note: Record<string, any> }} 处理结果。
+   */
+  const resolveNoteConflict = database.transaction((conflictNoteId, strategy) => {
+    if (!["local", "remote", "both"].includes(strategy)) throw new Error("不支持的冲突处理方式")
+    const conflict = database.prepare("SELECT * FROM notes WHERE id = ? AND conflict_source_id IS NOT NULL")
+      .get(conflictNoteId)
+    if (!conflict) throw new Error("冲突副本不存在或已处理")
+    const original = database.prepare("SELECT * FROM notes WHERE id = ?").get(conflict.conflict_source_id)
+    if (!original) throw new Error("冲突对应的原笔记不存在")
+
+    if (strategy === "both") {
+      database.prepare(`
+        UPDATE notes SET conflict_source_id = NULL, updated_at = ?, dirty = 1 WHERE id = ?
+      `).run(nowIso(), conflictNoteId)
+      const retained = getNote(conflictNoteId)
+      enqueue("note", conflictNoteId, "upsert", retained)
+      return { strategy, note: retained }
+    }
+
+    if (strategy === "local") {
+      createHistoryIfNeeded(original, true)
+      database.prepare(`
+        UPDATE notes
+        SET folder_id = ?, title = ?, content = ?, is_pinned = ?, is_deleted = ?,
+            deleted_at = ?, deleted_by_folder_id = ?, updated_at = ?, dirty = 1
+        WHERE id = ?
+      `).run(
+        conflict.folder_id,
+        String(conflict.title || "").replace(/（冲突副本）$/, "").slice(0, 100) || "无标题笔记",
+        validateNoteContent(conflict.content),
+        conflict.is_pinned,
+        conflict.is_deleted,
+        conflict.deleted_at,
+        conflict.deleted_by_folder_id,
+        nowIso(),
+        original.id
+      )
+      replaceNoteTags(original.id, selectTagsForNote.all(conflictNoteId).map((tag) => tag.name))
+      enqueue("note", original.id, "upsert", getNote(original.id))
+    } else {
+      preserveConflictAsHistory(original.id, conflict)
+    }
+
+    database.prepare("DELETE FROM outbox WHERE entity_type = 'note' AND entity_id = ?").run(conflictNoteId)
+    database.prepare("DELETE FROM notes WHERE id = ?").run(conflictNoteId)
+    if (conflict.server_id) {
+      enqueue("note", conflictNoteId, "delete", { id: conflictNoteId, serverId: conflict.server_id })
+    }
+    return { strategy, note: getNote(original.id) }
   })
 
   /**
@@ -1578,9 +1735,9 @@ function createRepository(database) {
       database.prepare(`
         INSERT INTO notes(
           id, folder_id, title, content, is_pinned, is_deleted, deleted_at,
-          deleted_by_folder_id,
+          deleted_by_folder_id, conflict_source_id,
           created_at, updated_at, dirty
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
       `).run(
         conflictId,
         current.folderId,
@@ -1590,6 +1747,7 @@ function createRepository(database) {
         Number(current.isDeleted),
         current.deletedAt,
         current.deletedByFolderId,
+        current.id,
         timestamp,
         timestamp
       )
@@ -1872,6 +2030,8 @@ function createRepository(database) {
     duplicateNote,
     createQuickNote,
     updateNote,
+    listNoteConflicts,
+    resolveNoteConflict,
     listNoteHistory,
     getNoteHistory,
     restoreNoteHistory,
@@ -1887,6 +2047,7 @@ function createRepository(database) {
     deleteFolderPermanently,
     createTag,
     deleteTag,
+    expandAssetReferences: expandImageAssetReferences,
     exportBackup,
     importBackup,
     importMarkdownDocuments,
@@ -1896,12 +2057,14 @@ function createRepository(database) {
     getImageAsset,
     listAssets: listImageAssets,
     listImageAssets,
+    listAttachmentInventory,
     listPendingAssets: listPendingImageAssets,
     listPendingImageAssets,
     listRemoteAttachmentReferencesToCache,
     listRemoteImageUrlsToCache,
     markAssetUploaded: markImageAssetUploaded,
     markImageAssetUploaded,
+    deleteOrphanAsset,
     getSyncBatch,
     applySyncResult
   }

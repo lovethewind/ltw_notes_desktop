@@ -19,6 +19,11 @@ contextBridge.exposeInMainWorld("notesDesktop", {
   },
   saveAttachment: (input) => ipcRenderer.invoke("asset:save-attachment", input),
   openAttachment: (assetId) => ipcRenderer.invoke("asset:open", assetId),
+  listAttachmentInventory: () => ipcRenderer.invoke("asset-management:list"),
+  revealAttachment: (assetId) => ipcRenderer.invoke("asset-management:reveal", assetId),
+  deleteOrphanAttachment: (assetId) => ipcRenderer.invoke("asset-management:delete-orphan", assetId),
+  deleteAllOrphanAttachments: (assetIds) => ipcRenderer.invoke("asset-management:delete-all-orphans", assetIds),
+  repairAttachmentIntegrity: () => ipcRenderer.invoke("asset-management:repair-integrity"),
   openExternalLink: (url) => ipcRenderer.invoke("external-link:open", url),
   saveImageAsset: (input) => ipcRenderer.invoke("asset:save-image", input),
   createNote: (folderId) => ipcRenderer.invoke("note:create", folderId),
@@ -82,6 +87,9 @@ contextBridge.exposeInMainWorld("notesDesktop", {
     return () => ipcRenderer.removeListener("quick-capture:escape", listener)
   },
   updateNote: (noteId, patch) => ipcRenderer.invoke("note:update", noteId, patch),
+  resolveNoteConflict: (conflictNoteId, strategy) => (
+    ipcRenderer.invoke("note-conflict:resolve", conflictNoteId, strategy)
+  ),
   listNoteHistory: (noteId) => ipcRenderer.invoke("note-history:list", noteId),
   getNoteHistory: (noteId, historyId) => ipcRenderer.invoke("note-history:detail", noteId, historyId),
   restoreNoteHistory: (noteId, historyId) => ipcRenderer.invoke("note-history:restore", noteId, historyId),
