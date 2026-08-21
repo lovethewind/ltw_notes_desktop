@@ -15,17 +15,69 @@ export interface PartitionedNoteTabs {
  * :param noteId: 待打开的笔记 ID。
  * :return: 更新后的标签状态。
  */
-export function activateNoteInCurrentTab(state: NoteTabsState, noteId: string): NoteTabsState {
+export function activateNoteInCurrentTab(
+  state: NoteTabsState,
+  noteId: string,
+  pinnedNoteIds: string[] = [],
+): NoteTabsState {
   if (state.noteIds.includes(noteId)) {
     return { noteIds: [...state.noteIds], activeNoteId: noteId }
   }
   const activeIndex = state.activeNoteId ? state.noteIds.indexOf(state.activeNoteId) : -1
+  if (state.activeNoteId && pinnedNoteIds.includes(state.activeNoteId)) {
+    return { noteIds: [...state.noteIds, noteId], activeNoteId: noteId }
+  }
   if (activeIndex < 0) {
     return { noteIds: [...state.noteIds, noteId], activeNoteId: noteId }
   }
   const noteIds = [...state.noteIds]
   noteIds[activeIndex] = noteId
   return { noteIds, activeNoteId: noteId }
+}
+
+export interface PinnedNoteTabsState {
+  noteIds: string[]
+  pinnedNoteIds: string[]
+}
+
+/** 固定或取消固定标签，并维持固定标签在左侧。 */
+export function togglePinnedNoteTab(
+  state: PinnedNoteTabsState,
+  noteId: string,
+): PinnedNoteTabsState {
+  if (!state.noteIds.includes(noteId)) {
+    return { noteIds: [...state.noteIds], pinnedNoteIds: [...state.pinnedNoteIds] }
+  }
+  const pinnedSet = new Set(state.pinnedNoteIds.filter((id) => state.noteIds.includes(id)))
+  if (pinnedSet.has(noteId)) pinnedSet.delete(noteId)
+  else pinnedSet.add(noteId)
+  const pinnedNoteIds = state.noteIds.filter((id) => pinnedSet.has(id))
+  const regularNoteIds = state.noteIds.filter((id) => !pinnedSet.has(id))
+  return { noteIds: [...pinnedNoteIds, ...regularNoteIds], pinnedNoteIds }
+}
+
+/** 在固定或普通标签分组内部拖动排序。 */
+export function reorderNoteTabs(
+  state: PinnedNoteTabsState,
+  sourceNoteId: string,
+  targetNoteId: string,
+): PinnedNoteTabsState {
+  const sourceIndex = state.noteIds.indexOf(sourceNoteId)
+  const targetIndex = state.noteIds.indexOf(targetNoteId)
+  if (sourceIndex < 0 || targetIndex < 0 || sourceNoteId === targetNoteId) {
+    return { noteIds: [...state.noteIds], pinnedNoteIds: [...state.pinnedNoteIds] }
+  }
+  const pinnedSet = new Set(state.pinnedNoteIds)
+  if (pinnedSet.has(sourceNoteId) !== pinnedSet.has(targetNoteId)) {
+    return { noteIds: [...state.noteIds], pinnedNoteIds: [...state.pinnedNoteIds] }
+  }
+  const noteIds = [...state.noteIds]
+  noteIds.splice(sourceIndex, 1)
+  noteIds.splice(noteIds.indexOf(targetNoteId), 0, sourceNoteId)
+  return {
+    noteIds,
+    pinnedNoteIds: noteIds.filter((id) => pinnedSet.has(id))
+  }
 }
 
 /**
@@ -79,11 +131,18 @@ export function reconcileNoteTabs(
  *
  * :param state: 当前标签状态。
  * :param noteId: 需要保留的笔记 ID。
+ * :param pinnedNoteIds: 不受“关闭其他”影响的固定标签 ID。
  * :return: 更新后的标签状态。
  */
-export function closeOtherNoteTabs(state: NoteTabsState, noteId: string): NoteTabsState {
+export function closeOtherNoteTabs(
+  state: NoteTabsState,
+  noteId: string,
+  pinnedNoteIds: string[] = [],
+): NoteTabsState {
   if (!state.noteIds.includes(noteId)) return { noteIds: [...state.noteIds], activeNoteId: state.activeNoteId }
-  return { noteIds: [noteId], activeNoteId: noteId }
+  const pinnedSet = new Set(pinnedNoteIds)
+  const noteIds = state.noteIds.filter((id) => id === noteId || pinnedSet.has(id))
+  return { noteIds, activeNoteId: noteId }
 }
 
 /**

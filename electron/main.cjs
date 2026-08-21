@@ -55,6 +55,9 @@ const {
 } = require("./attachment-cleanup.cjs")
 const { classifyAttachmentSource } = require("./attachment-source.cjs")
 const { executeAttachmentIntegrityRepair } = require("./attachment-integrity.cjs")
+const { createQuitSaveCoordinator } = require("./quit-save-coordinator.cjs")
+const { registerIpcHandlers: registerFeatureIpcHandlers } = require("./ipc-handlers.cjs")
+const { isE2ERuntime, resolveUserDataPath, shouldShowMainWindow } = require("./runtime-paths.cjs")
 
 const DEFAULT_BACKEND_URL = "https://lovethewind.cn"
 const DEFAULT_WEB_URL = "https://lovethewind.cn"
@@ -81,6 +84,42 @@ let mainWindow = null
 let quickCaptureWindow = null
 let quickCaptureSettings = null
 let isQuitting = false
+let closeMainWindowAfterSave = false
+let allowMainWindowClose = false
+const quitSaveCoordinator = createQuitSaveCoordinator({
+  requestSave: (requestId) => {
+    if (!mainWindow || mainWindow.isDestroyed() || mainWindow.webContents.isDestroyed()) {
+      throw new Error("主窗口已关闭，无法确认当前笔记已保存")
+    }
+    mainWindow.webContents.send("app:before-quit-save", requestId)
+  },
+  quit: () => {
+    if (closeMainWindowAfterSave && mainWindow && !mainWindow.isDestroyed()) {
+      closeMainWindowAfterSave = false
+      allowMainWindowClose = true
+      // 红色关窗只销毁主窗口，不退出仍驻留在 macOS Dock 中的应用进程。
+      quitSaveCoordinator.dispose()
+      mainWindow.close()
+      return
+    }
+    app.quit()
+  },
+  onFailure: (message) => {
+    closeMainWindowAfterSave = false
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      if (mainWindow.isMinimized()) mainWindow.restore()
+      mainWindow.show()
+      mainWindow.focus()
+    }
+    void dialog.showMessageBox(mainWindow ?? undefined, {
+      type: "error",
+      title: "无法退出心悦笔记",
+      message: "当前笔记尚未安全保存",
+      detail: message,
+      buttons: ["知道了"]
+    })
+  }
+})
 const backupStatusTracker = createDatabaseBackupStatusTracker((status) => {
   if (mainWindow && !mainWindow.isDestroyed()) {
     mainWindow.webContents.send("database-backup:status", status)
@@ -1189,7 +1228,7 @@ async function performSync() {
     try {
       const uploadedAssetCount = await uploadPendingImageAssets(controller.signal)
       const batch = repository.getSyncBatch()
-      const beforeWorkspace = repository.listWorkspace()
+      const beforeWorkspace = repository.listFullWorkspace()
       const { outboxIds, ...syncPayload } = batch
       const response = await requestBackendJson(`${syncSettings.backendUrl}/api/note-sync/push`, {
         method: "POST",
@@ -1207,7 +1246,7 @@ async function performSync() {
       const lastResult = createSyncResultSummary({
         batch,
         beforeWorkspace,
-        afterWorkspace: repository.listWorkspace(),
+        afterWorkspace: repository.listFullWorkspace(),
         uploadedAssetCount,
         conflictCount: applied.conflictCount,
         startedAt,
@@ -1330,7 +1369,7 @@ function getExportTimestamp() {
  * @returns {Promise<Record<string, any>>} 导出结果。
  */
 async function exportNoteMarkdown(noteId) {
-  const note = repository.listWorkspace().notes.find((item) => item.id === noteId)
+  const note = repository.getNoteForEditing(noteId)
   if (!note) throw new Error("当前笔记不存在")
   const result = await dialog.showSaveDialog(mainWindow, {
     title: "导出当前笔记",
@@ -1377,6 +1416,29 @@ async function exportAllMarkdown() {
   return {
     canceled: false,
     message: `已导出 ${noteCount} 篇 Markdown 笔记`,
+    filePath: result.filePath
+  }
+}
+
+/** 将用户选中的未删除笔记导出为 Markdown ZIP。 */
+async function exportSelectedMarkdown(noteIds) {
+  const selectedIds = new Set(Array.isArray(noteIds) ? noteIds.filter((id) => typeof id === "string" && id) : [])
+  if (!selectedIds.size) throw new Error("请先选择要导出的笔记")
+  const backup = repository.exportBackup()
+  backup.notes = backup.notes.filter((note) => selectedIds.has(note.id) && !note.isDeleted)
+  if (!backup.notes.length) throw new Error("所选内容中没有可导出的笔记")
+  const result = await dialog.showSaveDialog(mainWindow, {
+    title: "导出所选笔记",
+    defaultPath: `心悦笔记-所选${backup.notes.length}篇-${getExportTimestamp()}.zip`,
+    filters: [{ name: "ZIP 压缩包", extensions: ["zip"] }]
+  })
+  if (result.canceled || !result.filePath) return { canceled: true }
+  const assetBodies = await readBackupAssetBodies(backup)
+  backup.assets = (backup.assets || []).map((asset) => ({ ...asset, data: assetBodies.get(asset.id) }))
+  await fs.promises.writeFile(result.filePath, createMarkdownZip(backup))
+  return {
+    canceled: false,
+    message: `已导出 ${backup.notes.length} 篇 Markdown 笔记`,
     filePath: result.filePath
   }
 }
@@ -1805,154 +1867,176 @@ async function handleAppDeepLink(rawUrl) {
  * @returns {void}
  */
 function registerIpcHandlers() {
-  ipcMain.handle("workspace:list", () => repository.listWorkspace())
-  ipcMain.handle("note-link:open-local", (_event, noteId) => {
-    const normalizedNoteId = String(noteId || "").trim()
-    if (normalizedNoteId) notifyOpenNoteLink(normalizedNoteId)
-    return Boolean(normalizedNoteId)
-  })
-  ipcMain.handle("note-link:consume-pending", () => {
-    const noteId = pendingNoteLinkId
-    pendingNoteLinkId = ""
-    return noteId
-  })
-  ipcMain.handle("asset:save-attachment", (_event, input) => saveAttachment(input || {}))
-  ipcMain.handle("asset:open", (_event, assetId) => openAttachment(assetId))
-  ipcMain.handle("asset-management:list", () => listAttachmentInventory())
-  ipcMain.handle("asset-management:reveal", (_event, assetId) => revealAttachment(assetId))
-  ipcMain.handle("asset-management:delete-orphan", (_event, assetId) => deleteOrphanAttachment(assetId))
-  ipcMain.handle("asset-management:delete-all-orphans", (_event, assetIds) => deleteAllOrphanAttachments(assetIds))
-  ipcMain.handle("asset-management:repair-integrity", () => repairAttachmentIntegrity())
-  ipcMain.handle("external-link:open", (_event, url) => openExternalLink(url))
-  ipcMain.handle("asset:save-image", (_event, input) => saveImageAsset(input || {}))
-  ipcMain.handle("note:create", (_event, folderId) => (
-    applyLocalMutation(() => repository.createNote(folderId || null))
-  ))
-  ipcMain.handle("note:duplicate", (_event, noteId, targetFolderId, title) => (
-    applyLocalMutation(() => repository.duplicateNote(noteId, targetFolderId, title))
-  ))
-  ipcMain.handle("quick-capture:open", () => {
-    showQuickCaptureWindow()
-    return true
-  })
-  ipcMain.handle("quick-capture:hide", () => {
-    quickCaptureWindow?.hide()
-    if (process.platform === "darwin") app.hide()
-    return true
-  })
-  ipcMain.handle("quick-capture:settings:get", () => ({ ...quickCaptureSettings }))
-  ipcMain.handle("quick-capture:settings:save", async (_event, input) => {
-    const previous = quickCaptureSettings
-    const requestedShortcut = String(input?.shortcut || "").trim()
-    if (!requestedShortcut) throw new Error("请先录入快捷键")
-    if (!registerQuickCaptureShortcut(requestedShortcut, previous.shortcut)) {
-      throw new Error("快捷键已被系统或其他应用占用，请换一个组合")
+  registerFeatureIpcHandlers(ipcMain, {
+    application: {
+      completeQuitSave: (requestId, result) => quitSaveCoordinator.complete(requestId, result),
+      setTheme: (theme) => {
+        nativeTheme.themeSource = ["light", "dark"].includes(theme) ? theme : "system"
+        return nativeTheme.shouldUseDarkColors
+      },
+      checkForUpdates: () => checkForUpdates({
+        currentVersion: app.getVersion(),
+        architecture: process.arch,
+        request: (url, options) => net.fetch(url, options)
+      }),
+      openUpdateDownload: (downloadUrl) => {
+        const parsedUrl = new URL(String(downloadUrl || ""))
+        if (!["github.com", "objects.githubusercontent.com"].includes(parsedUrl.hostname)) {
+          throw new Error("更新下载地址不受信任")
+        }
+        return shell.openExternal(parsedUrl.toString())
+      }
+    },
+    workspace: {
+      listWorkspace: () => repository.listWorkspace(),
+      getSession: () => repository.getWorkspaceSession(),
+      saveSession: (input) => repository.saveWorkspaceSession(input),
+      saveViewState: (noteId, scrollTop) => repository.saveNoteViewState(noteId, scrollTop),
+      getNote: (noteId) => repository.getNoteForEditing(noteId),
+      searchNotes: (keyword, options) => repository.searchNotes(keyword, options),
+      openNoteLink: (noteId) => {
+        const normalizedNoteId = String(noteId || "").trim()
+        if (normalizedNoteId) notifyOpenNoteLink(normalizedNoteId)
+        return Boolean(normalizedNoteId)
+      },
+      consumePendingNoteLink: () => {
+        const noteId = pendingNoteLinkId
+        pendingNoteLinkId = ""
+        return noteId
+      }
+    },
+    attachments: {
+      saveAttachment,
+      openAttachment,
+      listInventory: listAttachmentInventory,
+      revealAttachment,
+      deleteOrphan: deleteOrphanAttachment,
+      deleteAllOrphans: deleteAllOrphanAttachments,
+      repairIntegrity: repairAttachmentIntegrity,
+      openExternalLink,
+      saveImage: saveImageAsset
+    },
+    notes: {
+      create: (folderId) => applyLocalMutation(() => repository.createNote(folderId)),
+      duplicate: (noteId, targetFolderId, title) => (
+        applyLocalMutation(() => repository.duplicateNote(noteId, targetFolderId, title))
+      ),
+      update: (noteId, patch) => applyLocalMutation(() => repository.updateNote(noteId, patch)),
+      bulkUpdate: (noteIds, patch) => (
+        applyLocalMutation(() => repository.bulkUpdateNotes(noteIds, patch))
+      ),
+      resolveConflict: (conflictNoteId, strategy) => (
+        applyLocalMutation(() => repository.resolveNoteConflict(conflictNoteId, strategy))
+      ),
+      listHistory: (noteId) => repository.listNoteHistory(noteId),
+      getHistory: (noteId, historyId) => repository.getNoteHistory(noteId, historyId),
+      restoreHistory: (noteId, historyId) => {
+        const restored = repository.restoreNoteHistory(noteId, historyId)
+        if (restored) requestImmediateSync()
+        return restored
+      },
+      deleteHistory: (noteId, historyId) => {
+        const deleted = repository.deleteNoteHistory(noteId, historyId)
+        if (deleted) requestImmediateSync()
+        return deleted
+      },
+      setDeleted: (noteId, deleted) => (
+        applyLocalMutation(() => repository.setNoteDeleted(noteId, deleted))
+      ),
+      deletePermanently: (noteId) => (
+        applyLocalMutation(() => repository.deleteNotePermanently(noteId))
+      ),
+      emptyTrash: () => applyLocalMutation(() => repository.emptyTrash())
+    },
+    foldersAndTags: {
+      createFolder: (name, parentId) => (
+        applyLocalMutation(() => repository.createFolder(name, parentId))
+      ),
+      renameFolder: (folderId, name) => (
+        applyLocalMutation(() => repository.renameFolder(folderId, name))
+      ),
+      moveFolder: (folderId, parentId, beforeFolderId) => (
+        applyLocalMutation(() => repository.moveFolder(folderId, parentId, beforeFolderId))
+      ),
+      deleteFolder: (folderId) => (
+        applyLocalMutation(() => repository.setFolderDeleted(folderId))
+      ),
+      restoreFolder: (folderId) => (
+        applyLocalMutation(() => repository.restoreFolder(folderId))
+      ),
+      deleteFolderPermanently: (folderId) => (
+        applyLocalMutation(() => repository.deleteFolderPermanently(folderId))
+      ),
+      createTag: (name) => applyLocalMutation(() => repository.createTag(name)),
+      deleteTag: (tagId) => applyLocalMutation(() => repository.deleteTag(tagId))
+    },
+    quickCapture: {
+      open: () => {
+        showQuickCaptureWindow()
+        return true
+      },
+      hide: () => {
+        quickCaptureWindow?.hide()
+        if (process.platform === "darwin") app.hide()
+        return true
+      },
+      getSettings: () => ({ ...quickCaptureSettings }),
+      saveSettings: async (input) => {
+        const previous = quickCaptureSettings
+        const requestedShortcut = String(input?.shortcut || "").trim()
+        if (!requestedShortcut) throw new Error("请先录入快捷键")
+        if (!registerQuickCaptureShortcut(requestedShortcut, previous.shortcut)) {
+          throw new Error("快捷键已被系统或其他应用占用，请换一个组合")
+        }
+        try {
+          quickCaptureSettings = await saveQuickCaptureSettings(app.getPath("userData"), {
+            shortcut: requestedShortcut,
+            folderId: input?.folderId
+          })
+          return { ...quickCaptureSettings }
+        } catch (error) {
+          globalShortcut.unregister(requestedShortcut)
+          registerQuickCaptureShortcut(previous.shortcut)
+          throw error
+        }
+      },
+      create: async (input) => {
+        const note = applyLocalMutation(() => repository.createQuickNote(input))
+        quickCaptureSettings = await saveQuickCaptureSettings(app.getPath("userData"), {
+          ...quickCaptureSettings,
+          folderId: note.folderId
+        })
+        mainWindow?.webContents.send("workspace:changed")
+        return note
+      }
+    },
+    dataTransfer: {
+      exportNote: exportNoteMarkdown,
+      exportAll: exportAllMarkdown,
+      exportSelected: exportSelectedMarkdown,
+      exportBackup: exportFullBackup,
+      importMarkdown: importMarkdownFiles,
+      importBackup: importFullBackup
+    },
+    backups: {
+      list: listCurrentDatabaseBackups,
+      getStatus: () => backupStatusTracker.getStatus(),
+      getSettings: getCurrentBackupSettings,
+      saveSettings: saveCurrentBackupSettings,
+      create: () => createCurrentDatabaseBackup("manual"),
+      restore: restoreCurrentDatabaseBackup,
+      openDirectory: openCurrentBackupDirectory
+    },
+    sync: {
+      getSettings: getSyncSettingsView,
+      getStatus: () => syncStatus,
+      run: performSync,
+      testConnection: testSyncConnection,
+      startAuth: startBrowserSyncLogin,
+      cancelAuth: cancelBrowserSyncLogin,
+      saveSettings: saveSyncSettings,
+      clearSettings: clearSyncSettings
     }
-    try {
-      quickCaptureSettings = await saveQuickCaptureSettings(app.getPath("userData"), {
-        shortcut: requestedShortcut,
-        folderId: input?.folderId
-      })
-      return { ...quickCaptureSettings }
-    } catch (error) {
-      globalShortcut.unregister(requestedShortcut)
-      registerQuickCaptureShortcut(previous.shortcut)
-      throw error
-    }
-  })
-  ipcMain.handle("quick-capture:create", async (_event, input) => {
-    const note = applyLocalMutation(() => repository.createQuickNote(input || {}))
-    quickCaptureSettings = await saveQuickCaptureSettings(app.getPath("userData"), {
-      ...quickCaptureSettings,
-      folderId: note.folderId
-    })
-    mainWindow?.webContents.send("workspace:changed")
-    return note
-  })
-  ipcMain.handle("note:update", (_event, noteId, patch) => (
-    applyLocalMutation(() => repository.updateNote(noteId, patch))
-  ))
-  ipcMain.handle("note-conflict:resolve", (_event, conflictNoteId, strategy) => (
-    applyLocalMutation(() => repository.resolveNoteConflict(conflictNoteId, strategy))
-  ))
-  ipcMain.handle("note-history:list", (_event, noteId) => {
-    return repository.listNoteHistory(noteId)
-  })
-  ipcMain.handle("note-history:detail", (_event, noteId, historyId) => (
-    repository.getNoteHistory(noteId, historyId)
-  ))
-  ipcMain.handle("note-history:restore", (_event, noteId, historyId) => {
-    const restored = repository.restoreNoteHistory(noteId, historyId)
-    if (restored) requestImmediateSync()
-    return restored
-  })
-  ipcMain.handle("note-history:delete", (_event, noteId, historyId) => {
-    const deleted = repository.deleteNoteHistory(noteId, historyId)
-    if (deleted) requestImmediateSync()
-    return deleted
-  })
-  ipcMain.handle("note:set-deleted", (_event, noteId, deleted) => (
-    applyLocalMutation(() => repository.setNoteDeleted(noteId, deleted))
-  ))
-  ipcMain.handle("note:delete-permanently", (_event, noteId) => (
-    applyLocalMutation(() => repository.deleteNotePermanently(noteId))
-  ))
-  ipcMain.handle("note:empty-trash", () => applyLocalMutation(() => repository.emptyTrash()))
-  ipcMain.handle("folder:create", (_event, name, parentId) => (
-    applyLocalMutation(() => repository.createFolder(name, parentId || null))
-  ))
-  ipcMain.handle("folder:rename", (_event, folderId, name) => (
-    applyLocalMutation(() => repository.renameFolder(folderId, name))
-  ))
-  ipcMain.handle("folder:move", (_event, folderId, parentId, beforeFolderId) => (
-    applyLocalMutation(() => repository.moveFolder(folderId, parentId || null, beforeFolderId || null))
-  ))
-  ipcMain.handle("folder:set-deleted", (_event, folderId) => (
-    applyLocalMutation(() => repository.setFolderDeleted(folderId))
-  ))
-  ipcMain.handle("folder:restore", (_event, folderId) => (
-    applyLocalMutation(() => repository.restoreFolder(folderId))
-  ))
-  ipcMain.handle("folder:delete-permanently", (_event, folderId) => (
-    applyLocalMutation(() => repository.deleteFolderPermanently(folderId))
-  ))
-  ipcMain.handle("tag:create", (_event, name) => applyLocalMutation(() => repository.createTag(name)))
-  ipcMain.handle("tag:delete", (_event, tagId) => applyLocalMutation(() => repository.deleteTag(tagId)))
-  ipcMain.handle("data:export-note-markdown", (_event, noteId) => exportNoteMarkdown(noteId))
-  ipcMain.handle("data:export-all-markdown", () => exportAllMarkdown())
-  ipcMain.handle("data:export-backup", () => exportFullBackup())
-  ipcMain.handle("data:import-markdown", (_event, folderId) => importMarkdownFiles(folderId || null))
-  ipcMain.handle("data:import-backup", () => importFullBackup())
-  ipcMain.handle("database-backup:list", () => listCurrentDatabaseBackups())
-  ipcMain.handle("database-backup:status", () => backupStatusTracker.getStatus())
-  ipcMain.handle("database-backup:settings:get", () => getCurrentBackupSettings())
-  ipcMain.handle("database-backup:settings:save", (_event, input) => saveCurrentBackupSettings(input || {}))
-  ipcMain.handle("database-backup:create", () => createCurrentDatabaseBackup("manual"))
-  ipcMain.handle("database-backup:restore", (_event, backupId) => restoreCurrentDatabaseBackup(backupId))
-  ipcMain.handle("database-backup:open-directory", () => openCurrentBackupDirectory())
-  ipcMain.handle("theme:set", (_event, theme) => {
-    nativeTheme.themeSource = ["light", "dark"].includes(theme) ? theme : "system"
-    return nativeTheme.shouldUseDarkColors
-  })
-  ipcMain.handle("sync-settings:get", () => getSyncSettingsView())
-  ipcMain.handle("sync:status", () => syncStatus)
-  ipcMain.handle("sync:run", () => performSync())
-  ipcMain.handle("sync-settings:test", (_event, input) => testSyncConnection(input || {}))
-  ipcMain.handle("sync-auth:start", (_event, input) => startBrowserSyncLogin(input || {}))
-  ipcMain.handle("sync-auth:cancel", () => cancelBrowserSyncLogin())
-  ipcMain.handle("sync-settings:save", (_event, input) => saveSyncSettings(input || {}))
-  ipcMain.handle("sync-settings:clear", () => clearSyncSettings())
-  ipcMain.handle("app-update:check", () => checkForUpdates({
-    currentVersion: app.getVersion(),
-    architecture: process.arch,
-    request: (url, options) => net.fetch(url, options)
-  }))
-  ipcMain.handle("app-update:open-download", (_event, downloadUrl) => {
-    const parsedUrl = new URL(String(downloadUrl || ""))
-    if (!["github.com", "objects.githubusercontent.com"].includes(parsedUrl.hostname)) {
-      throw new Error("更新下载地址不受信任")
-    }
-    return shell.openExternal(parsedUrl.toString())
   })
 }
 
@@ -2059,6 +2143,7 @@ function installMenu() {
  * @returns {BrowserWindow} 主窗口。
  */
 function createWindow() {
+  allowMainWindowClose = false
   const browserWindow = new BrowserWindow({
     width: 1440,
     height: 920,
@@ -2078,7 +2163,10 @@ function createWindow() {
     }
   })
 
-  browserWindow.once("ready-to-show", () => browserWindow.show())
+  // 自动化测试默认保持后台隐藏，避免窗口闪现和抢占用户焦点。
+  browserWindow.once("ready-to-show", () => {
+    if (shouldShowMainWindow(process.env)) browserWindow.show()
+  })
   browserWindow.webContents.once("did-finish-load", () => {
     if (app.isPackaged) {
       setTimeout(() => {
@@ -2088,7 +2176,15 @@ function createWindow() {
       }, 3000)
     }
   })
+  browserWindow.on("close", (event) => {
+    if (isQuitting || allowMainWindowClose) return
+    closeMainWindowAfterSave = true
+    // macOS 红色关窗也必须等待渲染器把草稿和标签会话写入 SQLite。
+    quitSaveCoordinator.requestQuit(event)
+  })
   browserWindow.on("closed", () => {
+    closeMainWindowAfterSave = false
+    allowMainWindowClose = false
     mainWindow = null
   })
   browserWindow.webContents.setWindowOpenHandler(({ url }) => {
@@ -2166,10 +2262,12 @@ function createQuickCaptureWindow() {
   return browserWindow
 }
 
-const currentUserDataPath = path.join(app.getPath("appData"), "心悦笔记")
+const e2eRuntime = isE2ERuntime(process.env)
+const currentUserDataPath = resolveUserDataPath(app.getPath("appData"), process.env)
 app.setPath("userData", currentUserDataPath)
 app.setName("心悦笔记")
-app.setAsDefaultProtocolClient(DESKTOP_AUTH_PROTOCOL)
+// E2E 只验证应用内行为，不注册系统协议或全局快捷键，避免污染开发机设置。
+if (!e2eRuntime) app.setAsDefaultProtocolClient(DESKTOP_AUTH_PROTOCOL)
 protocol.registerSchemesAsPrivileged([{
   scheme: LOCAL_ASSET_PROTOCOL,
   privileges: {
@@ -2202,14 +2300,16 @@ app.whenReady().then(() => {
   registerIpcHandlers()
   installMenu()
   createWindow()
-  if (!registerQuickCaptureShortcut(quickCaptureSettings.shortcut)) {
+  if (!e2eRuntime && !registerQuickCaptureShortcut(quickCaptureSettings.shortcut)) {
     console.warn(`快速记录快捷键注册失败: ${quickCaptureSettings.shortcut}`)
   }
-  setTimeout(() => {
-    void ensureDailyDatabaseBackup().catch((error) => {
-      console.warn("创建每日数据库备份失败", error)
-    })
-  }, 1000)
+  if (!e2eRuntime) {
+    setTimeout(() => {
+      void ensureDailyDatabaseBackup().catch((error) => {
+        console.warn("创建每日数据库备份失败", error)
+      })
+    }, 1000)
+  }
   if (syncSettings.token) {
     setTimeout(() => void performSync(), 1500)
   }
@@ -2221,7 +2321,12 @@ app.whenReady().then(() => {
   })
 })
 
-app.on("before-quit", () => {
+app.on("before-quit", (event) => {
+  closeMainWindowAfterSave = false
+  const canRequestRendererSave = mainWindow
+    && !mainWindow.isDestroyed()
+    && !mainWindow.webContents.isDestroyed()
+  if (canRequestRendererSave && !quitSaveCoordinator.requestQuit(event)) return
   isQuitting = true
   globalShortcut.unregisterAll()
   if (automaticSyncTimer) clearInterval(automaticSyncTimer)
@@ -2231,6 +2336,7 @@ app.on("before-quit", () => {
   repository?.close()
   repository = null
   backupManager = null
+  quitSaveCoordinator.dispose()
 })
 
 app.on("window-all-closed", () => {

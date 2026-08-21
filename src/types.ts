@@ -24,6 +24,8 @@ export interface OfflineNote {
   folderId: string | null
   title: string
   content: string
+  /** false 表示 content 仅为列表或搜索摘要，进入编辑器前必须读取详情。 */
+  contentLoaded?: boolean
   isPinned: boolean
   isDeleted: boolean
   deletedAt: string | null
@@ -49,6 +51,15 @@ export interface NotePatch {
   folderId?: string | null
   isPinned?: boolean
   tagNames?: string[]
+}
+
+export interface BulkNotePatch {
+  folderId?: string | null
+  isPinned?: boolean
+  isDeleted?: boolean
+  permanentlyDelete?: boolean
+  addTagNames?: string[]
+  removeTagNames?: string[]
 }
 
 export interface NoteConflictPair {
@@ -261,14 +272,48 @@ export interface AttachmentIntegrityRepairResult {
   failures: AttachmentRepairFailure[]
 }
 
+export interface WorkspaceSessionTab {
+  noteId: string
+  isPinned: boolean
+  scrollTop: number
+}
+
+export interface WorkspaceSession {
+  tabs: WorkspaceSessionTab[]
+  activeNoteId: string | null
+}
+
+export interface WorkspaceSessionInput {
+  tabs: Array<Pick<WorkspaceSessionTab, 'noteId' | 'isPinned'>>
+  activeNoteId: string | null
+}
+
 export interface NotesDesktopApi {
   listWorkspace(): Promise<WorkspaceData>
+  getWorkspaceSession(): Promise<WorkspaceSession>
+  saveWorkspaceSession(input: WorkspaceSessionInput): Promise<WorkspaceSession>
+  saveNoteViewState(noteId: string, scrollTop: number): Promise<boolean>
+  /** 按需读取单篇笔记的完整正文。 */
+  getNote(noteId: string): Promise<OfflineNote | null>
+  /** 在 SQLite 中搜索完整正文，并可组合结构化筛选条件。 */
+  searchNotes(keyword: string, options?: {
+    includeMetadata?: boolean
+    limit?: number
+    folderIds?: string[]
+    tagIds?: string[]
+    updatedAfter?: string
+    pinnedOnly?: boolean
+  }): Promise<OfflineNote[]>
   /** 打开指定笔记。 */
   openNoteLink(noteId: string): Promise<boolean>
   /** 获取冷启动期间待打开的笔记 ID。 */
   consumePendingNoteLink(): Promise<string>
   /** 监听外部应用触发的笔记深链接。 */
   onOpenNoteLink(callback: (noteId: string) => void): () => void
+  /** 监听应用退出前的强制保存请求。 */
+  onBeforeQuitSave(callback: (requestId: number) => void): () => void
+  /** 将退出前保存结果回报给主进程。 */
+  completeBeforeQuitSave(requestId: number, result: { ok: boolean, message?: string }): void
   saveAttachment(input: SaveAttachmentInput): Promise<AttachmentAsset>
   openAttachment(assetId: string): Promise<boolean>
   listAttachmentInventory(): Promise<AttachmentInventory>
@@ -295,6 +340,7 @@ export interface NotesDesktopApi {
   /** 监听主进程捕获的快速记录 Escape 按键。 */
   onQuickCaptureEscape(callback: () => void): () => void
   updateNote(noteId: string, patch: NotePatch): Promise<OfflineNote | null>
+  bulkUpdateNotes(noteIds: string[], patch: BulkNotePatch): Promise<OfflineNote[]>
   resolveNoteConflict(conflictNoteId: string, strategy: 'local' | 'remote' | 'both'): Promise<NoteConflictResolution>
   listNoteHistory(noteId: string): Promise<NoteHistory[]>
   getNoteHistory(noteId: string, historyId: string): Promise<NoteHistory | null>
@@ -313,6 +359,7 @@ export interface NotesDesktopApi {
   deleteTag(tagId: string): Promise<boolean>
   exportNoteMarkdown(noteId: string): Promise<DataTransferResult>
   exportAllMarkdown(): Promise<DataTransferResult>
+  exportSelectedMarkdown(noteIds: string[]): Promise<DataTransferResult>
   exportFullBackup(): Promise<DataTransferResult>
   importMarkdown(folderId: string | null): Promise<DataTransferResult>
   importFullBackup(): Promise<DataTransferResult>

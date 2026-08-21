@@ -9,6 +9,32 @@ export interface NoteNavigationCounts {
 export const NOTE_AUTOSAVE_DELAY_MS = 1500
 
 /**
+ * 收集指定文件夹从根目录到自身的完整路径，异常循环会安全终止。
+ *
+ * :param folders: 工作区文件夹列表。
+ * :param folderId: 目标文件夹 ID；未分类传空。
+ * :return: 按祖先到后代排序的文件夹 ID。
+ */
+export function collectFolderPathIds(
+  folders: Array<{ id: string, parentId: string | null }>,
+  folderId: string | null
+): string[] {
+  if (!folderId) return []
+  const folderMap = new Map(folders.map((folder) => [folder.id, folder]))
+  const visited = new Set<string>()
+  const path: string[] = []
+  let currentId: string | null = folderId
+  while (currentId && !visited.has(currentId)) {
+    visited.add(currentId)
+    const folder = folderMap.get(currentId)
+    if (!folder) break
+    path.unshift(folder.id)
+    currentId = folder.parentId
+  }
+  return path
+}
+
+/**
  * 将笔记更新时间格式化为两端统一的简洁文本。
  *
  * :param value: ISO 时间或可被 Date 解析的时间文本。

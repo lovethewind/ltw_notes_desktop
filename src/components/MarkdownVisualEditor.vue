@@ -33,7 +33,7 @@
       type="file"
       @change="handleAttachmentSelection"
     >
-    <div ref="editorScrollRef" class="milkdown-editor-scroll" @scroll.passive="updateActiveOutline">
+    <div ref="editorScrollRef" class="milkdown-editor-scroll" @scroll.passive="handleEditorScroll">
       <div ref="editorRootRef" class="milkdown-editor-root" />
     </div>
     <aside
@@ -72,7 +72,8 @@ import '@milkdown/crepe/theme/classic.css'
 import { EditorView } from '@codemirror/view'
 import { Crepe } from '@milkdown/crepe'
 import { commandsCtx, editorViewCtx } from '@milkdown/kit/core'
-import { redoCommand, undoCommand } from '@milkdown/kit/plugin/history'
+import { historyProviderPlugin, redoCommand, undoCommand } from '@milkdown/kit/plugin/history'
+import { redoDepth, undoDepth } from '@milkdown/kit/prose/history'
 import type { Node as ProseMirrorNode } from '@milkdown/kit/prose/model'
 import { paragraphSchema } from '@milkdown/kit/preset/commonmark'
 import { TextSelection } from '@milkdown/kit/prose/state'
@@ -89,6 +90,7 @@ interface Props {
   readonly?: boolean
   showToolbar?: boolean
   showOutline?: boolean
+  scrollTop?: number
 }
 
 interface OutlineCacheEntry {
@@ -114,10 +116,12 @@ const props = withDefaults(defineProps<Props>(), {
   documentId: '',
   readonly: false,
   showToolbar: true,
-  showOutline: true
+  showOutline: true,
+  scrollTop: 0
 })
 const emit = defineEmits<{
   (event: 'change', value: string, documentId: string): void
+  (event: 'scroll-position-change', scrollTop: number, documentId: string): void
 }>()
 
 const editorRootRef = ref<HTMLDivElement | null>(null)
@@ -144,6 +148,7 @@ let outlineTimer: ReturnType<typeof setTimeout> | undefined
 let suppressionTimer: ReturnType<typeof setTimeout> | undefined
 let readonlyObserver: MutationObserver | null = null
 let jsonFormatObserver: MutationObserver | null = null
+let toolbarObserver: MutationObserver | null = null
 let activeFindMatch: { from: number, to: number } | null = null
 const toolbarMenuPanels = new Map<HTMLElement, HTMLDivElement>()
 const outlineCache = new Map<string, OutlineCacheEntry>()
@@ -472,6 +477,13 @@ function updateActiveOutline(): void {
   activeOutlineIndex.value = nextIndex
 }
 
+/** 更新大纲并把当前文档阅读位置交给父级防抖保存。 */
+function handleEditorScroll(): void {
+  updateActiveOutline()
+  const scrollTop = editorScrollRef.value?.scrollTop
+  if (scrollTop !== undefined) emit('scroll-position-change', scrollTop, editorDocumentId)
+}
+
 /**
  * 将编辑区和大纲状态重置到文档顶部。
  *
@@ -479,11 +491,19 @@ function updateActiveOutline(): void {
  */
 function resetEditorScroll(): void {
   const scrollContainer = editorScrollRef.value
-  if (scrollContainer) scrollContainer.scrollTop = 0
+  const nextScrollTop = Math.max(0, props.scrollTop)
+  if (scrollContainer) scrollContainer.scrollTop = nextScrollTop
   activeOutlineIndex.value = 0
   void nextTick(() => {
-    if (editorScrollRef.value) editorScrollRef.value.scrollTop = 0
+    if (editorScrollRef.value) {
+      editorScrollRef.value.scrollTop = nextScrollTop
+      updateActiveOutline()
+    }
   })
+}
+
+function getScrollTop(): number {
+  return editorScrollRef.value?.scrollTop ?? 0
 }
 
 /**
@@ -761,6 +781,31 @@ function replaceContentSilently(value: string, crepe: Crepe): void {
 }
 
 /**
+ * 在切换文档后仅替换 history 插件状态，清空上一文档的撤销和重做记录。
+ * 使用普通事务更新插件状态，避免 view.updateState 重建 Crepe 工具栏视图。
+ *
+ * :param crepe: Milkdown 编辑器实例。
+ * :return: 无返回值。
+ */
+function resetDocumentHistory(crepe: Crepe): void {
+  crepe.editor.action((context) => {
+    const view = context.get(editorViewCtx)
+    const plugins = view.state.plugins
+    const historyKey = historyProviderPlugin.key()
+    const historyPlugin = historyKey?.get(view.state)
+    if (!historyKey || !historyPlugin) return
+    const stateWithFreshHistory = view.state.reconfigure({
+      plugins: plugins.filter((plugin) => plugin !== historyPlugin)
+    }).reconfigure({ plugins })
+    const freshHistoryState = historyKey.getState(stateWithFreshHistory)
+    if (!freshHistoryState) return
+    // history 插件支持由事务元数据替换自身状态；这样不会销毁其他插件视图。
+    view.dispatch(view.state.tr.setMeta(historyKey, { historyState: freshHistoryState }))
+  })
+  if (editorRootRef.value) syncHistoryActionButtons(editorRootRef.value)
+}
+
+/**
  * 关闭所有已展开的工具栏二级菜单。
  *
  * :return: 无返回值。
@@ -910,6 +955,25 @@ function undoEditor(): void {
 /** 执行编辑器重做命令。 */
 function redoEditor(): void {
   editor?.editor.action((context) => context.get(commandsCtx).call(redoCommand.key))
+}
+
+/**
+ * 根据当前文档的 history 深度同步撤销与重做按钮。
+ *
+ * :param root: 编辑器根节点。
+ * :return: 无返回值。
+ */
+function syncHistoryActionButtons(root: HTMLElement): void {
+  if (!editor) return
+  const undoButton = root.querySelector<HTMLButtonElement>('[data-action="撤销"]')
+  const redoButton = root.querySelector<HTMLButtonElement>('[data-action="重做"]')
+  if (!undoButton || !redoButton) return
+  editor.editor.action((context) => {
+    const view = context.get(editorViewCtx)
+    const isReadonly = props.readonly || previewMode.value
+    undoButton.disabled = isReadonly || undoDepth(view.state) === 0
+    redoButton.disabled = isReadonly || redoDepth(view.state) === 0
+  })
 }
 
 /** 切换当前选区的行内公式格式。 */
@@ -1070,6 +1134,15 @@ function localizeTopBar(root: HTMLElement): void {
   const inner = root.querySelector<HTMLElement>('.top-bar-inner')
   const heading = inner?.querySelector<HTMLElement>('.top-bar-heading-selector')
   if (!inner || !heading) return
+  if (inner.querySelector('.top-bar-actions')) {
+    syncOutlineToggle()
+    syncPreviewToggle()
+    syncFocusModeToggle()
+    syncHistoryActionButtons(root)
+    return
+  }
+  // 顶栏被 Crepe 重绘后，丢弃已经脱离 DOM 的旧菜单引用。
+  toolbarMenuPanels.clear()
   const actions = document.createElement('div')
   actions.className = 'top-bar-actions'
   Array.from(inner.children).forEach((child) => {
@@ -1094,11 +1167,29 @@ function localizeTopBar(root: HTMLElement): void {
   previewToggle.addEventListener('click', togglePreview)
   actions.append(previewToggle)
 
-  document.addEventListener('click', closeToolbarMenus)
-  document.addEventListener('keydown', handleEditorDocumentKeydown)
-  toolbarEventsBound = true
+  if (!toolbarEventsBound) {
+    document.addEventListener('click', closeToolbarMenus)
+    document.addEventListener('keydown', handleEditorDocumentKeydown)
+    toolbarEventsBound = true
+  }
   syncOutlineToggle()
   syncPreviewToggle()
+  syncHistoryActionButtons(root)
+}
+
+/**
+ * 监听 Crepe 顶栏重绘，并恢复桌面端定制工具栏。
+ *
+ * :param root: 编辑器根节点。
+ * :return: 无返回值。
+ */
+function startToolbarSync(root: HTMLElement): void {
+  toolbarObserver?.disconnect()
+  toolbarObserver = new MutationObserver(() => {
+    const inner = root.querySelector<HTMLElement>('.top-bar-inner')
+    if (inner && !inner.querySelector('.top-bar-actions')) localizeTopBar(root)
+  })
+  toolbarObserver.observe(root, { childList: true, subtree: true })
 }
 
 /**
@@ -1155,6 +1246,9 @@ async function createEditor(): Promise<void> {
   })
   editor = crepe
   crepe.on((listener) => {
+    listener.updated(() => {
+      if (editorRootRef.value) syncHistoryActionButtons(editorRootRef.value)
+    })
     listener.markdownUpdated((_context, markdown) => {
       editorMarkdown = markdown
       scheduleOutlineUpdate(markdown, editorDocumentId)
@@ -1177,6 +1271,7 @@ async function createEditor(): Promise<void> {
     return
   }
   localizeTopBar(editorRootRef.value)
+  startToolbarSync(editorRootRef.value)
   editorRootRef.value.addEventListener('click', handleEditorLinkClick)
   editorRootRef.value.addEventListener('contextmenu', handleImageContextMenu)
   editorRootRef.value.addEventListener('click', handleJsonCodeFormatClick)
@@ -1193,6 +1288,7 @@ async function createEditor(): Promise<void> {
   startJsonFormatButtons(editorRootRef.value)
   editorReady = true
   editorMarkdown = contentValue.value
+  resetEditorScroll()
 }
 
 /**
@@ -1209,7 +1305,10 @@ function setContent(value: string, documentId: string): void {
   contentValue.value = value
   editorDocumentId = documentId
   scheduleOutlineUpdate(value, documentId)
-  if (editor && editorReady && contentChanged) replaceContentSilently(value, editor)
+  if (editor && editorReady) {
+    if (contentChanged) replaceContentSilently(value, editor)
+    if (documentChanged) resetDocumentHistory(editor)
+  }
   if (documentChanged) resetEditorScroll()
 }
 
@@ -1287,7 +1386,7 @@ function clearFindHighlight(): void {
   })
 }
 
-defineExpose({ clearFindHighlight, findText })
+defineExpose({ clearFindHighlight, findText, getScrollTop })
 
 watch(
   () => [props.value, props.documentId] as const,
@@ -1322,6 +1421,8 @@ onBeforeUnmount(() => {
   readonlyObserver = null
   jsonFormatObserver?.disconnect()
   jsonFormatObserver = null
+  toolbarObserver?.disconnect()
+  toolbarObserver = null
   editorRootRef.value?.removeEventListener('click', handleEditorLinkClick)
   editorRootRef.value?.removeEventListener('contextmenu', handleImageContextMenu)
   editorRootRef.value?.removeEventListener('click', handleJsonCodeFormatClick)

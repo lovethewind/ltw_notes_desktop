@@ -2,6 +2,13 @@ const { contextBridge, ipcRenderer } = require("electron")
 
 contextBridge.exposeInMainWorld("notesDesktop", {
   listWorkspace: () => ipcRenderer.invoke("workspace:list"),
+  getWorkspaceSession: () => ipcRenderer.invoke("workspace-session:get"),
+  saveWorkspaceSession: (input) => ipcRenderer.invoke("workspace-session:save", input),
+  saveNoteViewState: (noteId, scrollTop) => (
+    ipcRenderer.invoke("workspace-session:save-view-state", noteId, scrollTop)
+  ),
+  getNote: (noteId) => ipcRenderer.invoke("note:detail", noteId),
+  searchNotes: (keyword, options) => ipcRenderer.invoke("note:search", keyword, options),
   /** @param {string} noteId 笔记 ID；@returns {Promise<boolean>} 是否已发起打开。 */
   openNoteLink: (noteId) => ipcRenderer.invoke("note-link:open-local", noteId),
   /** @returns {Promise<string>} 返回冷启动期间待打开的笔记 ID。 */
@@ -16,6 +23,16 @@ contextBridge.exposeInMainWorld("notesDesktop", {
     const listener = (_event, noteId) => callback(String(noteId || ""))
     ipcRenderer.on("note-link:open", listener)
     return () => ipcRenderer.removeListener("note-link:open", listener)
+  },
+  /** 监听应用退出前的强制保存请求。 */
+  onBeforeQuitSave: (callback) => {
+    const listener = (_event, requestId) => callback(Number(requestId))
+    ipcRenderer.on("app:before-quit-save", listener)
+    return () => ipcRenderer.removeListener("app:before-quit-save", listener)
+  },
+  /** 将退出前保存结果回报给主进程。 */
+  completeBeforeQuitSave: (requestId, result) => {
+    ipcRenderer.send("app:before-quit-save-result", requestId, result)
   },
   saveAttachment: (input) => ipcRenderer.invoke("asset:save-attachment", input),
   openAttachment: (assetId) => ipcRenderer.invoke("asset:open", assetId),
@@ -87,6 +104,7 @@ contextBridge.exposeInMainWorld("notesDesktop", {
     return () => ipcRenderer.removeListener("quick-capture:escape", listener)
   },
   updateNote: (noteId, patch) => ipcRenderer.invoke("note:update", noteId, patch),
+  bulkUpdateNotes: (noteIds, patch) => ipcRenderer.invoke("note:bulk-update", noteIds, patch),
   resolveNoteConflict: (conflictNoteId, strategy) => (
     ipcRenderer.invoke("note-conflict:resolve", conflictNoteId, strategy)
   ),
@@ -117,6 +135,7 @@ contextBridge.exposeInMainWorld("notesDesktop", {
   deleteTag: (tagId) => ipcRenderer.invoke("tag:delete", tagId),
   exportNoteMarkdown: (noteId) => ipcRenderer.invoke("data:export-note-markdown", noteId),
   exportAllMarkdown: () => ipcRenderer.invoke("data:export-all-markdown"),
+  exportSelectedMarkdown: (noteIds) => ipcRenderer.invoke("data:export-selected-markdown", noteIds),
   exportFullBackup: () => ipcRenderer.invoke("data:export-backup"),
   importMarkdown: (folderId) => ipcRenderer.invoke("data:import-markdown", folderId),
   importFullBackup: () => ipcRenderer.invoke("data:import-backup"),

@@ -20,12 +20,15 @@ const props = defineProps<{
   searchKeyword?: string
   dragEnabled?: boolean
   blockedFolderIds?: Set<string>
+  batchMode?: boolean
+  selectedNoteIds?: Set<string>
   folderNoteCounts: Map<string, number>
 }>()
 
 const emit = defineEmits<{
   toggle: [folderId: string]
   selectNote: [note: OfflineNote]
+  toggleNoteSelection: [noteId: string]
   folderContext: [event: MouseEvent, folder: NoteFolder]
   noteContext: [event: MouseEvent, note: OfflineNote]
   resourceDragStart: [event: DragEvent, resource: { kind: 'note' | 'folder', id: string }]
@@ -194,7 +197,7 @@ function openFolderContext(event: MouseEvent): void {
  * :return: 无返回值。
  */
 function openNoteContext(event: MouseEvent, note: OfflineNote): void {
-  if (props.recycle && note.deletedByFolderId) return
+  if (props.recycle && note.deletedByFolderId && !props.batchMode) return
   emit('noteContext', event, note)
 }
 </script>
@@ -239,9 +242,12 @@ function openNoteContext(event: MouseEvent, note: OfflineNote): void {
         :search-keyword="searchKeyword"
         :drag-enabled="dragEnabled"
         :blocked-folder-ids="blockedFolderIds"
+        :batch-mode="batchMode"
+        :selected-note-ids="selectedNoteIds"
         :folder-note-counts="folderNoteCounts"
         @toggle="emit('toggle', $event)"
         @select-note="emit('selectNote', $event)"
+        @toggle-note-selection="emit('toggleNoteSelection', $event)"
         @folder-context="forwardFolderContext"
         @note-context="forwardNoteContext"
         @resource-drag-start="(event, resource) => emit('resourceDragStart', event, resource)"
@@ -251,12 +257,22 @@ function openNoteContext(event: MouseEvent, note: OfflineNote): void {
       <article
         v-for="note in directNotes"
         :key="note.id"
-        :class="['sidebar-note-row', 'is-nested', { active: note.id === activeNoteId }]"
-        :draggable="dragEnabled"
+        :class="['sidebar-note-row', 'is-nested', { active: note.id === activeNoteId, selected: selectedNoteIds?.has(note.id) }]"
+        :draggable="dragEnabled && !batchMode"
         @dragstart="startNoteDrag($event, note)"
         @contextmenu.prevent="openNoteContext($event, note)"
       >
-        <button class="sidebar-note-main" type="button" @click="emit('selectNote', note)">
+        <button
+          v-if="batchMode"
+          class="sidebar-note-select"
+          type="button"
+          :aria-label="selectedNoteIds?.has(note.id) ? `取消选择 ${note.title || '无标题笔记'}` : `选择 ${note.title || '无标题笔记'}`"
+          :aria-pressed="selectedNoteIds?.has(note.id)"
+          @click="emit('toggleNoteSelection', note.id)"
+        >
+          <Icon :icon="selectedNoteIds?.has(note.id) ? 'tabler:square-check-filled' : 'tabler:square'" />
+        </button>
+        <button class="sidebar-note-main" type="button" @click="batchMode ? emit('toggleNoteSelection', note.id) : emit('selectNote', note)">
           <Icon :icon="note.isPinned && !recycle
             ? 'material-symbols:keep-rounded'
             : 'material-symbols:description-outline-rounded'" />

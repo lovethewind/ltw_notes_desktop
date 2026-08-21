@@ -1,6 +1,11 @@
 const { randomUUID } = require("node:crypto")
 const path = require("node:path")
 const Database = require("better-sqlite3")
+const { initializeNotesDatabase } = require("./database-schema.cjs")
+const {
+  createNoteContentPreview,
+  searchNotes: searchNotesDatabase
+} = require("./database-search.cjs")
 
 const HISTORY_INTERVAL_MS = 5 * 60 * 1000
 const MAX_NOTE_CONTENT_BYTES = 15 * 1024 * 1024
@@ -77,150 +82,7 @@ function mapImageAsset(row) {
  */
 function openNotesDatabase(userDataPath) {
   const database = new Database(path.join(userDataPath, "notes.sqlite3"))
-  database.pragma("journal_mode = WAL")
-  database.pragma("foreign_keys = ON")
-  database.pragma("busy_timeout = 5000")
-  database.exec(`
-    CREATE TABLE IF NOT EXISTS folders (
-      id TEXT PRIMARY KEY,
-      server_id TEXT,
-      parent_id TEXT REFERENCES folders(id) ON DELETE SET NULL,
-      name TEXT NOT NULL,
-      sort_order INTEGER NOT NULL DEFAULT 0,
-      is_deleted INTEGER NOT NULL DEFAULT 0,
-      deleted_at TEXT,
-      deleted_root_id TEXT,
-      created_at TEXT NOT NULL,
-      updated_at TEXT NOT NULL,
-      server_updated_at TEXT,
-      revision INTEGER NOT NULL DEFAULT 0,
-      dirty INTEGER NOT NULL DEFAULT 1
-    );
-    CREATE TABLE IF NOT EXISTS tags (
-      id TEXT PRIMARY KEY,
-      server_id TEXT,
-      name TEXT NOT NULL COLLATE NOCASE UNIQUE,
-      created_at TEXT NOT NULL,
-      updated_at TEXT NOT NULL,
-      server_updated_at TEXT,
-      revision INTEGER NOT NULL DEFAULT 0,
-      dirty INTEGER NOT NULL DEFAULT 1
-    );
-    CREATE TABLE IF NOT EXISTS notes (
-      id TEXT PRIMARY KEY,
-      server_id TEXT,
-      folder_id TEXT REFERENCES folders(id) ON DELETE SET NULL,
-      title TEXT NOT NULL DEFAULT '无标题笔记',
-      content TEXT NOT NULL DEFAULT '',
-      is_pinned INTEGER NOT NULL DEFAULT 0,
-      is_deleted INTEGER NOT NULL DEFAULT 0,
-      deleted_at TEXT,
-      deleted_by_folder_id TEXT,
-      conflict_source_id TEXT REFERENCES notes(id) ON DELETE SET NULL,
-      created_at TEXT NOT NULL,
-      updated_at TEXT NOT NULL,
-      server_updated_at TEXT,
-      revision INTEGER NOT NULL DEFAULT 0,
-      dirty INTEGER NOT NULL DEFAULT 1
-    );
-    CREATE INDEX IF NOT EXISTS idx_notes_list
-      ON notes(is_deleted, is_pinned, updated_at DESC);
-    CREATE TABLE IF NOT EXISTS note_tags (
-      note_id TEXT NOT NULL REFERENCES notes(id) ON DELETE CASCADE,
-      tag_id TEXT NOT NULL REFERENCES tags(id) ON DELETE CASCADE,
-      PRIMARY KEY(note_id, tag_id)
-    );
-    CREATE TABLE IF NOT EXISTS note_history (
-      id TEXT PRIMARY KEY,
-      note_id TEXT NOT NULL REFERENCES notes(id) ON DELETE CASCADE,
-      title TEXT NOT NULL,
-      content TEXT NOT NULL,
-      folder_id TEXT,
-      tag_names TEXT NOT NULL DEFAULT '[]',
-      created_at TEXT NOT NULL,
-      dirty INTEGER NOT NULL DEFAULT 1
-    );
-    CREATE INDEX IF NOT EXISTS idx_note_history_time
-      ON note_history(note_id, created_at DESC);
-    CREATE TABLE IF NOT EXISTS note_assets (
-      id TEXT PRIMARY KEY,
-      file_name TEXT NOT NULL,
-      mime_type TEXT NOT NULL,
-      byte_size INTEGER NOT NULL,
-      sha256 TEXT NOT NULL UNIQUE,
-      local_path TEXT NOT NULL,
-      remote_url TEXT,
-      server_source_id TEXT,
-      created_at TEXT NOT NULL,
-      updated_at TEXT NOT NULL
-    );
-    CREATE UNIQUE INDEX IF NOT EXISTS idx_note_assets_remote_url
-      ON note_assets(remote_url) WHERE remote_url IS NOT NULL;
-    CREATE TABLE IF NOT EXISTS outbox (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      entity_type TEXT NOT NULL,
-      entity_id TEXT NOT NULL,
-      operation TEXT NOT NULL,
-      payload TEXT NOT NULL,
-      created_at TEXT NOT NULL,
-      attempt_count INTEGER NOT NULL DEFAULT 0
-    );
-    CREATE INDEX IF NOT EXISTS idx_outbox_pending ON outbox(id);
-    CREATE TABLE IF NOT EXISTS sync_state (
-      key TEXT PRIMARY KEY,
-      value TEXT NOT NULL
-    );
-  `)
-  const folderColumns = database.prepare("PRAGMA table_info(folders)").all()
-  if (!folderColumns.some((column) => column.name === "parent_id")) {
-    database.exec("ALTER TABLE folders ADD COLUMN parent_id TEXT REFERENCES folders(id) ON DELETE SET NULL")
-  }
-  for (const [columnName, definition] of [
-    ["is_deleted", "INTEGER NOT NULL DEFAULT 0"],
-    ["deleted_at", "TEXT"],
-    ["deleted_root_id", "TEXT"]
-  ]) {
-    if (!folderColumns.some((column) => column.name === columnName)) {
-      database.exec(`ALTER TABLE folders ADD COLUMN ${columnName} ${definition}`)
-    }
-  }
-  const noteColumns = database.prepare("PRAGMA table_info(notes)").all()
-  if (!noteColumns.some((column) => column.name === "deleted_by_folder_id")) {
-    database.exec("ALTER TABLE notes ADD COLUMN deleted_by_folder_id TEXT")
-  }
-  if (!noteColumns.some((column) => column.name === "conflict_source_id")) {
-    database.exec("ALTER TABLE notes ADD COLUMN conflict_source_id TEXT REFERENCES notes(id) ON DELETE SET NULL")
-  }
-  for (const tableName of ["folders", "tags", "notes"]) {
-    const columns = database.prepare(`PRAGMA table_info(${tableName})`).all()
-    if (!columns.some((column) => column.name === "server_updated_at")) {
-      database.exec(`ALTER TABLE ${tableName} ADD COLUMN server_updated_at TEXT`)
-    }
-  }
-  const historyColumns = database.prepare("PRAGMA table_info(note_history)").all()
-  if (!historyColumns.some((column) => column.name === "dirty")) {
-    database.exec("ALTER TABLE note_history ADD COLUMN dirty INTEGER NOT NULL DEFAULT 1")
-  }
-  const assetColumns = database.prepare("PRAGMA table_info(note_assets)").all()
-  if (!assetColumns.some((column) => column.name === "server_source_id")) {
-    database.exec("ALTER TABLE note_assets ADD COLUMN server_source_id TEXT")
-  }
-  database.exec(`
-    DELETE FROM note_history
-    WHERE id IN (
-      SELECT id
-      FROM (
-        SELECT id, ROW_NUMBER() OVER (
-          PARTITION BY note_id ORDER BY created_at DESC, id DESC
-        ) AS position
-        FROM note_history
-      )
-      WHERE position > 50
-    )
-  `)
-  database.exec("CREATE INDEX IF NOT EXISTS idx_folders_parent ON folders(parent_id, sort_order)")
-  database.exec("CREATE INDEX IF NOT EXISTS idx_folders_deleted ON folders(is_deleted, deleted_root_id)")
-  database.exec("CREATE INDEX IF NOT EXISTS idx_notes_conflict_source ON notes(conflict_source_id)")
+  initializeNotesDatabase(database)
   return createRepository(database)
 }
 
@@ -277,6 +139,26 @@ function createRepository(database) {
     ORDER BY t.name COLLATE NOCASE
   `)
 
+  /** 一次读取指定笔记集合的标签，避免列表逐篇查询。 */
+  function selectTagsForNotes(noteIds) {
+    if (!noteIds.length) return new Map()
+    const placeholders = noteIds.map(() => "?").join(",")
+    const rows = database.prepare(`
+      SELECT nt.note_id AS noteId, t.id, t.name
+      FROM note_tags nt
+      JOIN tags t ON t.id = nt.tag_id
+      WHERE nt.note_id IN (${placeholders})
+      ORDER BY t.name COLLATE NOCASE
+    `).all(...noteIds)
+    const tagsByNoteId = new Map()
+    for (const row of rows) {
+      const tags = tagsByNoteId.get(row.noteId) || []
+      tags.push({ id: row.id, name: row.name })
+      tagsByNoteId.set(row.noteId, tags)
+    }
+    return tagsByNoteId
+  }
+
   /**
    * 将图片资源的旧目录前缀替换为当前档案目录。
    *
@@ -325,6 +207,17 @@ function createRepository(database) {
   function getNote(noteId) {
     const row = database.prepare("SELECT * FROM notes WHERE id = ?").get(noteId)
     return row ? mapNote(row, selectTagsForNote.all(noteId)) : null
+  }
+
+  /** 获取进入编辑器所需的完整笔记正文。 */
+  function getNoteForEditing(noteId) {
+    const note = getNote(noteId)
+    if (!note) return null
+    return {
+      ...note,
+      content: localizeImageAssetReferences(note.content),
+      contentLoaded: true
+    }
   }
 
   /**
@@ -600,12 +493,8 @@ function createRepository(database) {
     return row ? { ...row, isDeleted: Boolean(row.isDeleted), dirty: Boolean(row.dirty) } : null
   }
 
-  /**
-   * 获取离线工作区完整数据。
-   *
-   * @returns {object} 文件夹、标签、笔记与同步统计。
-   */
-  function listWorkspace() {
+  /** 获取工作区中不含笔记正文的公共集合。 */
+  function listWorkspaceCollections() {
     const folders = database.prepare(`
       SELECT id, server_id AS serverId, parent_id AS parentId, name, sort_order AS sortOrder,
              is_deleted AS isDeleted, deleted_at AS deletedAt,
@@ -628,14 +517,150 @@ function createRepository(database) {
         created_at,
         name COLLATE NOCASE
     `).all().map((tag) => ({ ...tag, dirty: Boolean(tag.dirty) }))
-    const notes = database.prepare(`
-      SELECT * FROM notes ORDER BY is_pinned DESC, updated_at DESC
-    `).all().map((row) => {
-      const note = mapNote(row, selectTagsForNote.all(row.id))
-      return { ...note, content: localizeImageAssetReferences(note.content) }
-    })
     const pendingCount = database.prepare("SELECT COUNT(*) AS total FROM outbox").get().total
-    return { folders, tags, notes, pendingCount }
+    return { folders, tags, pendingCount }
+  }
+
+  /**
+   * 获取离线工作区列表数据。
+   *
+   * @returns {object} 文件夹、标签、笔记摘要与同步统计。
+   */
+  function listWorkspace() {
+    const workspace = listWorkspaceCollections()
+    const noteRows = database.prepare(`
+      SELECT n.id, n.server_id, n.folder_id, n.title,
+             COALESCE(p.content_prefix, '') AS content,
+             n.is_pinned, n.is_deleted, n.deleted_at, n.deleted_by_folder_id,
+             n.conflict_source_id, n.created_at, n.updated_at, n.server_updated_at,
+             n.revision, n.dirty
+      FROM notes n
+      LEFT JOIN note_previews p ON p.note_id = n.id
+      ORDER BY n.is_pinned DESC, n.updated_at DESC
+    `).all()
+    const tagsByNoteId = selectTagsForNotes(noteRows.map((row) => row.id))
+    const notes = noteRows.map((row) => ({
+      ...mapNote(row, tagsByNoteId.get(row.id) || []),
+      content: createNoteContentPreview(row.content),
+      contentLoaded: false
+    }))
+    return { ...workspace, notes }
+  }
+
+  /** 获取仅供同步、备份和导出使用的完整工作区快照。 */
+  function listFullWorkspace() {
+    const workspace = listWorkspaceCollections()
+    const noteRows = database.prepare(`
+      SELECT * FROM notes ORDER BY is_pinned DESC, updated_at DESC
+    `).all()
+    const tagsByNoteId = selectTagsForNotes(noteRows.map((row) => row.id))
+    const notes = noteRows.map((row) => ({
+      ...mapNote(row, tagsByNoteId.get(row.id) || []),
+      content: localizeImageAssetReferences(row.content),
+      contentLoaded: true
+    }))
+    return { ...workspace, notes }
+  }
+
+  /** 获取当前本地档案的标签页会话和滚动位置。 */
+  function getWorkspaceSession() {
+    const tabs = database.prepare(`
+      SELECT tabs.note_id AS noteId,
+             tabs.is_pinned AS isPinned,
+             COALESCE(view.scroll_top, 0) AS scrollTop
+      FROM workspace_session_tabs tabs
+      JOIN notes ON notes.id = tabs.note_id AND notes.is_deleted = 0
+      LEFT JOIN note_view_states view ON view.note_id = tabs.note_id
+      ORDER BY tabs.position, tabs.note_id
+    `).all().map((tab) => ({
+      noteId: tab.noteId,
+      isPinned: Boolean(tab.isPinned),
+      scrollTop: Math.max(0, Number(tab.scrollTop) || 0)
+    }))
+    const activeNoteId = database.prepare(`
+      SELECT session.active_note_id AS activeNoteId
+      FROM workspace_session session
+      JOIN notes ON notes.id = session.active_note_id AND notes.is_deleted = 0
+      WHERE session.id = 1
+    `).get()?.activeNoteId || null
+    return {
+      tabs,
+      activeNoteId: tabs.some((tab) => tab.noteId === activeNoteId) ? activeNoteId : null
+    }
+  }
+
+  /** 保存当前本地档案的标签页顺序、固定状态和活动笔记。 */
+  const saveWorkspaceSession = database.transaction((input = {}) => {
+    const requestedTabs = Array.isArray(input.tabs) ? input.tabs.slice(0, 100) : []
+    const requestedIds = [...new Set(requestedTabs
+      .map((tab) => String(tab?.noteId || "").trim())
+      .filter(Boolean))]
+    const validIds = new Set()
+    if (requestedIds.length) {
+      const placeholders = requestedIds.map(() => "?").join(",")
+      for (const row of database.prepare(`
+        SELECT id FROM notes
+        WHERE is_deleted = 0 AND id IN (${placeholders})
+      `).all(...requestedIds)) validIds.add(row.id)
+    }
+    const tabsById = new Map(requestedTabs.map((tab) => [String(tab?.noteId || "").trim(), tab]))
+    const tabs = requestedIds
+      .filter((noteId) => validIds.has(noteId))
+      .map((noteId) => ({ noteId, isPinned: Boolean(tabsById.get(noteId)?.isPinned) }))
+    const timestamp = nowIso()
+    database.prepare("DELETE FROM workspace_session_tabs").run()
+    const insertTab = database.prepare(`
+      INSERT INTO workspace_session_tabs(note_id, position, is_pinned, updated_at)
+      VALUES (?, ?, ?, ?)
+    `)
+    tabs.forEach((tab, position) => insertTab.run(
+      tab.noteId,
+      position,
+      Number(tab.isPinned),
+      timestamp
+    ))
+    const requestedActiveNoteId = String(input.activeNoteId || "").trim()
+    const activeNoteId = tabs.some((tab) => tab.noteId === requestedActiveNoteId)
+      ? requestedActiveNoteId
+      : null
+    database.prepare(`
+      INSERT INTO workspace_session(id, active_note_id, updated_at)
+      VALUES (1, ?, ?)
+      ON CONFLICT(id) DO UPDATE SET
+        active_note_id = excluded.active_note_id,
+        updated_at = excluded.updated_at
+    `).run(activeNoteId, timestamp)
+    return getWorkspaceSession()
+  })
+
+  /** 保存单篇笔记的本地阅读滚动位置。 */
+  function saveNoteViewState(noteId, scrollTop) {
+    const normalizedNoteId = String(noteId || "").trim()
+    const note = database.prepare("SELECT id FROM notes WHERE id = ? AND is_deleted = 0")
+      .get(normalizedNoteId)
+    if (!note) return false
+    const normalizedScrollTop = Math.max(0, Math.min(
+      Math.round(Number(scrollTop) || 0),
+      100_000_000
+    ))
+    database.prepare(`
+      INSERT INTO note_view_states(note_id, scroll_top, updated_at)
+      VALUES (?, ?, ?)
+      ON CONFLICT(note_id) DO UPDATE SET
+        scroll_top = excluded.scroll_top,
+        updated_at = excluded.updated_at
+    `).run(normalizedNoteId, normalizedScrollTop, nowIso())
+    return true
+  }
+
+  /**
+   * 使用 SQLite FTS5 搜索标题与完整正文，可选匹配标签和文件夹名称。
+   */
+  function searchNotes(keyword, options = {}) {
+    return searchNotesDatabase(database, keyword, options, {
+      mapNote,
+      selectTagsForNotes
+    })
   }
 
   /**
@@ -1042,16 +1067,60 @@ function createRepository(database) {
    */
   function setNoteDeleted(noteId, deleted) {
     const timestamp = nowIso()
+    const current = getNote(noteId)
+    const currentFolder = current?.folderId ? getFolder(current.folderId) : null
+    const targetFolderId = !deleted && currentFolder?.isDeleted ? null : current?.folderId ?? null
     database.prepare(`
       UPDATE notes
-      SET is_deleted = ?, deleted_at = ?, deleted_by_folder_id = NULL,
+      SET folder_id = ?, is_deleted = ?, deleted_at = ?, deleted_by_folder_id = NULL,
           updated_at = ?, dirty = 1
       WHERE id = ?
-    `).run(Number(deleted), deleted ? timestamp : null, timestamp, noteId)
+    `).run(targetFolderId, Number(deleted), deleted ? timestamp : null, timestamp, noteId)
     const note = getNote(noteId)
     if (note) enqueue("note", noteId, "upsert", note)
     return note
   }
+
+  /**
+   * 在单个事务中批量修改笔记属性，并为每篇发生变化的笔记写入同步队列。
+   *
+   * @param {string[]} noteIds 待修改的笔记 ID。
+   * @param {Record<string, any>} patch 批量修改内容。
+   * @returns {Record<string, any>[]} 更新后的笔记。
+   */
+  const bulkUpdateNotes = database.transaction((noteIds, patch = {}) => {
+    const ids = [...new Set(Array.isArray(noteIds) ? noteIds.filter((id) => typeof id === "string" && id) : [])]
+    if (!ids.length) return []
+    if (ids.length > 1000) throw new Error("单次最多批量处理 1000 篇笔记")
+    const notes = ids.map((noteId) => {
+      const note = getNote(noteId)
+      if (!note) throw new Error(`笔记不存在：${noteId}`)
+      return note
+    })
+    if (patch.permanentlyDelete) {
+      if (notes.some((note) => !note.isDeleted)) throw new Error("只能永久删除回收站中的笔记")
+      for (const note of notes) deleteNotePermanently(note.id)
+      return []
+    }
+    if (Object.hasOwn(patch, "folderId") && patch.folderId !== null) {
+      const folder = database.prepare("SELECT id FROM folders WHERE id = ? AND is_deleted = 0").get(patch.folderId)
+      if (!folder) throw new Error("目标文件夹不存在或已在回收站")
+    }
+    const addTagNames = normalizeTagNames(Array.isArray(patch.addTagNames) ? patch.addTagNames : [])
+    const removeTagNames = new Set(normalizeTagNames(Array.isArray(patch.removeTagNames) ? patch.removeTagNames : []))
+    return notes.map((note) => {
+      const notePatch = {}
+      if (Object.hasOwn(patch, "folderId")) notePatch.folderId = patch.folderId
+      if (typeof patch.isPinned === "boolean") notePatch.isPinned = patch.isPinned
+      if (addTagNames.length || removeTagNames.size) {
+        const tagNames = note.tags.map((tag) => tag.name).filter((name) => !removeTagNames.has(name))
+        notePatch.tagNames = [...new Set([...tagNames, ...addTagNames])]
+      }
+      if (Object.keys(notePatch).length) updateNote(note.id, notePatch)
+      if (typeof patch.isDeleted === "boolean") setNoteDeleted(note.id, patch.isDeleted)
+      return getNote(note.id)
+    })
+  })
 
   /**
    * 永久删除笔记并保留待同步墓碑。
@@ -1424,7 +1493,7 @@ function createRepository(database) {
    * @returns {Record<string, any>} 版本化备份数据。
    */
   function exportBackup() {
-    const workspace = listWorkspace()
+    const workspace = listFullWorkspace()
     const histories = database.prepare(`
       SELECT id, note_id AS noteId, title, content, folder_id AS folderId,
              tag_names AS tagNames, created_at AS createdAt
@@ -2026,10 +2095,17 @@ function createRepository(database) {
     close: () => database.close(),
     relocateImageAssetPaths,
     listWorkspace,
+    listFullWorkspace,
+    getWorkspaceSession,
+    saveWorkspaceSession,
+    saveNoteViewState,
+    getNoteForEditing,
+    searchNotes,
     createNote,
     duplicateNote,
     createQuickNote,
     updateNote,
+    bulkUpdateNotes,
     listNoteConflicts,
     resolveNoteConflict,
     listNoteHistory,

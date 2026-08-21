@@ -1,12 +1,10 @@
 <script setup lang="ts">
-import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
+import { computed, defineAsyncComponent, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import { Icon } from '@iconify/vue'
-import DOMPurify from 'dompurify'
-import { marked } from 'marked'
 import {
+  collectFolderPathIds,
   formatNoteExcerpt as getNoteExcerpt,
   formatNoteUpdatedTime as formatTime,
-  matchesNoteSearch,
   NOTE_AUTOSAVE_DELAY_MS,
   type NoteNavigationKind
 } from './utils/note-workspace'
@@ -19,23 +17,28 @@ import {
   closeNoteTabsToRight,
   partitionNoteTabs,
   reconcileNoteTabs,
+  reorderNoteTabs,
+  togglePinnedNoteTab,
   type NoteTabsState
 } from './utils/note-tabs'
 import NoteNavigation from './components/NoteNavigation.vue'
 import FolderTreeItem from './components/FolderTreeItem.vue'
-import MarkdownVisualEditor from './components/MarkdownVisualEditor.vue'
+import FolderPickerPopover from './components/FolderPickerPopover.vue'
+import type { GeneralSettingsResult } from './components/GeneralSettingsDialog.vue'
+import type { QuickOpenSelection } from './components/QuickOpenDialog.vue'
 import SearchExcerpt from './components/SearchExcerpt.vue'
+import { matchesShortcut } from './utils/keyboard-shortcuts'
+import { useAppUpdate } from './composables/useAppUpdate'
+import { useAttachmentManager } from './composables/useAttachmentManager'
+import { useDatabaseBackups } from './composables/useDatabaseBackups'
+import { useWorkspaceSession } from './composables/useWorkspaceSession'
 import type {
-  AttachmentInventory,
-  AttachmentInventoryItem,
   AttachmentNoteReference,
-  DatabaseBackup,
+  BulkNotePatch,
   DatabaseBackupStatus,
-  DatabaseBackupSettings,
   DataTransferResult,
   NoteFolder,
   NoteConflictPair,
-  NoteHistory,
   NotePatch,
   NoteTag,
   OfflineNote,
@@ -44,9 +47,14 @@ import type {
   SyncSettingsView,
   SyncStatus,
   ThemeMode,
-  UpdateCheckResult,
   WorkspaceData
 } from './types'
+
+// 编辑器与低频弹窗单独形成 chunk，避免应用启动时解析完整编辑器实现。
+const MarkdownVisualEditor = defineAsyncComponent(() => import('./components/MarkdownVisualEditor.vue'))
+const QuickOpenDialog = defineAsyncComponent(() => import('./components/QuickOpenDialog.vue'))
+const NoteHistoryDialog = defineAsyncComponent(() => import('./components/NoteHistoryDialog.vue'))
+const GeneralSettingsDialog = defineAsyncComponent(() => import('./components/GeneralSettingsDialog.vue'))
 
 type FilterKind = 'all' | 'pinned' | 'trash' | 'folder' | 'tag'
 type SaveState = 'idle' | 'saving' | 'saved' | 'error'
@@ -93,24 +101,32 @@ interface FolderDropPayload {
   position: 'before' | 'inside' | 'after'
 }
 
-interface QuickOpenResult {
-  note: OfflineNote
-  folderPath: string
-  excerpt: string
-  contentMatched: boolean
-}
-
 const workspace = reactive<WorkspaceData>({ folders: [], tags: [], notes: [], pendingCount: 0 })
 const activeFilter = reactive<ActiveFilter>({ kind: 'all', id: null })
 const activeNoteId = ref<string | null>(null)
-const openNoteIds = ref<string[]>([])
-const activeTabNoteId = ref<string | null>(null)
+const {
+  openNoteIds,
+  activeTabNoteId,
+  pinnedNoteIds,
+  noteScrollTops,
+  restoreWorkspaceSession,
+  scheduleWorkspaceSessionSave,
+  updateNoteScrollPosition,
+  flushWorkspaceSession,
+  disposeWorkspaceSession
+} = useWorkspaceSession({
+  saveSession: (input) => window.notesDesktop.saveWorkspaceSession(input),
+  saveViewState: (noteId, scrollTop) => window.notesDesktop.saveNoteViewState(noteId, scrollTop)
+})
 const noteTabBarElement = ref<HTMLElement | null>(null)
 const noteTabBarWidth = ref(0)
 const noteTabOverflowVisible = ref(false)
 const noteTabContextMenuElement = ref<HTMLElement | null>(null)
 const tabContextMenu = reactive({ visible: false, x: 0, y: 0, noteId: null as string | null })
+const draggedNoteTabId = ref<string | null>(null)
+const dragOverNoteTabId = ref<string | null>(null)
 const searchKeyword = ref('')
+const workspaceSearchNotes = ref<OfflineNote[]>([])
 const searchInput = ref<HTMLInputElement | null>(null)
 const noteFindVisible = ref(false)
 const noteFindKeyword = ref('')
@@ -119,98 +135,48 @@ const noteFindResult = reactive({ count: 0, index: -1 })
 const markdownEditorRef = ref<{
   clearFindHighlight: () => void
   findText: (keyword: string, requestedIndex: number) => { count: number, index: number }
+  getScrollTop: () => number
 } | null>(null)
 const loading = ref(true)
 const saveState = ref<SaveState>('idle')
 const lastSavedAt = ref('')
 const linkCopyFeedback = ref('')
 const historyVisible = ref(false)
-const noteHistories = ref<NoteHistory[]>([])
-const selectedHistoryId = ref<string | null>(null)
-const historyLoading = ref(false)
-const historyDetailLoading = ref(false)
 const actionError = ref('')
-const updateDialogVisible = ref(false)
-const updateChecking = ref(false)
-const updateError = ref('')
-const updateResult = ref<UpdateCheckResult | null>(null)
-
-/**
- * 将新版本发布说明渲染为经过净化的 HTML。
- *
- * :return: 可安全展示的发布说明 HTML。
- */
-const renderedUpdateReleaseNotes = computed<string>(() => {
-  const releaseNotes = updateResult.value?.releaseNotes
-  if (updateResult.value?.status !== 'available' || !releaseNotes) return ''
-  return DOMPurify.sanitize(marked.parse(releaseNotes, { async: false }))
-})
+const {
+  updateDialogVisible,
+  updateChecking,
+  updateError,
+  updateResult,
+  renderedUpdateReleaseNotes,
+  runUpdateCheck,
+  openUpdateDownload
+} = useAppUpdate()
 const syncDialogVisible = ref(false)
 const conflictCenterVisible = ref(false)
 const selectedConflictNoteId = ref('')
+const selectedConflictDetail = ref<NoteConflictPair | null>(null)
+const conflictDetailLoading = ref(false)
 const conflictResolving = ref(false)
 const conflictError = ref('')
+let conflictDetailRequestId = 0
 const generalSettingsVisible = ref(false)
-const generalSettingsSaving = ref(false)
-const generalSettingsMessage = ref('')
-const generalShortcutRecording = ref(false)
-const generalShortcut = ref('CommandOrControl+Shift+Space')
-const generalQuickCaptureFolderId = ref<string | null>(null)
 const quickOpenVisible = ref(false)
-const quickOpenKeyword = ref('')
-const quickOpenInput = ref<HTMLInputElement | null>(null)
-const quickOpenResultsElement = ref<HTMLElement | null>(null)
-const quickOpenActiveIndex = ref(0)
-const quickOpenShortcutRecording = ref(false)
 const quickOpenShortcut = ref(window.localStorage.getItem('notes-quick-open-shortcut') || 'CommandOrControl+O')
-const draftQuickOpenShortcut = ref(quickOpenShortcut.value)
-const quickOpenHistory = ref(loadQuickOpenHistory())
 const storedShowTreeLines = window.localStorage.getItem('notes-show-tree-lines')
 const showTreeLines = ref(storedShowTreeLines !== 'false')
-const draftShowTreeLines = ref(showTreeLines.value)
 const syncTesting = ref(false)
 const syncBrowserLoginPending = ref(false)
 const syncSaving = ref(false)
 const dataTransferVisible = ref(false)
 const dataTransferBusy = ref(false)
 const dataTransferMessage = ref('')
-const attachmentManagerVisible = ref(false)
-const attachmentManagerLoading = ref(false)
-const attachmentOperationId = ref('')
-const attachmentManagerMessage = ref('')
-const attachmentSearchKeyword = ref('')
-const attachmentKindFilter = ref<'all' | 'image' | 'document' | 'other'>('all')
-const attachmentStateFilter = ref<'all' | 'uploaded' | 'pending' | 'missing' | 'corrupt' | 'orphan'>('all')
-const attachmentSourceFilter = ref<'all' | 'managed' | 'external-cache'>('all')
-const attachmentKindOptions: Array<{ value: 'all' | 'image' | 'document' | 'other', label: string }> = [
-  { value: 'all', label: '全部' },
-  { value: 'image', label: '图片' },
-  { value: 'document', label: '文档' },
-  { value: 'other', label: '其他' }
-]
-const attachmentInventory = ref<AttachmentInventory>({
-  items: [],
-  totalCount: 0,
-  localBytes: 0,
-  uploadedCount: 0,
-  pendingCount: 0,
-  missingCount: 0,
-  corruptCount: 0,
-  orphanCount: 0,
-  managedCount: 0,
-  externalCacheCount: 0
-})
-const databaseBackupVisible = ref(false)
-const databaseBackupBusy = ref(false)
-const databaseBackupMessage = ref('')
-const databaseBackups = ref<DatabaseBackup[]>([])
 const databaseBackupStatus = reactive<DatabaseBackupStatus>({
   state: 'idle',
   message: '尚未创建备份',
   lastSuccessAt: '',
   reason: ''
 })
-const databaseBackupSettings = reactive<DatabaseBackupSettings>({ schedule: 'daily', retention: 10 })
 const markdownImportTargetVisible = ref(false)
 const markdownImportTargetFolderId = ref<string | null>(null)
 const duplicateNoteVisible = ref(false)
@@ -241,6 +207,62 @@ const syncStatus = reactive<SyncStatus>({
   lastSuccessAt: '',
   history: []
 })
+const {
+  attachmentManagerVisible,
+  attachmentManagerLoading,
+  attachmentOperationId,
+  attachmentManagerMessage,
+  attachmentSearchKeyword,
+  attachmentKindFilter,
+  attachmentStateFilter,
+  attachmentSourceFilter,
+  attachmentKindOptions,
+  attachmentInventory,
+  filteredAttachments,
+  formatAttachmentSize,
+  getAttachmentKindIcon,
+  getAttachmentStateLabel,
+  getAttachmentSourceLabel,
+  openAttachmentManager,
+  closeAttachmentManager,
+  openManagedAttachment,
+  revealManagedAttachment,
+  locateAttachmentReference,
+  retryManagedAttachmentUpload,
+  repairAttachmentIntegrity,
+  cleanOrphanAttachment,
+  cleanAllOrphanAttachments
+} = useAttachmentManager({
+  flushSave,
+  requestConfirmation,
+  locateReference: locateAttachmentNote,
+  isSyncConfigured: () => syncSettings.configured,
+  syncAttachments: async () => {
+    const status = await window.notesDesktop.runSync()
+    Object.assign(syncStatus, status)
+    return status
+  }
+})
+const {
+  databaseBackupVisible,
+  databaseBackupBusy,
+  databaseBackupMessage,
+  databaseBackups,
+  databaseBackupSettings,
+  formatDatabaseBackupTime,
+  formatDatabaseBackupSize,
+  getDatabaseBackupReasonLabel,
+  saveDatabaseBackupPolicy,
+  openDatabaseBackupManager,
+  createDatabaseBackup,
+  restoreDatabaseBackup,
+  openDatabaseBackupDirectory
+} = useDatabaseBackups({
+  dataTransferVisible,
+  flushSave,
+  refreshWorkspace,
+  requestConfirmation
+})
 const folderDialogVisible = ref(false)
 const folderDialogMode = ref<'create' | 'rename'>('create')
 const editingFolderId = ref<string | null>(null)
@@ -249,12 +271,19 @@ const folderName = ref('')
 const createMenuVisible = ref(false)
 const folderPickerVisible = ref(false)
 const folderPickerSearchKeyword = ref('')
-const folderPickerSearchInput = ref<HTMLInputElement | null>(null)
 const tagPickerVisible = ref(false)
 const tagSearchKeyword = ref('')
 const tagDialogVisible = ref(false)
 const tagDialogAttachToDraft = ref(false)
 const tagName = ref('')
+const noteBatchMode = ref(false)
+const selectedNoteIds = ref<Set<string>>(new Set())
+const noteBatchDialogMode = ref<'move' | 'add-tag' | 'remove-tag'>('move')
+const noteBatchSearchKeyword = ref('')
+const noteBatchBusy = ref(false)
+const noteBatchMessage = ref('')
+const noteBatchPicker = reactive({ visible: false, x: 0, y: 0 })
+const noteBatchPickerElement = ref<HTMLElement | null>(null)
 const systemThemeMedia = window.matchMedia('(prefers-color-scheme: dark)')
 const storedTheme = window.localStorage.getItem('notes-theme')
 const themeMode = ref<ThemeMode>(storedTheme === 'system' || storedTheme === 'light' || storedTheme === 'dark' ? storedTheme : 'system')
@@ -290,7 +319,7 @@ const buttonTooltip = reactive<ButtonTooltipState>({
   placement: 'bottom'
 })
 const expandedFolderIds = ref<Set<string>>(new Set())
-const unclassifiedExpanded = ref(true)
+const unclassifiedExpanded = ref(false)
 const draggedResource = ref<ResourceDragData | null>(null)
 const sidebarResourceScroll = ref<HTMLElement | null>(null)
 const draft = reactive({
@@ -301,6 +330,8 @@ const draft = reactive({
   isPinned: false
 })
 let saveTimer: ReturnType<typeof setTimeout> | undefined
+let workspaceSearchTimer: ReturnType<typeof setTimeout> | undefined
+let workspaceSearchRequestId = 0
 let draftReady = false
 let draftVersion = 0
 let pendingRemoteRefresh = false
@@ -309,6 +340,7 @@ let confirmationResolver: ((confirmed: boolean) => void) | null = null
 let linkCopyFeedbackTimer: ReturnType<typeof setTimeout> | null = null
 let disposeOpenSyncSettings: (() => void) | null = null
 let disposeOpenNoteLink: (() => void) | null = null
+let disposeBeforeQuitSave: (() => void) | null = null
 let disposeCheckForUpdates: (() => void) | null = null
 let disposeOpenDataTransfer: (() => void) | null = null
 let disposeOpenGeneralSettings: (() => void) | null = null
@@ -391,12 +423,12 @@ const navigationActive = computed<NoteNavigationKind | null>(() =>
 )
 const visibleNotes = computed(() => {
   const keyword = searchKeyword.value.trim().toLocaleLowerCase()
-  return workspace.notes.filter((note) => {
+  const sourceNotes = keyword ? workspaceSearchNotes.value : workspace.notes
+  return sourceNotes.filter((note) => {
     if (activeFilter.kind === 'trash' ? !note.isDeleted : note.isDeleted) return false
     if (activeFilter.kind === 'pinned' && !note.isPinned) return false
     if (activeFilter.kind === 'folder' && note.folderId !== activeFilter.id) return false
     if (activeFilter.kind === 'tag' && !note.tags.some((tag) => tag.id === activeFilter.id)) return false
-    if (!matchesNoteSearch(note, keyword)) return false
     return true
   }).sort((left, right) => {
     if (!keyword) return 0
@@ -406,10 +438,11 @@ const visibleNotes = computed(() => {
 })
 const explorerNotes = computed(() => {
   const keyword = searchKeyword.value.trim().toLocaleLowerCase()
-  return workspace.notes.filter((note) => {
+  const sourceNotes = keyword ? workspaceSearchNotes.value : workspace.notes
+  return sourceNotes.filter((note) => {
     if (note.isDeleted) return false
     if (activeFilter.kind === 'tag' && !note.tags.some((tag) => tag.id === activeFilter.id)) return false
-    return matchesNoteSearch(note, keyword)
+    return true
   }).sort((left, right) => {
     if (!keyword) return 0
     return Number(right.title.toLocaleLowerCase().includes(keyword))
@@ -483,44 +516,6 @@ const folderOptions = computed(() => {
   appendFolderOptions(null, 0)
   return options
 })
-const filteredFolderOptions = computed(() => {
-  const keyword = folderPickerSearchKeyword.value.trim().toLocaleLowerCase()
-  if (!keyword) return folderOptions.value
-  return folderOptions.value.filter((folder) => folder.name.toLocaleLowerCase().includes(keyword))
-})
-const quickOpenResults = computed<QuickOpenResult[]>(() => {
-  const keyword = quickOpenKeyword.value.trim().toLocaleLowerCase()
-  const folderById = new Map(workspace.folders.map((folder) => [folder.id, folder]))
-  return workspace.notes
-    .filter((note) => !note.isDeleted)
-    .map((note) => {
-      const folderPath = getQuickOpenFolderPath(note.folderId, folderById)
-      const searchText = [
-        note.title,
-        note.content,
-        note.tags.map((tag) => tag.name).join(' '),
-        folderPath
-      ].join(' ').toLocaleLowerCase()
-      const score = keyword
-        ? Number(note.title.toLocaleLowerCase().includes(keyword)) * 4
-          + Number(note.tags.some((tag) => tag.name.toLocaleLowerCase().includes(keyword))) * 3
-          + Number(folderPath.toLocaleLowerCase().includes(keyword)) * 2
-          + Number(note.content.toLocaleLowerCase().includes(keyword))
-        : 0
-      return {
-        note,
-        folderPath,
-        excerpt: getNoteExcerpt(note.content),
-        contentMatched: Boolean(keyword && note.content.toLocaleLowerCase().includes(keyword)),
-        searchText,
-        score
-      }
-    })
-    .filter((result) => !keyword || result.searchText.includes(keyword))
-    .sort((left, right) => right.score - left.score || Date.parse(right.note.updatedAt) - Date.parse(left.note.updatedAt))
-    .slice(0, 12)
-    .map(({ note, folderPath, excerpt, contentMatched }) => ({ note, folderPath, excerpt, contentMatched }))
-})
 const currentFolderName = computed(() => {
   if (!draft.folderId) return '未分类'
   return workspace.folders.find((folder) => folder.id === draft.folderId)?.name ?? '未分类'
@@ -532,6 +527,13 @@ const visibleDraftTags = computed(() => selectedTags.value.slice(0, 3))
 const hiddenDraftTagCount = computed(() => Math.max(0, selectedTags.value.length - 3))
 const filteredTags = computed(() => {
   const keyword = tagSearchKeyword.value.trim().toLocaleLowerCase()
+  return workspace.tags.filter((tag) => !keyword || tag.name.toLocaleLowerCase().includes(keyword))
+})
+const allVisibleNotesSelected = computed(() => (
+  visibleNotes.value.length > 0 && visibleNotes.value.every((note) => selectedNoteIds.value.has(note.id))
+))
+const filteredNoteBatchTags = computed(() => {
+  const keyword = noteBatchSearchKeyword.value.trim().toLocaleLowerCase()
   return workspace.tags.filter((tag) => !keyword || tag.name.toLocaleLowerCase().includes(keyword))
 })
 const showFilteredResults = computed(() => activeFilter.kind === 'pinned')
@@ -588,27 +590,6 @@ const noteConflicts = computed<NoteConflictPair[]>(() => workspace.notes
 const selectedNoteConflict = computed(() => noteConflicts.value.find(
   (pair) => pair.conflict.id === selectedConflictNoteId.value,
 ) || noteConflicts.value[0] || null)
-const filteredAttachments = computed(() => {
-  const keyword = attachmentSearchKeyword.value.trim().toLocaleLowerCase()
-  return attachmentInventory.value.items.filter((asset) => {
-    if (attachmentKindFilter.value !== 'all' && asset.kind !== attachmentKindFilter.value) return false
-    if (attachmentSourceFilter.value !== 'all' && asset.sourceKind !== attachmentSourceFilter.value) return false
-    if (attachmentStateFilter.value === 'orphan' && !asset.isOrphan) return false
-    if (
-      attachmentStateFilter.value !== 'all'
-      && attachmentStateFilter.value !== 'orphan'
-      && asset.state !== attachmentStateFilter.value
-    ) return false
-    if (!keyword) return true
-    return [
-      asset.fileName,
-      asset.mimeType,
-      asset.sourceHost,
-      ...asset.noteReferences.map((note) => note.title)
-    ].some((value) => value.toLocaleLowerCase().includes(keyword))
-  })
-})
-
 function formatSyncDuration(durationMs: number): string {
   if (durationMs < 1000) return `${Math.max(0, Math.round(durationMs))} 毫秒`
   return `${(durationMs / 1000).toFixed(durationMs < 10_000 ? 1 : 0)} 秒`
@@ -631,9 +612,6 @@ const saveStatusLabel = computed(() => {
   if (saveState.value === 'saved') return lastSavedAt.value ? `已保存 ${lastSavedAt.value}` : '已保存'
   return '自动保存'
 })
-const selectedHistory = computed(() =>
-  noteHistories.value.find((history) => history.id === selectedHistoryId.value) ?? null
-)
 const canSaveSyncSettings = computed(() => {
   const backendUrl = syncForm.backendUrl.trim().replace(/\/+$/, '')
   const usingSavedConnection = syncSettings.configured
@@ -642,43 +620,6 @@ const canSaveSyncSettings = computed(() => {
     && !syncForm.password
   return !syncSaving.value && (usingSavedConnection || backendUrl === verifiedBackendUrl.value)
 })
-
-/**
- * 检查 GitHub Releases 中是否存在新版本。
- *
- * :param silent: 已是最新版或检查失败时是否静默。
- * :return: 检查完成后的 Promise。
- */
-async function runUpdateCheck(silent = false): Promise<void> {
-  if (updateChecking.value) return
-  updateChecking.value = true
-  updateError.value = ''
-  if (!silent) updateDialogVisible.value = true
-  try {
-    updateResult.value = await window.notesDesktop.checkForUpdates()
-    if (updateResult.value.status === 'available') updateDialogVisible.value = true
-  } catch (error) {
-    updateError.value = error instanceof Error ? error.message : '检查更新失败'
-    if (!silent) updateDialogVisible.value = true
-  } finally {
-    updateChecking.value = false
-  }
-}
-
-/**
- * 使用系统浏览器打开新版本下载地址。
- *
- * :return: 打开完成后的 Promise。
- */
-async function openUpdateDownload(): Promise<void> {
-  if (!updateResult.value?.downloadUrl) return
-  try {
-    await window.notesDesktop.openUpdateDownload(updateResult.value.downloadUrl)
-    updateDialogVisible.value = false
-  } catch (error) {
-    updateError.value = error instanceof Error ? error.message : '无法打开下载地址'
-  }
-}
 
 /**
  * 将工作区响应覆盖到响应式状态。
@@ -691,9 +632,6 @@ function applyWorkspace(data: WorkspaceData): void {
   workspace.tags = data.tags
   workspace.notes = data.notes
   workspace.pendingCount = data.pendingCount
-  if (!expandedFolderIds.value.size) {
-    expandedFolderIds.value = new Set(data.folders.map((folder) => folder.id))
-  }
 }
 
 /**
@@ -705,14 +643,49 @@ async function loadWorkspace(): Promise<void> {
   loading.value = true
   actionError.value = ''
   try {
-    applyWorkspace(await window.notesDesktop.listWorkspace())
-    const target = workspace.notes.find((note) => !note.isDeleted) ?? workspace.notes[0]
-    if (target) await selectNote(target)
+    const [data, session] = await Promise.all([
+      window.notesDesktop.listWorkspace(),
+      window.notesDesktop.getWorkspaceSession()
+    ])
+    applyWorkspace(data)
+    const availableNotes = workspace.notes.filter((note) => !note.isDeleted)
+    restoreWorkspaceSession(session, availableNotes.map((note) => note.id))
+    const target = availableNotes.find((note) => note.id === activeTabNoteId.value)
+    if (target) {
+      // 启动恢复只展开活动笔记的完整目录路径，避免默认展开整棵文件夹树。
+      expandedFolderIds.value = new Set(collectFolderPathIds(workspace.folders, target.folderId))
+      await selectNote(target)
+    } else {
+      activeNoteId.value = null
+    }
   } catch (error) {
     actionError.value = error instanceof Error ? error.message : '本地数据库加载失败'
   } finally {
     loading.value = false
   }
+}
+
+/** 防抖执行侧边栏完整正文搜索。 */
+function scheduleWorkspaceSearch(rawKeyword: string): void {
+  if (workspaceSearchTimer) clearTimeout(workspaceSearchTimer)
+  workspaceSearchTimer = undefined
+  const keyword = rawKeyword.trim()
+  const requestId = ++workspaceSearchRequestId
+  if (!keyword) {
+    workspaceSearchNotes.value = []
+    return
+  }
+  workspaceSearchTimer = setTimeout(() => {
+    workspaceSearchTimer = undefined
+    void window.notesDesktop.searchNotes(keyword, { limit: 1000 }).then((notes) => {
+      if (requestId === workspaceSearchRequestId) workspaceSearchNotes.value = notes
+    }).catch((error) => {
+      if (requestId === workspaceSearchRequestId) {
+        workspaceSearchNotes.value = []
+        actionError.value = error instanceof Error ? error.message : '搜索失败'
+      }
+    })
+  }, 120)
 }
 
 /**
@@ -724,7 +697,7 @@ async function refreshWorkspace(): Promise<void> {
   const selectedId = activeNoteId.value
   applyWorkspace(await window.notesDesktop.listWorkspace())
   const refreshedNote = selectedId
-    ? workspace.notes.find((note) => note.id === selectedId)
+    ? workspace.notes.find((note) => note.id === selectedId && !note.isDeleted)
     : undefined
   if (refreshedNote) {
     if (hasPendingDraftSave()) {
@@ -738,8 +711,11 @@ async function refreshWorkspace(): Promise<void> {
     return
   }
   pendingRemoteRefresh = false
-  const target = workspace.notes.find((note) => !note.isDeleted) ?? workspace.notes[0]
+  // 空标签会话是用户明确关闭全部标签后的状态；同步刷新不能替用户重新打开笔记。
+  if (!selectedId) return
+  const target = workspace.notes.find((note) => !note.isDeleted)
   if (target) await selectNote(target)
+  else activeNoteId.value = null
 }
 
 /**
@@ -766,168 +742,12 @@ async function pullLatestData(): Promise<void> {
 }
 
 /**
- * 将 Electron 快捷键格式转换为界面展示文本。
- *
- * :param value: Electron 快捷键字符串。
- * :return: 当前系统对应的快捷键文本。
- */
-function formatGeneralShortcut(value: string): string {
-  return value
-    .replace('CommandOrControl', navigator.platform.includes('Mac') ? '⌘' : 'Ctrl')
-    .replaceAll('Shift', '⇧')
-    .replaceAll('Alt', navigator.platform.includes('Mac') ? '⌥' : 'Alt')
-    .replaceAll('+', ' ')
-}
-
-/**
- * 将键盘事件转换为 Electron 全局快捷键字符串。
- *
- * :param event: 键盘事件。
- * :return: 有效快捷键字符串，无修饰键或仅按修饰键时返回 null。
- */
-function getGeneralShortcutFromEvent(event: KeyboardEvent): string | null {
-  const ignoredKeys = new Set(['Meta', 'Control', 'Shift', 'Alt'])
-  if (ignoredKeys.has(event.key)) return null
-  const modifiers: string[] = []
-  if (event.metaKey || event.ctrlKey) modifiers.push('CommandOrControl')
-  if (event.altKey) modifiers.push('Alt')
-  if (event.shiftKey) modifiers.push('Shift')
-  if (!modifiers.length) return null
-  const aliases: Record<string, string> = {
-    ' ': 'Space', ArrowUp: 'Up', ArrowDown: 'Down', ArrowLeft: 'Left', ArrowRight: 'Right'
-  }
-  const key = aliases[event.key] || (event.key.length === 1 ? event.key.toUpperCase() : event.key)
-  return [...modifiers, key].join('+')
-}
-
-/**
- * 录入通用设置中的快速记录快捷键。
- *
- * :param event: 键盘事件。
- * :return: 无返回值。
- */
-function recordGeneralShortcut(event: KeyboardEvent): void {
-  event.preventDefault()
-  event.stopPropagation()
-  const shortcut = getGeneralShortcutFromEvent(event)
-  if (!shortcut) return
-  generalShortcut.value = shortcut
-  generalShortcutRecording.value = false
-  generalSettingsMessage.value = ''
-}
-
-/**
- * 生成笔记所在文件夹的完整路径。
- *
- * :param folderId: 笔记所属文件夹 ID。
- * :param folderById: 按 ID 索引的文件夹集合。
- * :return: 文件夹路径，未分类笔记返回“未分类”。
- */
-function getQuickOpenFolderPath(folderId: string | null, folderById: Map<string, NoteFolder>): string {
-  if (!folderId) return '未分类'
-  const names: string[] = []
-  const visited = new Set<string>()
-  let currentId: string | null = folderId
-  while (currentId && !visited.has(currentId)) {
-    visited.add(currentId)
-    const folder = folderById.get(currentId)
-    if (!folder || folder.isDeleted) break
-    names.unshift(folder.name)
-    currentId = folder.parentId
-  }
-  return names.join(' / ') || '未分类'
-}
-
-/**
- * 录入通用设置中的快速打开快捷键。
- *
- * :param event: 键盘事件。
- * :return: 无返回值。
- */
-function recordQuickOpenShortcut(event: KeyboardEvent): void {
-  event.preventDefault()
-  event.stopPropagation()
-  const shortcut = getGeneralShortcutFromEvent(event)
-  if (!shortcut) return
-  draftQuickOpenShortcut.value = shortcut
-  quickOpenShortcutRecording.value = false
-  generalSettingsMessage.value = ''
-}
-
-/**
- * 判断键盘事件是否匹配应用内快捷键。
- *
- * :param event: 键盘事件。
- * :param shortcut: Electron 格式的快捷键字符串。
- * :return: 匹配时返回 true。
- */
-function matchesAppShortcut(event: KeyboardEvent, shortcut: string): boolean {
-  const parts = shortcut.split('+').map((part) => part.toLocaleLowerCase())
-  const expectedCommand = parts.includes('commandorcontrol')
-  const expectedShift = parts.includes('shift')
-  const expectedAlt = parts.includes('alt')
-  const key = parts.find((part) => !['commandorcontrol', 'shift', 'alt'].includes(part))
-  if (!key) return false
-  return (event.metaKey || event.ctrlKey) === expectedCommand
-    && event.shiftKey === expectedShift
-    && event.altKey === expectedAlt
-    && event.key.toLocaleLowerCase() === key.toLocaleLowerCase()
-}
-
-/**
- * 从本地设置读取最近使用的快速搜索词。
- *
- * :return: 最多八条有效搜索词。
- */
-function loadQuickOpenHistory(): string[] {
-  try {
-    const value = JSON.parse(window.localStorage.getItem('notes-quick-open-history') || '[]')
-    return Array.isArray(value)
-      ? value.filter((item): item is string => typeof item === 'string' && Boolean(item.trim())).slice(0, 8)
-      : []
-  } catch {
-    return []
-  }
-}
-
-/**
- * 保存最近使用的快速搜索词并去重。
- *
- * :param keyword: 已完成跳转的搜索词。
- * :return: 无返回值。
- */
-function rememberQuickOpenKeyword(keyword: string): void {
-  const normalizedKeyword = keyword.trim()
-  if (!normalizedKeyword) return
-  quickOpenHistory.value = [
-    normalizedKeyword,
-    ...quickOpenHistory.value.filter((item) => item.toLocaleLowerCase() !== normalizedKeyword.toLocaleLowerCase())
-  ].slice(0, 8)
-  window.localStorage.setItem('notes-quick-open-history', JSON.stringify(quickOpenHistory.value))
-}
-
-/**
- * 将历史搜索词填入快速打开输入框。
- *
- * :param keyword: 待复用搜索词。
- * :return: 无返回值。
- */
-function applyQuickOpenHistory(keyword: string): void {
-  quickOpenKeyword.value = keyword
-  quickOpenActiveIndex.value = 0
-  void nextTick(() => quickOpenInput.value?.focus())
-}
-
-/**
  * 打开全库快速搜索面板并聚焦输入框。
  *
  * :return: 无返回值。
  */
 function openQuickOpen(): void {
   quickOpenVisible.value = true
-  quickOpenKeyword.value = ''
-  quickOpenActiveIndex.value = 0
-  void nextTick(() => quickOpenInput.value?.focus())
 }
 
 /**
@@ -969,59 +789,18 @@ function handleSearchMenuCommand(target: SearchMenuTarget): void {
 /**
  * 选择快速搜索结果并跳转到对应笔记。
  *
- * :param result: 待打开的快速搜索结果。
+ * :param selection: 快速打开模块返回的笔记和搜索上下文。
  * :return: 跳转完成后的 Promise。
  */
-async function chooseQuickOpenResult(result: QuickOpenResult): Promise<void> {
-  const keyword = quickOpenKeyword.value.trim()
-  quickOpenVisible.value = false
+async function chooseQuickOpenResult(selection: QuickOpenSelection): Promise<void> {
   activeFilter.kind = 'all'
   activeFilter.id = null
-  rememberQuickOpenKeyword(keyword)
-  await selectNote(result.note)
-  if (result.contentMatched && keyword) {
+  await selectNote(selection.note)
+  if (selection.contentMatched && selection.keyword) {
     noteFindVisible.value = true
-    noteFindKeyword.value = keyword
+    noteFindKeyword.value = selection.keyword
     await nextTick()
     findInCurrentNote(1)
-  }
-}
-
-/**
- * 将快速搜索中的当前选中项滚动到结果列表可视区域。
- *
- * :return: 无返回值。
- */
-function scrollQuickOpenActiveResultIntoView(): void {
-  void nextTick(() => {
-    quickOpenResultsElement.value
-      ?.querySelector<HTMLElement>('[aria-selected="true"]')
-      ?.scrollIntoView({ block: 'nearest' })
-  })
-}
-
-/**
- * 处理快速搜索面板的方向键、回车和退出操作。
- *
- * :param event: 键盘事件。
- * :return: 无返回值。
- */
-function handleQuickOpenKeydown(event: KeyboardEvent): void {
-  if (event.key === 'ArrowDown') {
-    event.preventDefault()
-    quickOpenActiveIndex.value = Math.min(quickOpenActiveIndex.value + 1, Math.max(quickOpenResults.value.length - 1, 0))
-    scrollQuickOpenActiveResultIntoView()
-  } else if (event.key === 'ArrowUp') {
-    event.preventDefault()
-    quickOpenActiveIndex.value = Math.max(quickOpenActiveIndex.value - 1, 0)
-    scrollQuickOpenActiveResultIntoView()
-  } else if (event.key === 'Enter') {
-    event.preventDefault()
-    const result = quickOpenResults.value[quickOpenActiveIndex.value]
-    if (result) void chooseQuickOpenResult(result)
-  } else if (event.key === 'Escape') {
-    event.preventDefault()
-    quickOpenVisible.value = false
   }
 }
 
@@ -1030,277 +809,28 @@ function handleQuickOpenKeydown(event: KeyboardEvent): void {
  *
  * :return: 配置加载完成后的 Promise。
  */
-async function openGeneralSettings(): Promise<void> {
-  generalSettingsMessage.value = ''
-  generalShortcutRecording.value = false
-  quickOpenShortcutRecording.value = false
-  draftQuickOpenShortcut.value = quickOpenShortcut.value
-  draftShowTreeLines.value = showTreeLines.value
-  try {
-    const settings = await window.notesDesktop.getQuickCaptureSettings()
-    generalShortcut.value = settings.shortcut
-    generalQuickCaptureFolderId.value = settings.folderId
-    generalSettingsVisible.value = true
-  } catch (error) {
-    actionError.value = error instanceof Error ? error.message : '通用设置加载失败'
-  }
+function openGeneralSettings(): void {
+  generalSettingsVisible.value = true
 }
 
-/**
- * 保存通用设置并立即应用侧边栏连接线状态。
- *
- * :return: 保存完成后的 Promise。
- */
-async function saveGeneralSettings(): Promise<void> {
-  if (generalSettingsSaving.value) return
-  generalSettingsSaving.value = true
-  generalSettingsMessage.value = ''
-  try {
-    await window.notesDesktop.saveQuickCaptureSettings({
-      shortcut: generalShortcut.value,
-      folderId: generalQuickCaptureFolderId.value
-    })
-    showTreeLines.value = draftShowTreeLines.value
-    window.localStorage.setItem('notes-show-tree-lines', String(showTreeLines.value))
-    quickOpenShortcut.value = draftQuickOpenShortcut.value
-    window.localStorage.setItem('notes-quick-open-shortcut', quickOpenShortcut.value)
-    generalSettingsVisible.value = false
-  } catch (error) {
-    generalSettingsMessage.value = error instanceof Error ? error.message : '通用设置保存失败'
-  } finally {
-    generalSettingsSaving.value = false
-  }
+/** 应用通用设置模块保存后的渲染进程状态。 */
+function applyGeneralSettings(settings: GeneralSettingsResult): void {
+  quickOpenShortcut.value = settings.quickOpenShortcut
+  showTreeLines.value = settings.showTreeLines
 }
 
-/**
- * 将附件字节数格式化为易读文本。
- *
- * :param bytes: 字节数。
- * :return: 易读容量文本。
- */
-function formatAttachmentSize(bytes: number): string {
-  if (bytes < 1024) return `${bytes} B`
-  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(bytes < 10 * 1024 ? 1 : 0)} KB`
-  if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`
-  return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`
-}
-
-/** 返回附件分类对应的图标。 */
-function getAttachmentKindIcon(asset: AttachmentInventoryItem): string {
-  if (asset.kind === 'image') return 'tabler:photo'
-  if (asset.kind === 'document') return 'tabler:file-text'
-  return 'tabler:file'
-}
-
-/** 返回附件本地与云端状态文案。 */
-function getAttachmentStateLabel(asset: AttachmentInventoryItem): string {
-  if (asset.state === 'missing') return '文件缺失'
-  if (asset.state === 'corrupt') return '校验异常'
-  if (asset.state === 'pending') return '待上传'
-  return '已上传'
-}
-
-/** 返回附件来源及远程主机文案。 */
-function getAttachmentSourceLabel(asset: AttachmentInventoryItem): string {
-  if (asset.sourceKind === 'external-cache') {
-    return asset.sourceHost ? `外链缓存 · ${asset.sourceHost}` : '外链缓存'
-  }
-  if (!asset.remoteUrl) return '本地附件'
-  return asset.sourceHost ? `笔记附件 · ${asset.sourceHost}` : '笔记附件'
-}
-
-/** 从主进程刷新附件管理清单。 */
-async function loadAttachmentInventory(showLoading = true): Promise<void> {
-  if (showLoading) attachmentManagerLoading.value = true
-  try {
-    attachmentInventory.value = await window.notesDesktop.listAttachmentInventory()
-  } finally {
-    if (showLoading) attachmentManagerLoading.value = false
-  }
-}
-
-/** 保存当前草稿后打开附件管理中心。 */
-async function openAttachmentManager(): Promise<void> {
-  attachmentManagerVisible.value = true
-  attachmentManagerMessage.value = ''
-  attachmentSearchKeyword.value = ''
-  attachmentKindFilter.value = 'all'
-  attachmentStateFilter.value = 'all'
-  attachmentSourceFilter.value = 'all'
-  try {
-    await flushSave()
-    await loadAttachmentInventory()
-  } catch (error) {
-    attachmentManagerMessage.value = error instanceof Error ? error.message : '附件清单加载失败'
-    attachmentManagerLoading.value = false
-  }
-}
-
-/** 关闭附件管理中心。 */
-function closeAttachmentManager(): void {
-  if (attachmentOperationId.value) return
-  attachmentManagerVisible.value = false
-  attachmentManagerMessage.value = ''
-}
-
-/** 使用系统默认应用打开附件。 */
-async function openManagedAttachment(asset: AttachmentInventoryItem): Promise<void> {
-  attachmentOperationId.value = asset.id
-  attachmentManagerMessage.value = ''
-  try {
-    await window.notesDesktop.openAttachment(asset.id)
-  } catch (error) {
-    attachmentManagerMessage.value = error instanceof Error ? error.message : '附件打开失败'
-  } finally {
-    attachmentOperationId.value = ''
-  }
-}
-
-/** 在 Finder 中显示附件文件。 */
-async function revealManagedAttachment(asset: AttachmentInventoryItem): Promise<void> {
-  attachmentOperationId.value = asset.id
-  attachmentManagerMessage.value = ''
-  try {
-    await window.notesDesktop.revealAttachment(asset.id)
-  } catch (error) {
-    attachmentManagerMessage.value = error instanceof Error ? error.message : '无法打开附件所在目录'
-  } finally {
-    attachmentOperationId.value = ''
-  }
-}
-
-/** 关闭附件中心并定位引用附件的指定笔记。 */
-async function locateAttachmentReference(reference: AttachmentNoteReference): Promise<void> {
+/** 定位附件引用的笔记，供附件管理模块复用主工作区导航。 */
+async function locateAttachmentNote(reference: AttachmentNoteReference): Promise<boolean> {
   let note = workspace.notes.find((item) => item.id === reference.id)
   if (!note) {
     await refreshWorkspace()
     note = workspace.notes.find((item) => item.id === reference.id)
   }
-  if (!note) {
-    attachmentManagerMessage.value = '引用笔记已不存在'
-    return
-  }
-  attachmentManagerVisible.value = false
+  if (!note) return false
   searchKeyword.value = ''
   setFilter(note.isDeleted ? 'trash' : 'all')
   await selectNote(note)
-}
-
-/** 触发全库同步并刷新当前附件的上传状态。 */
-async function retryManagedAttachmentUpload(asset: AttachmentInventoryItem): Promise<void> {
-  if (!syncSettings.configured) {
-    attachmentManagerMessage.value = '请先在同步中心连接云端账号'
-    return
-  }
-  if (!asset.localExists) {
-    attachmentManagerMessage.value = '本地文件缺失，无法重新上传'
-    return
-  }
-  attachmentOperationId.value = asset.id
-  attachmentManagerMessage.value = '正在重新上传并同步…'
-  try {
-    const status = await window.notesDesktop.runSync()
-    Object.assign(syncStatus, status)
-    if (status.state === 'error') throw new Error(status.message || '附件上传失败')
-    await loadAttachmentInventory(false)
-    const updated = attachmentInventory.value.items.find((item) => item.id === asset.id)
-    attachmentManagerMessage.value = updated?.state === 'uploaded'
-      ? `“${asset.fileName}”已上传`
-      : status.message || '同步已完成'
-  } catch (error) {
-    attachmentManagerMessage.value = error instanceof Error ? error.message : '附件上传失败'
-  } finally {
-    attachmentOperationId.value = ''
-  }
-}
-
-/** 校验全部附件，并尽量重下缺失文件或重传待上传文件。 */
-async function repairAttachmentIntegrity(): Promise<void> {
-  attachmentOperationId.value = '__repair_attachment_integrity__'
-  attachmentManagerMessage.value = '正在校验附件并修复可恢复项目…'
-  try {
-    const result = await window.notesDesktop.repairAttachmentIntegrity()
-    await loadAttachmentInventory(false)
-    if (!result.candidateCount) {
-      attachmentManagerMessage.value = '当前没有需要检查的附件'
-      return
-    }
-    if (result.failedCount) {
-      const examples = result.failures.slice(0, 3).map((failure) => `“${failure.fileName}”`).join('、')
-      attachmentManagerMessage.value = `已检查 ${result.candidateCount} 个附件，修复 ${result.repairedCount} 个，${result.failedCount} 个未能修复：${examples}`
-      return
-    }
-    attachmentManagerMessage.value = result.repairedCount
-      ? `检查完成：${result.healthyCount} 个正常，修复 ${result.repairedCount} 个（重下 ${result.downloadedCount}、上传 ${result.uploadedCount}）`
-      : `检查完成，${result.healthyCount} 个附件全部正常`
-  } catch (error) {
-    attachmentManagerMessage.value = error instanceof Error ? error.message : '附件完整性检查失败'
-  } finally {
-    attachmentOperationId.value = ''
-  }
-}
-
-/** 确认后清理孤立附件记录并将本地文件移入废纸篓。 */
-async function cleanOrphanAttachment(asset: AttachmentInventoryItem): Promise<void> {
-  await flushSave()
-  await loadAttachmentInventory(false)
-  const current = attachmentInventory.value.items.find((item) => item.id === asset.id)
-  if (!current?.isOrphan) {
-    attachmentManagerMessage.value = '附件已有笔记引用，已取消清理'
-    return
-  }
-  const confirmed = await requestConfirmation(
-    '清理这个附件？',
-    `“${current.fileName}”未被当前笔记或历史版本引用。本地文件将移入废纸篓，已上传的云端文件不会被删除。`,
-    '清理附件'
-  )
-  if (!confirmed) return
-  attachmentOperationId.value = current.id
-  attachmentManagerMessage.value = ''
-  try {
-    const result = await window.notesDesktop.deleteOrphanAttachment(current.id)
-    await loadAttachmentInventory(false)
-    attachmentManagerMessage.value = result.removedLocalFile
-      ? `“${current.fileName}”已移入废纸篓`
-      : `“${current.fileName}”的无效记录已清理`
-  } catch (error) {
-    attachmentManagerMessage.value = error instanceof Error ? error.message : '附件清理失败'
-  } finally {
-    attachmentOperationId.value = ''
-  }
-}
-
-/** 重新扫描并确认后，一次清理当前全部孤立附件。 */
-async function cleanAllOrphanAttachments(): Promise<void> {
-  await flushSave()
-  await loadAttachmentInventory(false)
-  const candidates = attachmentInventory.value.items.filter((asset) => asset.isOrphan)
-  if (!candidates.length) {
-    attachmentManagerMessage.value = '当前没有可清理的孤立附件'
-    return
-  }
-  const localBytes = candidates.reduce((total, asset) => total + asset.localBytes, 0)
-  const confirmed = await requestConfirmation(
-    `一键清理 ${candidates.length} 个孤立附件？`,
-    `这些附件未被当前笔记或历史版本引用，共占用 ${formatAttachmentSize(localBytes)}。本地文件将移入废纸篓，已上传的云端文件不会被删除。`,
-    '一键清理'
-  )
-  if (!confirmed) return
-  attachmentOperationId.value = '__all_orphan_attachments__'
-  attachmentManagerMessage.value = '正在清理孤立附件…'
-  try {
-    const result = await window.notesDesktop.deleteAllOrphanAttachments(
-      candidates.map((asset) => asset.id)
-    )
-    await loadAttachmentInventory(false)
-    attachmentManagerMessage.value = result.failedCount
-      ? `已清理 ${result.removedCount} 个附件，${result.failedCount} 个未能清理，可再次尝试`
-      : `已清理 ${result.removedCount} 个孤立附件，其中 ${result.removedLocalFileCount} 个本地文件已移入废纸篓`
-  } catch (error) {
-    attachmentManagerMessage.value = error instanceof Error ? error.message : '孤立附件批量清理失败'
-  } finally {
-    attachmentOperationId.value = ''
-  }
+  return true
 }
 
 /**
@@ -1312,165 +842,6 @@ function openDataTransfer(): void {
   dataTransferMessage.value = ''
   markdownImportTargetVisible.value = false
   dataTransferVisible.value = true
-}
-
-/**
- * 格式化数据库备份的本地时间。
- *
- * :param value: ISO 备份时间。
- * :return: 本地日期时间文本。
- */
-function formatDatabaseBackupTime(value: string): string {
-  return new Intl.DateTimeFormat('zh-CN', {
-    year: 'numeric',
-    month: '2-digit',
-    day: '2-digit',
-    hour: '2-digit',
-    minute: '2-digit'
-  }).format(new Date(value))
-}
-
-/**
- * 格式化数据库备份文件大小。
- *
- * :param size: 文件字节数。
- * :return: 易读的文件大小文本。
- */
-function formatDatabaseBackupSize(size: number): string {
-  if (size < 1024 * 1024) return `${Math.max(1, Math.round(size / 1024))} KB`
-  return `${(size / 1024 / 1024).toFixed(1)} MB`
-}
-
-/**
- * 返回数据库备份原因对应的界面标签。
- *
- * :param reason: 备份原因。
- * :return: 中文原因标签。
- */
-function getDatabaseBackupReasonLabel(reason: DatabaseBackup['reason']): string {
-  return {
-    daily: '每日自动',
-    manual: '手动创建',
-    'before-import': '导入前保护',
-    'pre-restore': '恢复前保护'
-  }[reason]
-}
-
-/**
- * 刷新当前档案的完整备份列表。
- *
- * :return: 加载完成后的 Promise。
- */
-async function loadDatabaseBackups(): Promise<void> {
-  const [backups, settings] = await Promise.all([
-    window.notesDesktop.listDatabaseBackups(),
-    window.notesDesktop.getDatabaseBackupSettings()
-  ])
-  databaseBackups.value = backups
-  Object.assign(databaseBackupSettings, settings)
-}
-
-/**
- * 保存当前档案的自动备份策略。
- *
- * :return: 保存完成后的 Promise。
- */
-async function saveDatabaseBackupPolicy(): Promise<void> {
-  databaseBackupBusy.value = true
-  try {
-    const settings = await window.notesDesktop.saveDatabaseBackupSettings({
-      schedule: databaseBackupSettings.schedule,
-      retention: databaseBackupSettings.retention
-    })
-    Object.assign(databaseBackupSettings, settings)
-    await loadDatabaseBackups()
-    databaseBackupMessage.value = '自动备份策略已保存'
-  } catch (error) {
-    databaseBackupMessage.value = error instanceof Error ? error.message : '备份策略保存失败'
-  } finally {
-    databaseBackupBusy.value = false
-  }
-}
-
-/**
- * 打开完整自动备份管理窗口。
- *
- * :return: 打开完成后的 Promise。
- */
-async function openDatabaseBackupManager(): Promise<void> {
-  dataTransferVisible.value = false
-  databaseBackupVisible.value = true
-  databaseBackupBusy.value = true
-  databaseBackupMessage.value = ''
-  try {
-    await loadDatabaseBackups()
-  } catch (error) {
-    databaseBackupMessage.value = error instanceof Error ? error.message : '备份列表加载失败'
-  } finally {
-    databaseBackupBusy.value = false
-  }
-}
-
-/**
- * 立即创建当前档案的完整备份。
- *
- * :return: 创建完成后的 Promise。
- */
-async function createDatabaseBackup(): Promise<void> {
-  if (databaseBackupBusy.value) return
-  databaseBackupBusy.value = true
-  databaseBackupMessage.value = ''
-  try {
-    await flushSave()
-    await window.notesDesktop.createDatabaseBackup()
-    await loadDatabaseBackups()
-    databaseBackupMessage.value = '当前数据库和附件已安全备份'
-  } catch (error) {
-    databaseBackupMessage.value = error instanceof Error ? error.message : '完整备份失败'
-  } finally {
-    databaseBackupBusy.value = false
-  }
-}
-
-/**
- * 恢复指定完整备份。
- *
- * :param backup: 待恢复的备份摘要。
- * :return: 恢复完成后的 Promise。
- */
-async function restoreDatabaseBackup(backup: DatabaseBackup): Promise<void> {
-  const confirmed = await requestConfirmation(
-    '恢复完整备份？',
-    `将恢复到 ${formatDatabaseBackupTime(backup.createdAt)} 的状态。当前数据库和附件会先自动创建一份“恢复前保护”快照。`,
-    '确认恢复'
-  )
-  if (!confirmed) return
-  databaseBackupBusy.value = true
-  databaseBackupMessage.value = ''
-  try {
-    await flushSave()
-    const result = await window.notesDesktop.restoreDatabaseBackup(backup.id)
-    await refreshWorkspace()
-    await loadDatabaseBackups()
-    databaseBackupMessage.value = `${result.message}，恢复前状态也已保留`
-  } catch (error) {
-    databaseBackupMessage.value = error instanceof Error ? error.message : '完整备份恢复失败'
-  } finally {
-    databaseBackupBusy.value = false
-  }
-}
-
-/**
- * 在 Finder 中打开当前档案的备份目录。
- *
- * :return: 打开完成后的 Promise。
- */
-async function openDatabaseBackupDirectory(): Promise<void> {
-  try {
-    await window.notesDesktop.openDatabaseBackupDirectory()
-  } catch (error) {
-    databaseBackupMessage.value = error instanceof Error ? error.message : '无法打开备份目录'
-  }
 }
 
 /**
@@ -1613,6 +984,37 @@ async function openSyncSettings(): Promise<void> {
   syncDialogVisible.value = true
 }
 
+/** 加载冲突两侧的完整正文，避免基于工作区摘要执行覆盖操作。 */
+async function loadSelectedConflictDetail(): Promise<void> {
+  const summary = selectedNoteConflict.value
+  const requestId = ++conflictDetailRequestId
+  selectedConflictDetail.value = null
+  if (!summary) return
+  conflictDetailLoading.value = true
+  try {
+    const [conflict, original] = await Promise.all([
+      window.notesDesktop.getNote(summary.conflict.id),
+      window.notesDesktop.getNote(summary.original.id)
+    ])
+    if (requestId !== conflictDetailRequestId) return
+    if (!conflict || !original) throw new Error('冲突版本不存在或已被删除')
+    selectedConflictDetail.value = { conflict, original }
+  } catch (error) {
+    if (requestId === conflictDetailRequestId) {
+      conflictError.value = error instanceof Error ? error.message : '冲突正文加载失败'
+    }
+  } finally {
+    if (requestId === conflictDetailRequestId) conflictDetailLoading.value = false
+  }
+}
+
+/** 切换待处理冲突，并按需读取完整正文。 */
+function selectConflictNote(noteId: string): void {
+  selectedConflictNoteId.value = noteId
+  conflictError.value = ''
+  void loadSelectedConflictDetail()
+}
+
 /** 打开冲突处理中心并默认选中第一项。 */
 function openConflictCenter(): void {
   const firstConflict = noteConflicts.value[0]
@@ -1621,20 +1023,24 @@ function openConflictCenter(): void {
   conflictError.value = ''
   syncDialogVisible.value = false
   conflictCenterVisible.value = true
+  void loadSelectedConflictDetail()
 }
 
 /** 关闭冲突处理中心，可返回同步中心。 */
 function closeConflictCenter(reopenSyncCenter = true): void {
   if (conflictResolving.value) return
   conflictCenterVisible.value = false
+  conflictDetailRequestId += 1
   selectedConflictNoteId.value = ''
+  selectedConflictDetail.value = null
+  conflictDetailLoading.value = false
   conflictError.value = ''
   if (reopenSyncCenter) syncDialogVisible.value = true
 }
 
 /** 应用选定的冲突处理策略并刷新本地工作区。 */
 async function resolveSelectedNoteConflict(strategy: 'local' | 'remote' | 'both'): Promise<void> {
-  const pair = selectedNoteConflict.value
+  const pair = selectedConflictDetail.value
   if (!pair || conflictResolving.value) return
   conflictResolving.value = true
   conflictError.value = ''
@@ -1643,10 +1049,11 @@ async function resolveSelectedNoteConflict(strategy: 'local' | 'remote' | 'both'
     await window.notesDesktop.resolveNoteConflict(pair.conflict.id, strategy)
     await refreshWorkspace()
     const nextConflict = noteConflicts.value[0]
-    if (nextConflict) selectedConflictNoteId.value = nextConflict.conflict.id
+    if (nextConflict) selectConflictNote(nextConflict.conflict.id)
     else {
       conflictCenterVisible.value = false
       selectedConflictNoteId.value = ''
+      selectedConflictDetail.value = null
       syncDialogVisible.value = true
     }
   } catch (error) {
@@ -1836,16 +1243,21 @@ function doesDraftMatchNote(note: OfflineNote): boolean {
  * :return: 草稿加载完成后的 Promise。
  */
 async function loadNoteIntoDraft(note: OfflineNote): Promise<void> {
+  const resolvedNote = note.contentLoaded === false
+    ? await window.notesDesktop.getNote(note.id)
+    : note
+  if (!resolvedNote) throw new Error('笔记不存在或已被删除')
+  if (resolvedNote !== note) replaceNote(resolvedNote)
   closePropertyPickers()
   draftReady = false
-  activeNoteId.value = note.id
-  draft.title = note.title
-  draft.content = note.content
-  draft.folderId = note.folderId
-  draft.tagNames = note.tags.map((tag) => tag.name)
-  draft.isPinned = note.isPinned
-  if (note.folderId) {
-    expandedFolderIds.value = new Set([...expandedFolderIds.value, note.folderId])
+  activeNoteId.value = resolvedNote.id
+  draft.title = resolvedNote.title
+  draft.content = resolvedNote.content
+  draft.folderId = resolvedNote.folderId
+  draft.tagNames = resolvedNote.tags.map((tag) => tag.name)
+  draft.isPinned = resolvedNote.isPinned
+  if (resolvedNote.folderId) {
+    expandedFolderIds.value = new Set([...expandedFolderIds.value, resolvedNote.folderId])
   } else {
     unclassifiedExpanded.value = true
   }
@@ -1861,8 +1273,15 @@ async function loadNoteIntoDraft(note: OfflineNote): Promise<void> {
  * :return: 笔记切换完成后的 Promise。
  */
 async function selectNote(note: OfflineNote): Promise<void> {
+  rememberCurrentNoteScrollPosition()
   await flushSave()
   await loadNoteIntoDraft(note)
+}
+
+/** 把当前编辑器的阅读位置提交给会话状态。 */
+function rememberCurrentNoteScrollPosition(): void {
+  if (!activeNoteId.value || !markdownEditorRef.value) return
+  updateNoteScrollPosition(markdownEditorRef.value.getScrollTop(), activeNoteId.value)
 }
 
 /**
@@ -1874,6 +1293,7 @@ async function selectNote(note: OfflineNote): Promise<void> {
 function applyNoteTabsState(state: NoteTabsState): void {
   openNoteIds.value = state.noteIds
   activeTabNoteId.value = state.activeNoteId
+  pinnedNoteIds.value = pinnedNoteIds.value.filter((noteId) => state.noteIds.includes(noteId))
 }
 
 /**
@@ -1890,7 +1310,7 @@ function syncCurrentNoteTab(noteId: string | null): void {
   applyNoteTabsState(activateNoteInCurrentTab({
     noteIds: openNoteIds.value,
     activeNoteId: activeTabNoteId.value
-  }, noteId))
+  }, noteId, pinnedNoteIds.value))
 }
 
 /**
@@ -1951,6 +1371,8 @@ async function closeNoteTab(noteId: string): Promise<void> {
  */
 async function applyClosedNoteTabs(nextState: NoteTabsState): Promise<void> {
   applyNoteTabsState(nextState)
+  // 标签状态一旦变空就先提交空会话，不能让正文保存或窗口销毁把旧标签留在 SQLite 中。
+  if (!nextState.noteIds.length) await flushWorkspaceSession()
   if (activeNoteId.value === nextState.activeNoteId) return
   const nextNote = workspace.notes.find((note) => note.id === nextState.activeNoteId && !note.isDeleted)
   if (nextNote) {
@@ -1993,8 +1415,60 @@ async function handleNoteTabCloseCommand(command: 'close' | 'others' | 'right'):
   if (!noteId) return
   const state = { noteIds: openNoteIds.value, activeNoteId: activeTabNoteId.value }
   if (command === 'close') await applyClosedNoteTabs(getClosedNoteTabs(state, noteId))
-  if (command === 'others') await applyClosedNoteTabs(closeOtherNoteTabs(state, noteId))
+  if (command === 'others') {
+    await applyClosedNoteTabs(closeOtherNoteTabs(state, noteId, pinnedNoteIds.value))
+  }
   if (command === 'right') await applyClosedNoteTabs(closeNoteTabsToRight(state, noteId))
+}
+
+/** 固定或取消固定右键菜单对应的标签。 */
+function toggleContextNoteTabPin(): void {
+  const noteId = tabContextMenu.noteId
+  tabContextMenu.visible = false
+  if (!noteId) return
+  const state = togglePinnedNoteTab({
+    noteIds: openNoteIds.value,
+    pinnedNoteIds: pinnedNoteIds.value
+  }, noteId)
+  openNoteIds.value = state.noteIds
+  pinnedNoteIds.value = state.pinnedNoteIds
+}
+
+function isNoteTabPinned(noteId: string): boolean {
+  return pinnedNoteIds.value.includes(noteId)
+}
+
+/** 开始拖动标签，排序仅允许在固定组或普通组内部进行。 */
+function startNoteTabDrag(event: DragEvent, noteId: string): void {
+  draggedNoteTabId.value = noteId
+  event.dataTransfer?.setData('text/plain', noteId)
+  if (event.dataTransfer) event.dataTransfer.effectAllowed = 'move'
+}
+
+function dragOverNoteTab(event: DragEvent, noteId: string): void {
+  const sourceNoteId = draggedNoteTabId.value
+  if (!sourceNoteId || isNoteTabPinned(sourceNoteId) !== isNoteTabPinned(noteId)) return
+  event.preventDefault()
+  dragOverNoteTabId.value = noteId
+  if (event.dataTransfer) event.dataTransfer.dropEffect = 'move'
+}
+
+function dropNoteTab(event: DragEvent, targetNoteId: string): void {
+  event.preventDefault()
+  const sourceNoteId = draggedNoteTabId.value
+  if (!sourceNoteId) return finishNoteTabDrag()
+  const state = reorderNoteTabs({
+    noteIds: openNoteIds.value,
+    pinnedNoteIds: pinnedNoteIds.value
+  }, sourceNoteId, targetNoteId)
+  openNoteIds.value = state.noteIds
+  pinnedNoteIds.value = state.pinnedNoteIds
+  finishNoteTabDrag()
+}
+
+function finishNoteTabDrag(): void {
+  draggedNoteTabId.value = null
+  dragOverNoteTabId.value = null
 }
 
 /**
@@ -2127,6 +1601,43 @@ async function flushSave(): Promise<void> {
   await saveDraft()
 }
 
+/** 等待正在执行的 SQLite 写入结束。 */
+async function waitForDraftSave(): Promise<void> {
+  const deadline = Date.now() + 8_000
+  while (saveState.value === 'saving') {
+    if (Date.now() >= deadline) throw new Error('等待当前笔记保存超时')
+    await new Promise((resolve) => setTimeout(resolve, 25))
+  }
+}
+
+/**
+ * 退出应用前把最新草稿确认写入 SQLite。
+ *
+ * :return: 本地数据库内容与草稿一致时完成。
+ */
+async function saveBeforeQuit(): Promise<void> {
+  if (initialWorkspaceLoad) await initialWorkspaceLoad
+  rememberCurrentNoteScrollPosition()
+  if (!draftReady || !activeNoteId.value) {
+    await flushWorkspaceSession()
+    return
+  }
+
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    await waitForDraftSave()
+    if (saveTimer) await flushSave()
+    else await saveDraft()
+    await waitForDraftSave()
+    if (saveState.value === 'error') throw new Error(actionError.value || '当前笔记保存失败')
+    const currentNote = workspace.notes.find((note) => note.id === activeNoteId.value)
+    if (currentNote && !saveTimer && doesDraftMatchNote(currentNote)) {
+      await flushWorkspaceSession()
+      return
+    }
+  }
+  throw new Error('当前笔记仍有未保存的修改，请重试')
+}
+
 /**
  * 打开当前笔记的同步历史版本。
  *
@@ -2134,89 +1645,14 @@ async function flushSave(): Promise<void> {
  */
 async function openNoteHistory(): Promise<void> {
   if (!activeNoteId.value) return
+  await flushSave()
   historyVisible.value = true
-  historyLoading.value = true
-  try {
-    await flushSave()
-    noteHistories.value = await window.notesDesktop.listNoteHistory(activeNoteId.value)
-    selectedHistoryId.value = noteHistories.value[0]?.id ?? null
-  } finally {
-    historyLoading.value = false
-  }
-  await loadSelectedHistory(selectedHistoryId.value)
 }
 
-/**
- * 按需加载选中历史版本的完整正文。
- *
- * :param historyId: 历史版本 ID。
- * :return: 详情加载完成后的 Promise。
- */
-async function loadSelectedHistory(historyId: string | null): Promise<void> {
-  if (!activeNoteId.value || !historyId) return
-  const existing = noteHistories.value.find((history) => history.id === historyId)
-  if (existing?.content) return
-  historyDetailLoading.value = true
-  try {
-    const detail = await window.notesDesktop.getNoteHistory(activeNoteId.value, historyId)
-    if (!detail || selectedHistoryId.value !== historyId) return
-    const index = noteHistories.value.findIndex((history) => history.id === historyId)
-    if (index >= 0) noteHistories.value[index] = detail
-  } finally {
-    if (selectedHistoryId.value === historyId) historyDetailLoading.value = false
-  }
-}
-
-/**
- * 选择历史版本并加载完整正文。
- *
- * :param historyId: 历史版本 ID。
- * :return: 详情加载完成后的 Promise。
- */
-async function selectHistory(historyId: string): Promise<void> {
-  selectedHistoryId.value = historyId
-  await loadSelectedHistory(historyId)
-}
-
-/**
- * 恢复当前选中的历史版本。
- *
- * :return: 恢复完成后的 Promise。
- */
-async function restoreSelectedHistory(): Promise<void> {
-  if (!activeNoteId.value || !selectedHistoryId.value) return
-  const confirmed = await requestConfirmation(
-    '恢复历史版本？',
-    '当前内容会先保存为一条历史记录，然后替换为所选版本。',
-    '恢复版本'
-  )
-  if (!confirmed) return
-  const restored = await window.notesDesktop.restoreNoteHistory(
-    activeNoteId.value,
-    selectedHistoryId.value
-  )
-  if (!restored) return
+/** 将历史模块恢复的笔记写回工作区和当前编辑草稿。 */
+async function applyRestoredHistory(restored: OfflineNote): Promise<void> {
   replaceNote(restored)
   await loadNoteIntoDraft(restored)
-  historyVisible.value = false
-}
-
-/**
- * 删除当前选中的同步历史版本。
- *
- * :return: 删除完成后的 Promise。
- */
-async function deleteSelectedHistory(): Promise<void> {
-  if (!activeNoteId.value || !selectedHistoryId.value) return
-  const confirmed = await requestConfirmation(
-    '删除历史版本？',
-    '这条历史记录会从已同步设备中删除，删除后无法恢复。',
-    '删除版本'
-  )
-  if (!confirmed) return
-  await window.notesDesktop.deleteNoteHistory(activeNoteId.value, selectedHistoryId.value)
-  noteHistories.value = noteHistories.value.filter((history) => history.id !== selectedHistoryId.value)
-  selectedHistoryId.value = noteHistories.value[0]?.id ?? null
 }
 
 /**
@@ -2345,7 +1781,6 @@ function toggleFolderPicker(): void {
   closePropertyPickers()
   folderPickerSearchKeyword.value = ''
   folderPickerVisible.value = nextVisible
-  if (nextVisible) void nextTick(() => folderPickerSearchInput.value?.focus())
 }
 
 /**
@@ -2612,6 +2047,196 @@ async function setNoteDeleted(note: OfflineNote, deleted: boolean): Promise<void
 }
 
 /**
+ * 开关当前筛选结果的批量管理模式。
+ */
+function toggleNoteBatchMode(): void {
+  noteBatchMode.value = !noteBatchMode.value
+  selectedNoteIds.value = new Set()
+  noteBatchPicker.visible = false
+  noteBatchMessage.value = ''
+}
+
+/**
+ * 从笔记右键菜单进入当前筛选的多选模式，并选择当前笔记。
+ */
+function enterNoteBatchModeFromContext(): void {
+  const note = contextMenu.note
+  if (!note) return
+  noteBatchMode.value = true
+  selectedNoteIds.value = new Set([note.id])
+  noteBatchPicker.visible = false
+  noteBatchMessage.value = ''
+  closeContextMenu()
+}
+
+/**
+ * 切换一篇笔记的批量选中状态。
+ */
+function toggleNoteBatchSelection(noteId: string): void {
+  const nextIds = new Set(selectedNoteIds.value)
+  if (nextIds.has(noteId)) nextIds.delete(noteId)
+  else nextIds.add(noteId)
+  selectedNoteIds.value = nextIds
+  noteBatchMessage.value = ''
+}
+
+/**
+ * 全选或取消全选当前筛选结果，不影响其他筛选下已经选中的笔记。
+ */
+function toggleAllVisibleNotes(): void {
+  const nextIds = new Set(selectedNoteIds.value)
+  for (const note of visibleNotes.value) {
+    if (allVisibleNotesSelected.value) nextIds.delete(note.id)
+    else nextIds.add(note.id)
+  }
+  selectedNoteIds.value = nextIds
+}
+
+/**
+ * 在右键菜单旁打开批量移动或标签选择弹层。
+ */
+function openNoteBatchPicker(event: MouseEvent, mode: 'move' | 'add-tag' | 'remove-tag'): void {
+  if (!selectedNoteIds.value.size) return
+  const triggerRect = (event.currentTarget as HTMLElement).getBoundingClientRect()
+  noteBatchDialogMode.value = mode
+  noteBatchSearchKeyword.value = ''
+  closeContextMenu()
+  void positionContextMenuInViewport(
+    () => noteBatchPickerElement.value,
+    noteBatchPicker,
+    triggerRect.right + 6,
+    triggerRect.top
+  )
+}
+
+/**
+ * 在一个本地事务内更新所有选中笔记。
+ */
+async function applyNoteBatchPatch(patch: BulkNotePatch, successMessage: string): Promise<void> {
+  const noteIds = [...selectedNoteIds.value]
+  if (!noteIds.length || noteBatchBusy.value) return
+  noteBatchBusy.value = true
+  noteBatchMessage.value = ''
+  actionError.value = ''
+  try {
+    await flushSave()
+    const updatedNotes = await window.notesDesktop.bulkUpdateNotes(noteIds, patch)
+    for (const note of updatedNotes) replaceNote(note)
+    workspace.pendingCount = Math.max(workspace.pendingCount, 1)
+    const updatedActiveNote = updatedNotes.find((note) => note.id === activeNoteId.value)
+    if (updatedActiveNote && !updatedActiveNote.isDeleted) await loadNoteIntoDraft(updatedActiveNote)
+    if (updatedActiveNote?.isDeleted) {
+      const nextNote = visibleNotes.value.find((note) => !selectedNoteIds.value.has(note.id))
+      if (nextNote) await loadNoteIntoDraft(nextNote)
+      else activeNoteId.value = null
+    }
+    selectedNoteIds.value = new Set()
+    noteBatchPicker.visible = false
+    noteBatchMessage.value = successMessage
+  } catch (error) {
+    noteBatchMessage.value = error instanceof Error ? error.message : '批量操作失败'
+  } finally {
+    noteBatchBusy.value = false
+  }
+}
+
+/**
+ * 应用批量弹层中的文件夹或标签选项。
+ */
+async function chooseNoteBatchTarget(id: string | null, name = ''): Promise<void> {
+  const count = selectedNoteIds.value.size
+  if (noteBatchDialogMode.value === 'move') {
+    await applyNoteBatchPatch({ folderId: id }, `已移动 ${count} 篇笔记`)
+    return
+  }
+  const patch = noteBatchDialogMode.value === 'add-tag'
+    ? { addTagNames: [name] }
+    : { removeTagNames: [name] }
+  await applyNoteBatchPatch(patch, noteBatchDialogMode.value === 'add-tag' ? `已添加标签“${name}”` : `已移除标签“${name}”`)
+}
+
+/**
+ * 将选中笔记移入回收站，确认后一次提交。
+ */
+async function trashSelectedNotes(): Promise<void> {
+  const count = selectedNoteIds.value.size
+  if (!count) return
+  const confirmed = await requestConfirmation(
+    `将选中的 ${count} 篇笔记移入回收站？`,
+    '笔记会保留在回收站中，之后仍可恢复。',
+    '移入回收站'
+  )
+  if (!confirmed) return
+  await applyNoteBatchPatch({ isDeleted: true }, `已将 ${count} 篇笔记移入回收站`)
+}
+
+/**
+ * 将选中的未删除笔记导出为 Markdown ZIP。
+ */
+async function exportSelectedNotes(): Promise<void> {
+  const noteIds = [...selectedNoteIds.value]
+  if (!noteIds.length || noteBatchBusy.value) return
+  noteBatchBusy.value = true
+  noteBatchMessage.value = ''
+  try {
+    await flushSave()
+    const result = await window.notesDesktop.exportSelectedMarkdown(noteIds)
+    if (!result.canceled) noteBatchMessage.value = result.message || `已导出 ${noteIds.length} 篇笔记`
+  } catch (error) {
+    noteBatchMessage.value = error instanceof Error ? error.message : '导出失败'
+  } finally {
+    noteBatchBusy.value = false
+  }
+}
+
+/**
+ * 永久删除所有选中的回收站笔记，并在一个事务内写入同步墓碑。
+ */
+async function deleteSelectedNotesPermanently(): Promise<void> {
+  const noteIds = [...selectedNoteIds.value]
+  if (!noteIds.length || noteBatchBusy.value) return
+  const confirmed = await requestConfirmation(
+    `永久删除选中的 ${noteIds.length} 篇笔记？`,
+    '删除后无法恢复，并会在下次同步时从其他设备删除。',
+    '永久删除'
+  )
+  if (!confirmed) return
+  noteBatchBusy.value = true
+  noteBatchMessage.value = ''
+  try {
+    await flushSave()
+    await window.notesDesktop.bulkUpdateNotes(noteIds, { permanentlyDelete: true })
+    const deletedIds = new Set(noteIds)
+    workspace.notes = workspace.notes.filter((note) => !deletedIds.has(note.id))
+    workspace.pendingCount = Math.max(workspace.pendingCount, 1)
+    if (activeNoteId.value && deletedIds.has(activeNoteId.value)) {
+      const nextNote = visibleNotes.value[0]
+      if (nextNote) await selectNote(nextNote)
+      else activeNoteId.value = null
+    }
+    selectedNoteIds.value = new Set()
+    noteBatchMessage.value = `已永久删除 ${noteIds.length} 篇笔记`
+  } catch (error) {
+    noteBatchMessage.value = error instanceof Error ? error.message : '批量永久删除失败'
+  } finally {
+    noteBatchBusy.value = false
+  }
+}
+
+/**
+ * 执行批量右键菜单中的直接操作。
+ */
+async function handleNoteBatchContextCommand(command: 'pin' | 'unpin' | 'export' | 'trash' | 'restore' | 'delete'): Promise<void> {
+  closeContextMenu()
+  if (command === 'pin') await applyNoteBatchPatch({ isPinned: true }, '已置顶选中笔记')
+  else if (command === 'unpin') await applyNoteBatchPatch({ isPinned: false }, '已取消置顶')
+  else if (command === 'export') await exportSelectedNotes()
+  else if (command === 'restore') await applyNoteBatchPatch({ isDeleted: false }, '已恢复选中笔记')
+  else if (command === 'delete') await deleteSelectedNotesPermanently()
+  else await trashSelectedNotes()
+}
+
+/**
  * 打开应用内确认弹窗并等待用户选择。
  *
  * :param title: 弹窗标题。
@@ -2839,6 +2464,10 @@ function openFolderContextMenu(event: MouseEvent, folder: NoteFolder): void {
  */
 function openNoteContextMenu(event: MouseEvent, note: OfflineNote): void {
   createMenuVisible.value = false
+  noteBatchPicker.visible = false
+  if (noteBatchMode.value && !selectedNoteIds.value.has(note.id)) {
+    selectedNoteIds.value = new Set([note.id])
+  }
   contextMenu.unclassified = false
   contextMenu.folder = null
   contextMenu.note = note
@@ -3161,15 +2790,13 @@ function handleShortcut(event: KeyboardEvent): void {
       return
     }
     generalSettingsVisible.value = false
-    generalShortcutRecording.value = false
-    quickOpenShortcutRecording.value = false
     syncDialogVisible.value = false
     createMenuVisible.value = false
     closeContextMenu()
     closePropertyPickers()
     return
   }
-  if (matchesAppShortcut(event, quickOpenShortcut.value)) {
+  if (matchesShortcut(event, quickOpenShortcut.value)) {
     event.preventDefault()
     openQuickOpen()
     return
@@ -3288,14 +2915,21 @@ watch(activeNoteId, () => {
   Object.assign(noteFindResult, { count: 0, index: -1 })
 })
 watch(activeNoteId, syncCurrentNoteTab)
+watch([openNoteIds, activeTabNoteId, pinnedNoteIds], scheduleWorkspaceSessionSave, { deep: true })
 watch(() => workspace.notes.map((note) => `${note.id}:${note.isDeleted}`).join('|'), () => {
   applyNoteTabsState(reconcileNoteTabs({
     noteIds: openNoteIds.value,
     activeNoteId: activeTabNoteId.value
   }, workspace.notes.filter((note) => !note.isDeleted).map((note) => note.id)))
 })
-watch(quickOpenKeyword, () => {
-  quickOpenActiveIndex.value = 0
+watch(searchKeyword, (keyword) => scheduleWorkspaceSearch(keyword))
+watch(() => workspace.notes.map((note) => `${note.id}:${note.updatedAt}`).join('|'), () => {
+  if (searchKeyword.value.trim()) scheduleWorkspaceSearch(searchKeyword.value)
+})
+watch([() => activeFilter.kind, () => activeFilter.id, searchKeyword], () => {
+  selectedNoteIds.value = new Set()
+  noteBatchPicker.visible = false
+  noteBatchMessage.value = ''
 })
 watch(noteTabBarElement, (element, previousElement) => {
   if (previousElement) noteTabResizeObserver?.unobserve(previousElement)
@@ -3319,6 +2953,14 @@ onMounted(() => {
   window.addEventListener('scroll', hideButtonTooltip, true)
   disposeOpenSyncSettings = window.notesDesktop.onOpenSyncSettings(() => void openSyncSettings())
   disposeOpenNoteLink = window.notesDesktop.onOpenNoteLink((noteId) => void openNoteFromLink(noteId))
+  disposeBeforeQuitSave = window.notesDesktop.onBeforeQuitSave((requestId) => {
+    void saveBeforeQuit()
+      .then(() => window.notesDesktop.completeBeforeQuitSave(requestId, { ok: true }))
+      .catch((error) => window.notesDesktop.completeBeforeQuitSave(requestId, {
+        ok: false,
+        message: error instanceof Error ? error.message : '退出前保存失败'
+      }))
+  })
   disposeCheckForUpdates = window.notesDesktop.onCheckForUpdates((silent) => void runUpdateCheck(silent))
   disposeOpenDataTransfer = window.notesDesktop.onOpenDataTransfer(openDataTransfer)
   disposeOpenGeneralSettings = window.notesDesktop.onOpenGeneralSettings(() => void openGeneralSettings())
@@ -3344,6 +2986,8 @@ onMounted(() => {
     })
 })
 onBeforeUnmount(() => {
+  rememberCurrentNoteScrollPosition()
+  disposeWorkspaceSession()
   noteTabResizeObserver?.disconnect()
   noteTabResizeObserver = null
   window.removeEventListener('keydown', handleShortcut)
@@ -3361,6 +3005,8 @@ onBeforeUnmount(() => {
   disposeOpenSyncSettings = null
   disposeOpenNoteLink?.()
   disposeOpenNoteLink = null
+  disposeBeforeQuitSave?.()
+  disposeBeforeQuitSave = null
   disposeCheckForUpdates?.()
   disposeCheckForUpdates = null
   disposeOpenDataTransfer?.()
@@ -3384,12 +3030,13 @@ onBeforeUnmount(() => {
   if (linkCopyFeedbackTimer) clearTimeout(linkCopyFeedbackTimer)
   if (confirmationResolver) resolveConfirmation(false)
   if (saveTimer) clearTimeout(saveTimer)
+  if (workspaceSearchTimer) clearTimeout(workspaceSearchTimer)
   void saveDraft()
 })
 </script>
 
 <template>
-  <div :class="['desktop-shell', { 'tree-lines-hidden': !showTreeLines }]" @click="createMenuVisible = false; closeContextMenu(); closePropertyPickers(); noteTabOverflowVisible = false; tabContextMenu.visible = false">
+  <div :class="['desktop-shell', { 'tree-lines-hidden': !showTreeLines }]" @click="createMenuVisible = false; closeContextMenu(); closePropertyPickers(); noteBatchPicker.visible = false; noteTabOverflowVisible = false; tabContextMenu.visible = false">
     <Transition name="editor-feedback">
       <div v-if="linkCopyFeedback" class="editor-feedback">{{ linkCopyFeedback }}</div>
     </Transition>
@@ -3513,15 +3160,31 @@ onBeforeUnmount(() => {
           @dragover="handleResourceAutoScroll"
           @dragleave="handleResourceAutoScrollLeave"
         >
+        <div v-if="noteBatchMode" class="note-batch-toolbar">
+          <div class="note-batch-toolbar-head">
+            <strong>批量管理</strong>
+            <span>已选 {{ selectedNoteIds.size }} 篇</span>
+            <button type="button" :disabled="!visibleNotes.length" @click="toggleAllVisibleNotes">
+              {{ allVisibleNotesSelected ? '取消全选' : '全选' }}
+            </button>
+            <button type="button" @click="toggleNoteBatchMode">完成</button>
+          </div>
+          <p v-if="noteBatchMessage">{{ noteBatchMessage }}</p>
+        </div>
         <section
           v-if="!showFilteredResults && activeFilter.kind !== 'trash'"
           class="nav-section explorer-section"
         >
           <div class="nav-heading">
             <span>文件夹</span>
-            <button type="button" aria-label="快捷新建文件夹" @click="openCreateFolderDialog()">
-              <Icon icon="material-symbols:create-new-folder-outline-rounded" />
-            </button>
+            <div class="note-tree-heading-actions">
+              <button v-if="!noteBatchMode" class="note-batch-toggle" type="button" aria-label="批量管理" @click="toggleNoteBatchMode">
+                <Icon icon="tabler:list-check" />
+              </button>
+              <button type="button" aria-label="快捷新建文件夹" @click="openCreateFolderDialog()">
+                <Icon icon="material-symbols:create-new-folder-outline-rounded" />
+              </button>
+            </div>
           </div>
           <div class="nav-scroll-list">
             <div v-if="loading" class="sidebar-placeholder">正在读取本地数据库…</div>
@@ -3544,12 +3207,22 @@ onBeforeUnmount(() => {
                 <article
                   v-for="note in getUnclassifiedNotes()"
                   :key="note.id"
-                  :class="['sidebar-note-row', 'is-nested', { active: note.id === activeNoteId }]"
-                  :draggable="resourceDragEnabled"
+                  :class="['sidebar-note-row', 'is-nested', { active: note.id === activeNoteId, selected: selectedNoteIds.has(note.id) }]"
+                  :draggable="resourceDragEnabled && !noteBatchMode"
                   @dragstart="startResourceDrag($event, { kind: 'note', id: note.id })"
                   @contextmenu.prevent="openNoteContextMenu($event, note)"
                 >
-                  <button class="sidebar-note-main" type="button" @click="selectNote(note)">
+                  <button
+                    v-if="noteBatchMode"
+                    class="sidebar-note-select"
+                    type="button"
+                    :aria-label="selectedNoteIds.has(note.id) ? `取消选择 ${note.title || '无标题笔记'}` : `选择 ${note.title || '无标题笔记'}`"
+                    :aria-pressed="selectedNoteIds.has(note.id)"
+                    @click="toggleNoteBatchSelection(note.id)"
+                  >
+                    <Icon :icon="selectedNoteIds.has(note.id) ? 'tabler:square-check-filled' : 'tabler:square'" />
+                  </button>
+                  <button class="sidebar-note-main" type="button" @click="noteBatchMode ? toggleNoteBatchSelection(note.id) : selectNote(note)">
                     <Icon :icon="note.isPinned
                       ? 'material-symbols:keep-rounded'
                       : 'material-symbols:description-outline-rounded'" />
@@ -3570,11 +3243,14 @@ onBeforeUnmount(() => {
               :active-note-id="activeNoteId"
               :active-folder-id="activeNote?.folderId ?? null"
               :search-keyword="searchKeyword"
-              :drag-enabled="resourceDragEnabled"
+              :drag-enabled="resourceDragEnabled && !noteBatchMode"
               :blocked-folder-ids="blockedFolderDropIds"
+              :batch-mode="noteBatchMode"
+              :selected-note-ids="selectedNoteIds"
               :folder-note-counts="folderNoteCounts"
               @toggle="toggleFolder"
               @select-note="selectNote"
+              @toggle-note-selection="toggleNoteBatchSelection"
               @folder-context="openFolderContextMenu"
               @note-context="openNoteContextMenu"
               @resource-drag-start="startResourceDrag"
@@ -3610,6 +3286,9 @@ onBeforeUnmount(() => {
             <span>已删除项目</span>
             <div class="note-tree-heading-actions">
               <small>{{ trashCount }}</small>
+              <button v-if="!noteBatchMode && trashCount" class="note-batch-toggle" type="button" aria-label="批量管理" @click="toggleNoteBatchMode">
+                <Icon icon="tabler:list-check" />
+              </button>
               <button
                 v-if="recycleItemCount"
                 class="empty-trash-button"
@@ -3637,8 +3316,11 @@ onBeforeUnmount(() => {
               :active-folder-id="null"
               :folder-note-counts="recycleFolderNoteCounts"
               recycle
+              :batch-mode="noteBatchMode"
+              :selected-note-ids="selectedNoteIds"
               @toggle="toggleFolder"
               @select-note="selectNote"
+              @toggle-note-selection="toggleNoteBatchSelection"
               @folder-context="openFolderContextMenu"
               @note-context="openNoteContextMenu"
             />
@@ -3653,10 +3335,20 @@ onBeforeUnmount(() => {
                 <article
                   v-for="note in standaloneDeletedNotes"
                   :key="note.id"
-                  :class="['sidebar-note-row', 'is-nested', { active: note.id === activeNoteId }]"
+                  :class="['sidebar-note-row', 'is-nested', { active: note.id === activeNoteId, selected: selectedNoteIds.has(note.id) }]"
                   @contextmenu.prevent="openNoteContextMenu($event, note)"
                 >
-                  <button class="sidebar-note-main" type="button" @click="selectNote(note)">
+                  <button
+                    v-if="noteBatchMode"
+                    class="sidebar-note-select"
+                    type="button"
+                    :aria-label="selectedNoteIds.has(note.id) ? `取消选择 ${note.title || '无标题笔记'}` : `选择 ${note.title || '无标题笔记'}`"
+                    :aria-pressed="selectedNoteIds.has(note.id)"
+                    @click="toggleNoteBatchSelection(note.id)"
+                  >
+                    <Icon :icon="selectedNoteIds.has(note.id) ? 'tabler:square-check-filled' : 'tabler:square'" />
+                  </button>
+                  <button class="sidebar-note-main" type="button" @click="noteBatchMode ? toggleNoteBatchSelection(note.id) : selectNote(note)">
                     <Icon icon="material-symbols:description-outline-rounded" />
                     <span><strong>{{ note.title || '无标题笔记' }}</strong><small>{{ getNoteExcerpt(note.content) }}</small></span>
                     <time>{{ formatTime(note.updatedAt) }}</time>
@@ -3672,6 +3364,9 @@ onBeforeUnmount(() => {
             <span>{{ filterTitle }}</span>
             <div class="note-tree-heading-actions">
               <small>{{ visibleNotes.length }}</small>
+              <button v-if="!noteBatchMode" class="note-batch-toggle" type="button" aria-label="批量管理" @click="toggleNoteBatchMode">
+                <Icon icon="tabler:list-check" />
+              </button>
             </div>
           </div>
           <div v-if="loading" class="sidebar-placeholder">正在读取本地数据库…</div>
@@ -3682,10 +3377,20 @@ onBeforeUnmount(() => {
             <article
               v-for="note in visibleNotes"
               :key="note.id"
-              :class="['sidebar-note-row', { active: note.id === activeNoteId }]"
+              :class="['sidebar-note-row', { active: note.id === activeNoteId, selected: selectedNoteIds.has(note.id) }]"
               @contextmenu.prevent="openNoteContextMenu($event, note)"
             >
-              <button class="sidebar-note-main" type="button" @click="selectNote(note)">
+              <button
+                v-if="noteBatchMode"
+                class="sidebar-note-select"
+                type="button"
+                :aria-label="selectedNoteIds.has(note.id) ? `取消选择 ${note.title || '无标题笔记'}` : `选择 ${note.title || '无标题笔记'}`"
+                :aria-pressed="selectedNoteIds.has(note.id)"
+                @click="toggleNoteBatchSelection(note.id)"
+              >
+                <Icon :icon="selectedNoteIds.has(note.id) ? 'tabler:square-check-filled' : 'tabler:square'" />
+              </button>
+              <button class="sidebar-note-main" type="button" @click="noteBatchMode ? toggleNoteBatchSelection(note.id) : selectNote(note)">
                 <Icon :icon="note.isPinned ? 'tabler:pinned-filled' : 'tabler:file-text'" />
                 <span>
                   <strong>{{ note.title || '无标题笔记' }}</strong>
@@ -3710,14 +3415,25 @@ onBeforeUnmount(() => {
             <div
               v-for="note in visibleNoteTabs"
               :key="note.id"
-              :class="['note-tab', { active: note.id === activeTabNoteId }]"
+              :class="['note-tab', {
+                active: note.id === activeTabNoteId,
+                pinned: isNoteTabPinned(note.id),
+                dragging: note.id === draggedNoteTabId,
+                'drag-over': note.id === dragOverNoteTabId
+              }]"
+              draggable="true"
               @contextmenu.prevent="openNoteTabContextMenu($event, note.id)"
+              @dragstart="startNoteTabDrag($event, note.id)"
+              @dragover="dragOverNoteTab($event, note.id)"
+              @drop="dropNoteTab($event, note.id)"
+              @dragend="finishNoteTabDrag"
             >
               <button class="note-tab-main" type="button" @click="switchNoteTab(note)">
-                <Icon icon="material-symbols:description-outline-rounded" />
+                <Icon :icon="isNoteTabPinned(note.id) ? 'material-symbols:keep-rounded' : 'material-symbols:description-outline-rounded'" />
                 <span>{{ note.title || '无标题笔记' }}</span>
               </button>
               <button
+                v-if="!isNoteTabPinned(note.id)"
                 class="note-tab-close"
                 type="button"
                 :aria-label="`关闭 ${note.title || '无标题笔记'}`"
@@ -3746,10 +3462,10 @@ onBeforeUnmount(() => {
                 @contextmenu.prevent="openNoteTabContextMenu($event, note.id)"
               >
                 <button type="button" @click="chooseOverflowNoteTab(note)">
-                  <Icon icon="material-symbols:description-outline-rounded" />
+                  <Icon :icon="isNoteTabPinned(note.id) ? 'material-symbols:keep-rounded' : 'material-symbols:description-outline-rounded'" />
                   <span>{{ note.title || '无标题笔记' }}</span>
                 </button>
-                <button type="button" :aria-label="`关闭 ${note.title || '无标题笔记'}`" @click="closeNoteTab(note.id)">
+                <button v-if="!isNoteTabPinned(note.id)" type="button" :aria-label="`关闭 ${note.title || '无标题笔记'}`" @click="closeNoteTab(note.id)">
                   <Icon icon="material-symbols:close-rounded" />
                 </button>
               </div>
@@ -3794,38 +3510,15 @@ onBeforeUnmount(() => {
                   >
                     <Icon icon="material-symbols:folder-outline-rounded" /><span>{{ currentFolderName }}</span><Icon icon="material-symbols:keyboard-arrow-down-rounded" />
                   </button>
-                  <div v-if="folderPickerVisible" class="property-popover folder-picker-menu" role="listbox" aria-label="选择文件夹">
-                    <div class="property-popover-title"><span>移动到文件夹</span><small>{{ folderOptions.length }} 个</small></div>
-                    <label class="folder-picker-search">
-                      <Icon icon="material-symbols:search-rounded" />
-                      <input
-                        ref="folderPickerSearchInput"
-                        v-model="folderPickerSearchKeyword"
-                        type="search"
-                        placeholder="搜索文件夹"
-                        aria-label="搜索文件夹"
-                      />
-                    </label>
-                    <button :class="['folder-picker-option', { selected: draft.folderId === null }]" type="button" role="option" :aria-selected="draft.folderId === null" @click="selectDraftFolder(null)">
-                      <Icon icon="tabler:folder-question" /><span>未分类</span><Icon v-if="draft.folderId === null" icon="material-symbols:check-rounded" />
-                    </button>
-                    <div class="property-popover-divider"></div>
-                    <div class="folder-picker-scroll">
-                      <button
-                        v-for="folder in filteredFolderOptions"
-                        :key="folder.id"
-                        :class="['folder-picker-option', { selected: draft.folderId === folder.id }]"
-                        :style="{ '--folder-depth': folder.depth }"
-                        type="button"
-                        role="option"
-                        :aria-selected="draft.folderId === folder.id"
-                        @click="selectDraftFolder(folder.id)"
-                      >
-                        <Icon icon="material-symbols:folder-outline-rounded" /><span>{{ folder.name }}</span><Icon v-if="draft.folderId === folder.id" icon="material-symbols:check-rounded" />
-                      </button>
-                      <p v-if="!filteredFolderOptions.length" class="folder-picker-empty">没有匹配的文件夹</p>
-                    </div>
-                  </div>
+                  <FolderPickerPopover
+                    v-if="folderPickerVisible"
+                    v-model:search-keyword="folderPickerSearchKeyword"
+                    class="folder-picker-menu"
+                    :count-label="`${folderOptions.length} 个`"
+                    :folders="folderOptions"
+                    :selected-folder-id="draft.folderId"
+                    @select="selectDraftFolder"
+                  />
                 </div>
               </div>
 
@@ -3891,8 +3584,10 @@ onBeforeUnmount(() => {
             <MarkdownVisualEditor
               ref="markdownEditorRef"
               :document-id="activeNote.id"
+              :scroll-top="noteScrollTops[activeNote.id] ?? 0"
               :value="draft.content"
               @change="updateDraftContent"
+              @scroll-position-change="updateNoteScrollPosition"
             />
           </div>
         </template>
@@ -3948,7 +3643,48 @@ onBeforeUnmount(() => {
           <Icon icon="material-symbols:delete-outline-rounded" /><span>删除标签</span>
         </button>
       </template>
+      <template v-else-if="contextMenu.note && noteBatchMode && selectedNoteIds.has(contextMenu.note.id)">
+        <div class="batch-context-menu-heading">已选 {{ selectedNoteIds.size }} 篇笔记</div>
+        <template v-if="contextMenu.note.isDeleted">
+          <button type="button" role="menuitem" @click="handleNoteBatchContextCommand('restore')">
+            <Icon icon="material-symbols:restore-from-trash-outline-rounded" /><span>恢复所选</span>
+          </button>
+          <div class="context-menu-divider"></div>
+          <button class="danger" type="button" role="menuitem" @click="handleNoteBatchContextCommand('delete')">
+            <Icon icon="material-symbols:delete-forever-rounded" /><span>永久删除</span>
+          </button>
+        </template>
+        <template v-else>
+          <button type="button" role="menuitem" @click="openNoteBatchPicker($event, 'move')">
+            <Icon icon="tabler:folder-share" /><span>移动到…</span>
+          </button>
+          <button type="button" role="menuitem" @click="openNoteBatchPicker($event, 'add-tag')">
+            <Icon icon="tabler:tag-plus" /><span>添加标签…</span>
+          </button>
+          <button type="button" role="menuitem" @click="openNoteBatchPicker($event, 'remove-tag')">
+            <Icon icon="tabler:tag-minus" /><span>移除标签…</span>
+          </button>
+          <div class="context-menu-divider"></div>
+          <button type="button" role="menuitem" @click="handleNoteBatchContextCommand('pin')">
+            <Icon icon="tabler:pinned" /><span>置顶</span>
+          </button>
+          <button type="button" role="menuitem" @click="handleNoteBatchContextCommand('unpin')">
+            <Icon icon="tabler:pinned-off" /><span>取消置顶</span>
+          </button>
+          <button type="button" role="menuitem" @click="handleNoteBatchContextCommand('export')">
+            <Icon icon="tabler:download" /><span>导出所选</span>
+          </button>
+          <div class="context-menu-divider"></div>
+          <button class="danger" type="button" role="menuitem" @click="handleNoteBatchContextCommand('trash')">
+            <Icon icon="tabler:trash" /><span>移入回收站</span>
+          </button>
+        </template>
+      </template>
       <template v-else-if="contextMenu.note && !contextMenu.note.isDeleted">
+        <button type="button" role="menuitem" @click="enterNoteBatchModeFromContext">
+          <Icon icon="tabler:square-check" /><span>选择</span>
+        </button>
+        <div class="context-menu-divider"></div>
         <button type="button" role="menuitem" @click="openContextNoteInNewTab">
           <Icon icon="material-symbols:tab-new-right-outline-rounded" /><span>在新标签页打开</span>
         </button>
@@ -3969,6 +3705,10 @@ onBeforeUnmount(() => {
         </button>
       </template>
       <template v-else-if="contextMenu.note">
+        <button type="button" role="menuitem" @click="enterNoteBatchModeFromContext">
+          <Icon icon="tabler:square-check" /><span>选择</span>
+        </button>
+        <div class="context-menu-divider"></div>
         <button type="button" role="menuitem" @click="handleNoteContextCommand('restore')">
           <Icon icon="material-symbols:restore-from-trash-outline-rounded" /><span>恢复</span>
         </button>
@@ -3980,6 +3720,48 @@ onBeforeUnmount(() => {
     </div>
 
     <div
+      v-if="noteBatchPicker.visible"
+      ref="noteBatchPickerElement"
+      class="note-batch-picker-positioner"
+      role="dialog"
+      aria-label="选择批量操作目标"
+      :style="{ left: `${noteBatchPicker.x}px`, top: `${noteBatchPicker.y}px` }"
+      @click.stop
+    >
+      <FolderPickerPopover
+        v-if="noteBatchDialogMode === 'move'"
+        v-model:search-keyword="noteBatchSearchKeyword"
+        class="note-batch-picker"
+        :count-label="`${selectedNoteIds.size} 篇`"
+        :folders="folderOptions"
+        :disabled="noteBatchBusy"
+        @select="chooseNoteBatchTarget"
+      />
+      <div v-else class="property-popover note-batch-picker">
+        <div class="property-popover-title">
+          <span>{{ noteBatchDialogMode === 'add-tag' ? '添加标签' : '移除标签' }}</span>
+          <small>{{ selectedNoteIds.size }} 篇</small>
+        </div>
+        <label class="tag-picker-search">
+          <Icon icon="tabler:search" />
+          <input v-model="noteBatchSearchKeyword" autofocus type="search" placeholder="搜索标签" />
+        </label>
+        <div class="tag-picker-options" role="listbox">
+          <button
+            v-for="item in filteredNoteBatchTags"
+            :key="item.id"
+            type="button"
+            :disabled="noteBatchBusy"
+            @click="chooseNoteBatchTarget(item.id, item.name)"
+          >
+            <Icon icon="tabler:tag" /><span>{{ item.name }}</span>
+          </button>
+          <p v-if="!filteredNoteBatchTags.length" class="folder-picker-empty">没有匹配的标签</p>
+        </div>
+      </div>
+    </div>
+
+    <div
       v-if="tabContextMenu.visible"
       ref="noteTabContextMenuElement"
       class="resource-context-menu note-tab-context-menu"
@@ -3987,6 +3769,19 @@ onBeforeUnmount(() => {
       :style="{ left: `${tabContextMenu.x}px`, top: `${tabContextMenu.y}px` }"
       @click.stop
     >
+      <button
+        v-if="tabContextMenu.noteId && !isNoteTabPinned(tabContextMenu.noteId)"
+        type="button"
+        role="menuitem"
+        @click="toggleContextNoteTabPin"
+      >
+        <Icon icon="material-symbols:keep-rounded" />
+        <span>固定标签</span>
+      </button>
+      <button v-else type="button" role="menuitem" @click="toggleContextNoteTabPin">
+        <Icon icon="material-symbols:keep-off-rounded" />
+        <span>取消固定</span>
+      </button>
       <button type="button" role="menuitem" @click="handleNoteTabCloseCommand('close')">
         <Icon icon="material-symbols:close-rounded" /><span>关闭标签</span>
       </button>
@@ -4059,122 +3854,20 @@ onBeforeUnmount(() => {
       </form>
     </div>
 
-    <div v-if="quickOpenVisible" class="dialog-backdrop quick-open-backdrop" @click.self="quickOpenVisible = false">
-      <section class="quick-open-dialog" role="dialog" aria-modal="true" aria-label="快速打开笔记">
-        <button class="dialog-close-button" type="button" aria-label="关闭快速打开窗口" @click="quickOpenVisible = false"><Icon icon="tabler:x" /></button>
-        <div class="quick-open-search">
-          <Icon icon="tabler:search" />
-          <input
-            ref="quickOpenInput"
-            v-model="quickOpenKeyword"
-            placeholder="搜索标题、正文、标签或文件夹"
-            autocomplete="off"
-            @keydown="handleQuickOpenKeydown"
-          />
-          <kbd>Esc</kbd>
-        </div>
-        <div v-if="!quickOpenKeyword && quickOpenHistory.length" class="quick-open-history">
-          <span>最近搜索</span>
-          <button
-            v-for="keyword in quickOpenHistory"
-            :key="keyword"
-            type="button"
-            @click="applyQuickOpenHistory(keyword)"
-          >
-            {{ keyword }}
-          </button>
-        </div>
-        <div ref="quickOpenResultsElement" class="quick-open-results" role="listbox" aria-label="笔记搜索结果">
-          <button
-            v-for="(result, index) in quickOpenResults"
-            :key="result.note.id"
-            :class="{ active: index === quickOpenActiveIndex }"
-            type="button"
-            role="option"
-            :aria-selected="index === quickOpenActiveIndex"
-            @mouseenter="quickOpenActiveIndex = index"
-            @click="chooseQuickOpenResult(result)"
-          >
-            <Icon icon="tabler:file-text" />
-            <span>
-              <strong>{{ result.note.title || '无标题笔记' }}</strong>
-              <small>{{ result.excerpt || '暂无正文内容' }}</small>
-            </span>
-            <em>{{ result.folderPath }}</em>
-          </button>
-          <div v-if="!quickOpenResults.length" class="quick-open-empty">
-            <Icon icon="tabler:file-search" />
-            没有找到匹配的笔记
-          </div>
-        </div>
-        <footer>
-          <span><kbd>↑</kbd><kbd>↓</kbd> 选择</span>
-          <span><kbd>Enter</kbd> 打开</span>
-          <small v-if="!quickOpenKeyword">最近更新的笔记</small>
-        </footer>
-      </section>
-    </div>
+    <QuickOpenDialog
+      v-model:visible="quickOpenVisible"
+      :folders="workspace.folders"
+      :tags="workspace.tags"
+      :notes="workspace.notes"
+      @select="chooseQuickOpenResult"
+    />
 
-    <div v-if="generalSettingsVisible" class="dialog-backdrop" @click.self="generalSettingsVisible = false">
-      <form class="folder-dialog general-settings-dialog" aria-label="通用设置" @submit.prevent="saveGeneralSettings">
-        <button class="dialog-close-button" type="button" aria-label="关闭通用设置" :disabled="generalSettingsSaving" @click="generalSettingsVisible = false"><Icon icon="tabler:x" /></button>
-        <div class="dialog-icon"><Icon icon="tabler:settings" /></div>
-        <h2>通用设置</h2>
-        <p>配置快速记录和笔记列表的显示方式。</p>
-        <div class="general-settings-list">
-          <section class="general-setting-item">
-            <div>
-              <strong>快速记录快捷键</strong>
-              <small>在其他应用中也可以呼出快速记录窗口</small>
-            </div>
-            <button
-              :class="['general-shortcut-recorder', { recording: generalShortcutRecording }]"
-              type="button"
-              @click="generalShortcutRecording = true"
-              @keydown="recordGeneralShortcut"
-            >
-              {{ generalShortcutRecording ? '请按快捷键…' : formatGeneralShortcut(generalShortcut) }}
-            </button>
-          </section>
-          <section class="general-setting-item">
-            <div>
-              <strong>快速打开快捷键</strong>
-              <small>仅在心悦笔记处于前台时搜索整个笔记库</small>
-            </div>
-            <button
-              :class="['general-shortcut-recorder', { recording: quickOpenShortcutRecording }]"
-              type="button"
-              @click="quickOpenShortcutRecording = true"
-              @keydown="recordQuickOpenShortcut"
-            >
-              {{ quickOpenShortcutRecording ? '请按快捷键…' : formatGeneralShortcut(draftQuickOpenShortcut) }}
-            </button>
-          </section>
-          <section class="general-setting-item">
-            <div>
-              <strong>文件夹树连接线</strong>
-              <small>显示侧边栏文件夹层级之间的辅助线</small>
-            </div>
-            <button
-              :class="['general-setting-switch', { active: draftShowTreeLines }]"
-              type="button"
-              role="switch"
-              :aria-checked="draftShowTreeLines"
-              @click="draftShowTreeLines = !draftShowTreeLines"
-            >
-              <span></span>
-            </button>
-          </section>
-        </div>
-        <p v-if="generalSettingsMessage" class="general-settings-message">{{ generalSettingsMessage }}</p>
-        <div class="general-settings-actions">
-          <button type="button" :disabled="generalSettingsSaving" @click="generalSettingsVisible = false">取消</button>
-          <button class="primary" type="submit" :disabled="generalSettingsSaving">
-            {{ generalSettingsSaving ? '保存中…' : '保存设置' }}
-          </button>
-        </div>
-      </form>
-    </div>
+    <GeneralSettingsDialog
+      v-model:visible="generalSettingsVisible"
+      :quick-open-shortcut="quickOpenShortcut"
+      :show-tree-lines="showTreeLines"
+      @saved="applyGeneralSettings"
+    />
 
     <div v-if="syncDialogVisible" class="dialog-backdrop sync-dialog-backdrop" @click.self="syncDialogVisible = false">
       <form class="folder-dialog sync-dialog sync-center-dialog" @submit.prevent="saveSyncSettings">
@@ -4374,30 +4067,31 @@ onBeforeUnmount(() => {
               :key="pair.conflict.id"
               :class="{ active: pair.conflict.id === selectedNoteConflict.conflict.id }"
               type="button"
-              @click="selectedConflictNoteId = pair.conflict.id"
+              @click="selectConflictNote(pair.conflict.id)"
             >
               <Icon icon="tabler:file-alert" />
               <span><strong>{{ pair.original.title }}</strong><small>{{ formatTime(pair.conflict.updatedAt) }}</small></span>
             </button>
           </aside>
 
-          <div class="conflict-compare-grid">
+          <div v-if="conflictDetailLoading" class="history-empty">正在读取冲突完整正文…</div>
+          <div v-else-if="selectedConflictDetail" class="conflict-compare-grid">
             <article class="conflict-version local">
               <div class="conflict-version-heading">
                 <span><Icon icon="tabler:device-laptop" /></span>
-                <div><strong>本地冲突版本</strong><small>{{ selectedNoteConflict.conflict.title }}</small></div>
+                <div><strong>本地冲突版本</strong><small>{{ selectedConflictDetail.conflict.title }}</small></div>
               </div>
               <div class="conflict-version-content">
-                <MarkdownVisualEditor :value="selectedNoteConflict.conflict.content" readonly :show-toolbar="false" :show-outline="false" />
+                <MarkdownVisualEditor :value="selectedConflictDetail.conflict.content" readonly :show-toolbar="false" :show-outline="false" />
               </div>
             </article>
             <article class="conflict-version remote">
               <div class="conflict-version-heading">
                 <span><Icon icon="tabler:cloud" /></span>
-                <div><strong>当前云端版本</strong><small>{{ selectedNoteConflict.original.title }}</small></div>
+                <div><strong>当前云端版本</strong><small>{{ selectedConflictDetail.original.title }}</small></div>
               </div>
               <div class="conflict-version-content">
-                <MarkdownVisualEditor :value="selectedNoteConflict.original.content" readonly :show-toolbar="false" :show-outline="false" />
+                <MarkdownVisualEditor :value="selectedConflictDetail.original.content" readonly :show-toolbar="false" :show-outline="false" />
               </div>
             </article>
           </div>
@@ -4406,9 +4100,9 @@ onBeforeUnmount(() => {
         <p v-if="conflictError" class="conflict-center-error"><Icon icon="tabler:alert-circle" />{{ conflictError }}</p>
         <footer>
           <span>处理后将自动进入同步队列</span>
-          <button type="button" :disabled="conflictResolving || !selectedNoteConflict" @click="resolveSelectedNoteConflict('local')">保留本地</button>
-          <button type="button" :disabled="conflictResolving || !selectedNoteConflict" @click="resolveSelectedNoteConflict('remote')">采用云端</button>
-          <button class="primary" type="button" :disabled="conflictResolving || !selectedNoteConflict" @click="resolveSelectedNoteConflict('both')">
+          <button type="button" :disabled="conflictResolving || conflictDetailLoading || !selectedConflictDetail" @click="resolveSelectedNoteConflict('local')">保留本地</button>
+          <button type="button" :disabled="conflictResolving || conflictDetailLoading || !selectedConflictDetail" @click="resolveSelectedNoteConflict('remote')">采用云端</button>
+          <button class="primary" type="button" :disabled="conflictResolving || conflictDetailLoading || !selectedConflictDetail" @click="resolveSelectedNoteConflict('both')">
             {{ conflictResolving ? '处理中…' : '两份都保留' }}
           </button>
         </footer>
@@ -4640,59 +4334,12 @@ onBeforeUnmount(() => {
       </section>
     </div>
 
-    <div v-if="historyVisible" class="dialog-backdrop" @click.self="historyVisible = false">
-      <section class="history-dialog" role="dialog" aria-modal="true" aria-label="笔记历史记录">
-        <header>
-          <div>
-            <Icon icon="tabler:history" />
-            <div><h2>历史记录</h2><p>最多保留 50 个同步版本</p></div>
-          </div>
-          <button type="button" aria-label="关闭历史记录" @click="historyVisible = false">
-            <Icon icon="tabler:x" />
-          </button>
-        </header>
-        <div v-if="historyLoading" class="history-empty">正在读取历史记录…</div>
-        <div v-else-if="!noteHistories.length" class="history-empty">
-          修改正文后会自动生成历史版本
-        </div>
-        <div v-else class="history-layout">
-          <aside class="history-list">
-            <button
-              v-for="history in noteHistories"
-              :key="history.id"
-              :class="{ active: history.id === selectedHistoryId }"
-              type="button"
-              @click="selectHistory(history.id)"
-            >
-              <strong>{{ history.title || '无标题笔记' }}</strong>
-              <small>{{ history.contentPreview }}</small>
-              <time>{{ formatTime(history.createdAt) }}</time>
-            </button>
-          </aside>
-          <article v-if="selectedHistory" class="history-preview">
-            <h3>{{ selectedHistory.title || '无标题笔记' }}</h3>
-            <div v-if="historyDetailLoading || !selectedHistory.content" class="history-empty">正在读取版本内容…</div>
-            <div v-else class="history-editor-preview">
-              <MarkdownVisualEditor
-                :key="selectedHistory.id"
-                :value="selectedHistory.content"
-                readonly
-                :show-toolbar="false"
-                :show-outline="false"
-              />
-            </div>
-          </article>
-        </div>
-        <footer>
-          <button class="danger" type="button" :disabled="!selectedHistory" @click="deleteSelectedHistory">
-            删除版本
-          </button>
-          <button class="primary" type="button" :disabled="!selectedHistory" @click="restoreSelectedHistory">
-            恢复此版本
-          </button>
-        </footer>
-      </section>
-    </div>
+    <NoteHistoryDialog
+      v-model:visible="historyVisible"
+      :note-id="activeNoteId"
+      :confirm="requestConfirmation"
+      @restored="applyRestoredHistory"
+    />
 
     <div v-if="confirmationDialog.visible" class="dialog-backdrop confirmation-backdrop" @click.self="resolveConfirmation(false)">
       <section class="folder-dialog confirmation-dialog" role="alertdialog" aria-modal="true" :aria-labelledby="'confirmation-dialog-title'">
