@@ -288,6 +288,26 @@ export interface WorkspaceSessionInput {
   activeNoteId: string | null
 }
 
+export type AiAssistantScope = 'current' | 'folder' | 'all'
+
+export interface AiAssistantSettings {
+  baseUrl: string
+  model: string
+  hasApiKey: boolean
+}
+
+export interface AiAssistantSource {
+  id: string
+  noteId: string
+  title: string
+  excerpt: string
+}
+
+export interface AiAssistantAnswer {
+  answer: string
+  sources: AiAssistantSource[]
+}
+
 export interface NotesDesktopApi {
   listWorkspace(): Promise<WorkspaceData>
   getWorkspaceSession(): Promise<WorkspaceSession>
@@ -304,6 +324,21 @@ export interface NotesDesktopApi {
     updatedAfter?: string
     pinnedOnly?: boolean
   }): Promise<OfflineNote[]>
+  /** 读取不包含 API Key 明文的 AI 助手设置。 */
+  getAiAssistantSettings(): Promise<AiAssistantSettings>
+  /** 保存 OpenAI 兼容接口设置；空密钥表示保留已有密钥。 */
+  saveAiAssistantSettings(input: {
+    baseUrl: string
+    model: string
+    apiKey?: string
+  }): Promise<AiAssistantSettings>
+  /** 基于有限的本地笔记上下文请求 AI 回答。 */
+  askAiAssistant(input: {
+    question: string
+    scope: AiAssistantScope
+    noteId?: string | null
+    folderId?: string | null
+  }): Promise<AiAssistantAnswer>
   /** 打开指定笔记。 */
   openNoteLink(noteId: string): Promise<boolean>
   /** 获取冷启动期间待打开的笔记 ID。 */

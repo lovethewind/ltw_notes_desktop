@@ -107,8 +107,16 @@ function registerApplicationHandlers(ipcMain, domain) {
   ipcMain.handle("app-update:open-download", (_event, downloadUrl) => domain.openUpdateDownload(downloadUrl))
 }
 
+/** 注册 AI 助手设置与问答接口，密钥和网络请求只停留在主进程。 */
+function registerAiAssistantHandlers(ipcMain, domain) {
+  ipcMain.handle("ai-assistant:settings:get", domain.getSettings)
+  ipcMain.handle("ai-assistant:settings:save", (_event, input) => domain.saveSettings(input || {}))
+  ipcMain.handle("ai-assistant:ask", (_event, input) => domain.ask(input || {}))
+}
+
 function registerIpcHandlers(ipcMain, domains) {
   registerApplicationHandlers(ipcMain, domains.application)
+  registerAiAssistantHandlers(ipcMain, domains.aiAssistant)
   registerWorkspaceHandlers(ipcMain, domains.workspace)
   registerAttachmentHandlers(ipcMain, domains.attachments)
   registerNoteHandlers(ipcMain, domains.notes)

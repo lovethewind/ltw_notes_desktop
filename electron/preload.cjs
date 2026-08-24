@@ -9,6 +9,9 @@ contextBridge.exposeInMainWorld("notesDesktop", {
   ),
   getNote: (noteId) => ipcRenderer.invoke("note:detail", noteId),
   searchNotes: (keyword, options) => ipcRenderer.invoke("note:search", keyword, options),
+  getAiAssistantSettings: () => ipcRenderer.invoke("ai-assistant:settings:get"),
+  saveAiAssistantSettings: (input) => ipcRenderer.invoke("ai-assistant:settings:save", input),
+  askAiAssistant: (input) => ipcRenderer.invoke("ai-assistant:ask", input),
   /** @param {string} noteId 笔记 ID；@returns {Promise<boolean>} 是否已发起打开。 */
   openNoteLink: (noteId) => ipcRenderer.invoke("note-link:open-local", noteId),
   /** @returns {Promise<string>} 返回冷启动期间待打开的笔记 ID。 */

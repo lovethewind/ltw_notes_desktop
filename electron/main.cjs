@@ -33,6 +33,7 @@ const {
   shouldConfirmLocalProfileTransfer
 } = require("./profile-storage.cjs")
 const { checkForUpdates } = require("./app-update.cjs")
+const { createAiAssistant } = require("./ai-assistant.cjs")
 const {
   createDatabaseBackupManager,
   restoreProfileSnapshot
@@ -1867,6 +1868,16 @@ async function handleAppDeepLink(rawUrl) {
  * @returns {void}
  */
 function registerIpcHandlers() {
+  const aiAssistant = createAiAssistant({
+    settingsPath: path.join(app.getPath("userData"), "ai-settings.json"),
+    encryptSecret: encryptSyncToken,
+    decryptSecret: decryptSyncToken,
+    repository,
+    request: (url, options) => net.fetch(url, {
+      ...options,
+      bypassCustomProtocolHandlers: true
+    })
+  })
   registerFeatureIpcHandlers(ipcMain, {
     application: {
       completeQuitSave: (requestId, result) => quitSaveCoordinator.complete(requestId, result),
@@ -1887,6 +1898,7 @@ function registerIpcHandlers() {
         return shell.openExternal(parsedUrl.toString())
       }
     },
+    aiAssistant,
     workspace: {
       listWorkspace: () => repository.listWorkspace(),
       getSession: () => repository.getWorkspaceSession(),

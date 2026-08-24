@@ -55,6 +55,7 @@ const MarkdownVisualEditor = defineAsyncComponent(() => import('./components/Mar
 const QuickOpenDialog = defineAsyncComponent(() => import('./components/QuickOpenDialog.vue'))
 const NoteHistoryDialog = defineAsyncComponent(() => import('./components/NoteHistoryDialog.vue'))
 const GeneralSettingsDialog = defineAsyncComponent(() => import('./components/GeneralSettingsDialog.vue'))
+const AiAssistantPanel = defineAsyncComponent(() => import('./components/AiAssistantPanel.vue'))
 
 type FilterKind = 'all' | 'pinned' | 'trash' | 'folder' | 'tag'
 type SaveState = 'idle' | 'saving' | 'saved' | 'error'
@@ -161,6 +162,7 @@ const conflictResolving = ref(false)
 const conflictError = ref('')
 let conflictDetailRequestId = 0
 const generalSettingsVisible = ref(false)
+const aiAssistantVisible = ref(false)
 const quickOpenVisible = ref(false)
 const quickOpenShortcut = ref(window.localStorage.getItem('notes-quick-open-shortcut') || 'CommandOrControl+O')
 const storedShowTreeLines = window.localStorage.getItem('notes-show-tree-lines')
@@ -819,18 +821,46 @@ function applyGeneralSettings(settings: GeneralSettingsResult): void {
   showTreeLines.value = settings.showTreeLines
 }
 
-/** 定位附件引用的笔记，供附件管理模块复用主工作区导航。 */
-async function locateAttachmentNote(reference: AttachmentNoteReference): Promise<boolean> {
-  let note = workspace.notes.find((item) => item.id === reference.id)
+/** 查询工作区笔记；本地列表缺失时只刷新一次，集中复用定位流程。 */
+async function findWorkspaceNote(noteId: string, includeDeleted: boolean): Promise<OfflineNote | undefined> {
+  let note = workspace.notes.find((item) => item.id === noteId && (includeDeleted || !item.isDeleted))
   if (!note) {
     await refreshWorkspace()
-    note = workspace.notes.find((item) => item.id === reference.id)
+    note = workspace.notes.find((item) => item.id === noteId && (includeDeleted || !item.isDeleted))
   }
+  return note
+}
+
+/** 定位附件引用的笔记，供附件管理模块复用主工作区导航。 */
+async function locateAttachmentNote(reference: AttachmentNoteReference): Promise<boolean> {
+  const note = await findWorkspaceNote(reference.id, true)
   if (!note) return false
   searchKeyword.value = ''
   setFilter(note.isDeleted ? 'trash' : 'all')
   await selectNote(note)
   return true
+}
+
+/** 打开 AI 回答引用的原笔记，复用既有关键导航入口而不改变其行为。 */
+async function openAiAssistantSource(noteId: string): Promise<void> {
+  const note = await findWorkspaceNote(noteId, false)
+  if (!note) {
+    actionError.value = '引用笔记已不存在'
+    return
+  }
+  searchKeyword.value = ''
+  setFilter('all')
+  await selectNote(note)
+}
+
+/** 打开 AI 助手前刷新防抖草稿，确保主进程读取到当前编辑内容。 */
+async function toggleAiAssistant(): Promise<void> {
+  if (aiAssistantVisible.value) {
+    aiAssistantVisible.value = false
+    return
+  }
+  if (activeNote.value) await flushSave()
+  aiAssistantVisible.value = true
 }
 
 /**
@@ -3057,6 +3087,17 @@ onBeforeUnmount(() => {
             <Icon :icon="option.icon" />
           </button>
         </div>
+        <button
+          class="ai-assistant-global-button"
+          :class="{ active: aiAssistantVisible }"
+          type="button"
+          :aria-pressed="aiAssistantVisible"
+          aria-label="AI 笔记助手"
+          data-tooltip="AI 笔记助手"
+          @click.stop="toggleAiAssistant"
+        >
+          <Icon icon="tabler:sparkles" />
+        </button>
         <div class="sync-control">
           <button
             class="sync-state"
@@ -3597,6 +3638,14 @@ onBeforeUnmount(() => {
           <p>所有内容优先保存在本机，没有网络也不会中断。</p>
           <button type="button" @click="createNote"><Icon icon="tabler:plus" />新建第一篇笔记</button>
         </div>
+        <AiAssistantPanel
+          :visible="aiAssistantVisible"
+          :current-note-id="activeNote?.id ?? null"
+          :current-folder-id="activeNote?.folderId ?? null"
+          :current-note-title="activeNote?.title ?? ''"
+          @close="aiAssistantVisible = false"
+          @open-source="openAiAssistantSource"
+        />
       </section>
     </main>
 
