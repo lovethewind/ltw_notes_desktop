@@ -1163,3 +1163,18 @@ test("笔记正文保存会按UTF-8字节数限制为15MiB", () => {
     )
   })
 })
+
+test("反向链接识别桌面内部链接的旧版与新版格式", () => {
+  withRepository((repository) => {
+    const source = repository.createNote(null)
+    const target = repository.createNote(null)
+
+    // 新版 https://xinyue-note.local/{noteId}
+    repository.updateNote(source.id, { content: `新格式 [目标](https://xinyue-note.local/${target.id})` })
+    assert.ok(repository.getBacklinks(target.id).some((item) => item.id === source.id))
+
+    // 旧版 xinyue-notes://note/{noteId} 仍应兼容
+    repository.updateNote(source.id, { content: `旧格式 [目标](xinyue-notes://note/${target.id})` })
+    assert.ok(repository.getBacklinks(target.id).some((item) => item.id === source.id))
+  })
+})

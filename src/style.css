@@ -537,6 +537,10 @@ body.is-link-modifier-active .milkdown-editor-root a[href] { cursor: pointer; }
 .markdown-outline-item:hover { background: #edf5ff; color: #315f96; }
 .markdown-outline-item.is-active { background: #e1efff; color: var(--blue); font-weight: 750; }
 .markdown-outline__empty { padding: 24px 12px; color: #98a5b5; font-size: 13px; text-align: center; }
+.markdown-backlinks-section { border-top: 1px solid var(--line, #e8eef5); padding-top: 6px; }
+.markdown-backlinks-section__toggle { width: 100%; display: flex; align-items: center; gap: 6px; padding: 8px 12px; border: 0; background: transparent; color: var(--muted, #78869b); cursor: pointer; font-size: 13px; font-weight: 600; text-align: left; }
+.markdown-backlinks-section__toggle svg { width: 16px; height: 16px; color: var(--blue, #2f80ed); }
+.markdown-backlinks-section__toggle:hover { color: var(--blue, #2f80ed); }
 .milkdown-editor-shell.is-toolbar-hidden .milkdown-top-bar { display: none; }
 .milkdown-editor-shell:is(.is-preview, .is-readonly) .milkdown-block-handle,
 .milkdown-editor-shell:is(.is-preview, .is-readonly) .milkdown-table-block .handle,

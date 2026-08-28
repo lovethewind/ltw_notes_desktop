@@ -62,7 +62,27 @@
         </button>
       </nav>
       <p v-else class="markdown-outline__empty">暂无大纲</p>
+      <section class="markdown-backlinks-section">
+        <button type="button" class="markdown-backlinks-section__toggle" @click="toggleBacklinks">
+          <Icon icon="material-symbols:link-rounded" />
+          <span>反向链接{{ backlinksOpen ? '' : ' · 点击展开' }}</span>
+        </button>
+        <BacklinksPanel v-if="backlinksOpen" :note-id="props.documentId" />
+      </section>
     </aside>
+    <NoteLinkPicker
+      :visible="noteLinkPickerVisible"
+      @close="noteLinkPickerVisible = false"
+      @select="insertNoteLink"
+    />
+    <LinkSuggestPopover
+      :visible="linkSuggestVisible"
+      :coords="linkSuggestCoords"
+      :items="linkSuggestItems"
+      :active-index="linkSuggestIndex"
+      @hover="linkSuggestHover"
+      @select="insertNoteLinkFromPos"
+    />
   </div>
 </template>
 
@@ -83,6 +103,10 @@ import { Icon } from '@iconify/vue'
 import { h, nextTick, onBeforeUnmount, onMounted, ref, render, watch } from 'vue'
 import { extractMarkdownOutline, type MarkdownOutlineItem } from '../utils/markdown-outline'
 import { formatJsonCode } from '../utils/json-code-formatter.js'
+import type { OfflineNote } from '../types'
+import NoteLinkPicker from './NoteLinkPicker.vue'
+import BacklinksPanel from './BacklinksPanel.vue'
+import LinkSuggestPopover from './LinkSuggestPopover.vue'
 
 interface Props {
   value: string
@@ -127,6 +151,15 @@ const emit = defineEmits<{
 const editorRootRef = ref<HTMLDivElement | null>(null)
 const editorScrollRef = ref<HTMLDivElement | null>(null)
 const attachmentInputRef = ref<HTMLInputElement | null>(null)
+const noteLinkPickerVisible = ref(false)
+const backlinksOpen = ref(false)
+const linkSuggestVisible = ref(false)
+const linkSuggestItems = ref<OfflineNote[]>([])
+const linkSuggestIndex = ref(0)
+const linkSuggestQuery = ref('')
+const linkSuggestCoords = ref<{ left: number, top: number, bottom: number }>({ left: 0, top: 0, bottom: 0 })
+const linkSuggestStart = ref<number | null>(null)
+let linkSuggestTimer: ReturnType<typeof setTimeout> | undefined
 const imageContextMenuElement = ref<HTMLDivElement | null>(null)
 const contentValue = ref(props.value)
 const outlineItems = ref<MarkdownOutlineItem[]>([])
@@ -188,7 +221,7 @@ function handleEditorLinkClick(event: MouseEvent): void {
     : null
   const href = anchor?.href ?? ''
   const shouldOpenLink = previewMode.value || props.readonly || event.metaKey || event.ctrlKey
-  if (href && new URL(href).protocol === 'xinyue-notes:' && new URL(href).hostname === 'note') {
+  if (href && new URL(href).hostname === 'xinyue-note.local') {
     event.preventDefault()
     event.stopPropagation()
     if (event.button !== 0 || !shouldOpenLink) return
@@ -533,6 +566,15 @@ function syncOutlineToggle(): void {
 }
 
 /**
+ * 切换反向链接面板的显示状态。
+ *
+ * :return: 无返回值。
+ */
+function toggleBacklinks(): void {
+  backlinksOpen.value = !backlinksOpen.value
+}
+
+/**
  * 同步工具栏预览按钮状态。
  *
  * :return: 无返回值。
@@ -712,6 +754,235 @@ async function insertAttachment(file: File): Promise<void> {
   } catch (error) {
     showFeedback(error instanceof Error ? error.message : '附件保存失败')
   }
+}
+
+/**
+ * 打开笔记链接选择器，供用户挑选要引用的笔记。
+ *
+ * :return: 无返回值。
+ */
+function openNoteLinkPicker(): void {
+  if (props.readonly) {
+    showFeedback('只读模式下无法插入笔记链接')
+    return
+  }
+  noteLinkPickerVisible.value = true
+}
+
+/**
+ * 将选中的笔记以内部链接形式插入当前光标位置。
+ *
+ * :param noteId: 目标笔记 ID。
+ * :param title: 链接展示用的笔记标题。
+ * :return: 无返回值。
+ */
+async function insertNoteLink(noteId: string, title: string): Promise<void> {
+  noteLinkPickerVisible.value = false
+  if (!editor || !editorReady || props.readonly) return
+  const href = `https://xinyue-note.local/${encodeURIComponent(noteId)}`
+  try {
+    editor.editor.action((context) => {
+      const view = context.get(editorViewCtx)
+      const { from, to } = view.state.selection
+      const linkMark = view.state.schema.marks.link
+      if (!linkMark) throw new Error('编辑器链接能力不可用')
+      const linkNode = view.state.schema.text(title, [linkMark.create({ href })])
+      view.dispatch(view.state.tr.replaceRangeWith(from, to, linkNode).scrollIntoView())
+      view.focus()
+    })
+  } catch (error) {
+    showFeedback(error instanceof Error ? error.message : '插入笔记链接失败')
+  }
+}
+
+/** 当前编辑器的 ProseMirror 视图，供 [ [ 补全同步读取光标与文本。 */
+let linkSuggestEditorView: any = null
+
+/**
+ * 打开 [ [ 补全浮层，定位在补全起点。
+ *
+ * :param start: 补全片段在文档中的起始位置。
+ * :return: 无返回值。
+ */
+function openLinkSuggest(start: number): void {
+  linkSuggestStart.value = start
+  const view = linkSuggestEditorView
+  if (view) {
+    try {
+      const coords = view.coordsAtPos(start)
+      linkSuggestCoords.value = {
+        left: coords.left,
+        top: coords.top,
+        bottom: coords.bottom,
+      }
+    } catch {
+      linkSuggestCoords.value = { left: 0, top: 0, bottom: 0 }
+    }
+  }
+  linkSuggestVisible.value = true
+  linkSuggestIndex.value = 0
+  void runLinkSuggestSearch('')
+}
+
+/**
+ * 关闭 [ [ 补全浮层并清理状态。
+ *
+ * :return: 无返回值。
+ */
+function closeLinkSuggest(): void {
+  linkSuggestVisible.value = false
+  linkSuggestItems.value = []
+  linkSuggestIndex.value = 0
+  linkSuggestStart.value = null
+  linkSuggestQuery.value = ''
+}
+
+/**
+ * 在存在补全时拦截方向键、回车与 Esc，避免编辑器默认行为。
+ *
+ * :param view: ProseMirror 视图。
+ * :param event: 键盘事件。
+ * :return: 是否已处理。
+ */
+function handleSuggestKeydown(_view: unknown, event: KeyboardEvent): boolean {
+  if (!linkSuggestVisible.value || !linkSuggestItems.value.length) {
+    if (event.key === 'Escape' && linkSuggestVisible.value) {
+      event.preventDefault()
+      closeLinkSuggest()
+      return true
+    }
+    return false
+  }
+  const count = linkSuggestItems.value.length
+  if (event.key === 'ArrowDown') {
+    event.preventDefault()
+    linkSuggestIndex.value = (linkSuggestIndex.value + 1) % count
+    return true
+  }
+  if (event.key === 'ArrowUp') {
+    event.preventDefault()
+    linkSuggestIndex.value = (linkSuggestIndex.value - 1 + count) % count
+    return true
+  }
+  if (event.key === 'Enter') {
+    event.preventDefault()
+    commitLinkSuggest()
+    return true
+  }
+  if (event.key === 'Escape') {
+    event.preventDefault()
+    closeLinkSuggest()
+    return true
+  }
+  return false
+}
+
+/**
+ * 编辑器内容输入时检测 [ [ 并驱动补全。
+ *
+ * :return: 是否已处理（始终不做拦截）。
+ */
+function handleSuggestInput(): boolean {
+  if (props.readonly) {
+    closeLinkSuggest()
+    return false
+  }
+  const view = linkSuggestEditorView
+  if (!view) return false
+  const { from } = view.state.selection
+  const before = view.state.doc.textBetween(Math.max(0, from - 8), from)
+  if (before.endsWith('[[')) {
+    openLinkSuggest(from - 2)
+  } else if (linkSuggestStart.value !== null) {
+    const query = view.state.doc.textBetween(linkSuggestStart.value + 2, from)
+    void runLinkSuggestSearch(query)
+  } else if (linkSuggestVisible.value) {
+    closeLinkSuggest()
+  }
+  return false
+}
+
+/**
+ * 读取 [ [ 后的关键词并检索笔记，空关键词展示最近笔记。
+ *
+ * :param query: 关键词。
+ * :return: 无返回值。
+ */
+async function runLinkSuggestSearch(query: string): Promise<void> {
+  const text = query.trim()
+  linkSuggestQuery.value = text
+  if (linkSuggestTimer) clearTimeout(linkSuggestTimer)
+  linkSuggestTimer = setTimeout(async () => {
+    try {
+      if (!text) {
+        const workspace = await window.notesDesktop.listWorkspace()
+        linkSuggestItems.value = (workspace.notes || [])
+          .filter((note) => !note.isDeleted)
+          .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))
+          .slice(0, 8)
+      } else {
+        const notes = await window.notesDesktop.searchNotes(text, { limit: 50 })
+        const query = text.toLowerCase()
+        linkSuggestItems.value = notes
+          .filter((note) => !note.isDeleted)
+          .sort((a, b) => {
+            const A = a.title.toLowerCase().includes(query) ? 0 : 1
+            const B = b.title.toLowerCase().includes(query) ? 0 : 1
+            if (A !== B) return A - B
+            return b.updatedAt.localeCompare(a.updatedAt)
+          })
+          .slice(0, 8)
+      }
+      if (linkSuggestIndex.value >= linkSuggestItems.value.length) linkSuggestIndex.value = 0
+    } catch {
+      linkSuggestItems.value = []
+    }
+  }, 120)
+}
+
+/**
+ * 用选中笔记替换 [ [ 补全片段，生成内部链接。
+ *
+ * :return: 无返回值。
+ */
+function commitLinkSuggest(): void {
+  const note = linkSuggestItems.value[linkSuggestIndex.value]
+  if (!note) {
+    closeLinkSuggest()
+    return
+  }
+  insertNoteLinkFromPos(note.id, note.title || '（无标题）')
+}
+
+/**
+ * 用选中笔记替换 [ [ 补全片段，生成内部链接。
+ *
+ * :param noteId: 目标笔记 ID。
+ * :param title: 链接展示标题。
+ * :return: 无返回值。
+ */
+function insertNoteLinkFromPos(noteId: string, title: string): void {
+  const start = linkSuggestStart.value
+  const view = linkSuggestEditorView
+  closeLinkSuggest()
+  if (start === null || !editor || props.readonly) return
+  const href = `https://xinyue-note.local/${encodeURIComponent(noteId)}`
+  const currentFrom = typeof view?.state?.selection?.from === 'number' ? view.state.selection.from : start
+  try {
+    editor.editor.action((context) => {
+      const v = context.get(editorViewCtx)
+      const linkMark = v.state.schema.marks.link
+      if (!linkMark) throw new Error('编辑器链接能力不可用')
+      const node = v.state.schema.text(title, [linkMark.create({ href })])
+      v.dispatch(v.state.tr.replaceWith(start, currentFrom, node).scrollIntoView())
+      v.focus()
+    })
+  } catch (error) {
+    showFeedback(error instanceof Error ? error.message : '插入笔记链接失败')
+  }
+}
+function linkSuggestHover(index: number): void {
+  linkSuggestIndex.value = index
 }
 
 /**
@@ -1091,6 +1362,7 @@ function groupTopBarActions(actions: HTMLElement): void {
     key: 'insert', label: '插入', icon: 'material-symbols:add-box-outline-rounded'
   }, [
     createToolbarActionButton({ label: '附件', icon: 'tabler:paperclip', action: openAttachmentPicker }),
+    createToolbarActionButton({ label: '插入笔记链接', icon: 'tabler:link', action: openNoteLinkPicker }),
     ...pickButtons(['表格', '公式', '引用', '分隔线']),
     createToolbarActionButton({ label: '行内公式', icon: 'material-symbols:functions-rounded', action: toggleInlineFormula })
   ])
@@ -1279,8 +1551,12 @@ async function createEditor(): Promise<void> {
   editorRootRef.value.addEventListener('dragover', handleAttachmentDragOver)
   editorRootRef.value.addEventListener('drop', handleAttachmentDrop)
   crepe.editor.action((context) => {
-    context.get(editorViewCtx).setProps({
-      decorations: (state) => createEditorDecorations(state.doc)
+    const view = context.get(editorViewCtx)
+    linkSuggestEditorView = view
+    view.setProps({
+      decorations: (state) => createEditorDecorations(state.doc),
+      handleKeyDown: handleSuggestKeydown,
+      handleDOMEvents: { input: handleSuggestInput }
     })
   })
   crepe.setReadonly(props.readonly)
@@ -1410,6 +1686,9 @@ onBeforeUnmount(() => {
     emit('change', latestMarkdown, editorDocumentId)
   }
   destroyed = true
+  closeLinkSuggest()
+  if (linkSuggestTimer) clearTimeout(linkSuggestTimer)
+  linkSuggestTimer = undefined
   clearLinkModifierState()
   document.removeEventListener('keydown', syncLinkModifierState)
   document.removeEventListener('keyup', syncLinkModifierState)

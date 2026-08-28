@@ -14,6 +14,10 @@ contextBridge.exposeInMainWorld("notesDesktop", {
   askAiAssistant: (input) => ipcRenderer.invoke("ai-assistant:ask", input),
   /** @param {string} noteId 笔记 ID；@returns {Promise<boolean>} 是否已发起打开。 */
   openNoteLink: (noteId) => ipcRenderer.invoke("note-link:open-local", noteId),
+  /** 查询引用了指定笔记的本地笔记列表。 */
+  getNoteBacklinks: (noteId) => ipcRenderer.invoke("note:backlinks", noteId),
+  /** 查询正文提及了指定笔记标题、但未显式链接的本地笔记列表。 */
+  getNoteMentions: (noteId) => ipcRenderer.invoke("note:mentions", noteId),
   /** @returns {Promise<string>} 返回冷启动期间待打开的笔记 ID。 */
   consumePendingNoteLink: () => ipcRenderer.invoke("note-link:consume-pending"),
   /**

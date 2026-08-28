@@ -706,6 +706,7 @@ function createRepository(database) {
       INSERT INTO notes(id, folder_id, title, content, created_at, updated_at)
       VALUES (?, ?, ?, ?, ?, ?)
     `).run(id, folderId, title, content, timestamp, timestamp)
+    refreshNoteLinks(id, content)
     replaceNoteTags(id, selectTagsForNote.all(noteId).map((tag) => tag.name))
     const note = getNote(id)
     enqueue("note", id, "upsert", note)
@@ -730,6 +731,7 @@ function createRepository(database) {
       INSERT INTO notes(id, folder_id, title, content, created_at, updated_at)
       VALUES (?, ?, ?, ?, ?, ?)
     `).run(id, folderId, title, content, timestamp, timestamp)
+    refreshNoteLinks(id, content)
     const note = getNote(id)
     enqueue("note", id, "upsert", note)
     return note
@@ -839,6 +841,7 @@ function createRepository(database) {
       SET title = ?, content = ?, folder_id = ?, updated_at = ?, dirty = 1
       WHERE id = ?
     `).run(history.title, restoredContent, history.folder_id, timestamp, noteId)
+    refreshNoteLinks(noteId, restoredContent)
     replaceNoteTags(noteId, JSON.parse(history.tag_names || "[]"))
     const note = getNote(noteId)
     enqueue("note", noteId, "upsert", note)
@@ -957,11 +960,213 @@ function createRepository(database) {
       SET title = ?, content = ?, folder_id = ?, is_pinned = ?, updated_at = ?, dirty = 1
       WHERE id = ?
     `).run(next.title, next.content, next.folderId, next.isPinned, next.updatedAt, noteId)
+    refreshNoteLinks(noteId, next.content)
     if (Array.isArray(patch.tagNames)) replaceNoteTags(noteId, nextTagNames)
     const note = getNote(noteId)
     enqueue("note", noteId, "upsert", note)
     return note
   })
+
+  /**
+   * 根据笔记正文重新计算其指向的内部笔记链接引用关系。
+   *
+   * @param {string} noteId 当前笔记 ID。
+   * @param {string} content 笔记正文。
+   * @returns {void}
+   */
+  /**
+   * 从笔记正文解析其引用的本地笔记 ID 集合。
+   *
+   * 同时支持两种链接来源：
+   * 1. 桌面端内部链接：https://xinyue-note.local/{noteId}（旧格式 xinyue-notes://note/{noteId} 仍兼容）
+   * 2. 网页版笔记链接：{后端域名}/notes/{serverId} 或 /articles/{serverId}，需通过 server_id 回落到本地笔记。
+   *
+   * @param {string} noteId 当前笔记 ID。
+   * @param {string} content 笔记正文。
+   * @returns {Set<string>} 被引用笔记的本地 ID 集合。
+   */
+  function resolveNoteLinkTargetIds(noteId, content) {
+    const targetIds = new Set()
+    if (typeof content !== "string") return targetIds
+    const internalLinkPattern = /xinyue-notes:\/\/note\/([^"'<>\s)]+)/g
+    let match
+    while ((match = internalLinkPattern.exec(content)) !== null) {
+      const raw = match[1]
+      let targetId = raw
+      try {
+        targetId = decodeURIComponent(raw)
+      } catch {
+        targetId = raw
+      }
+      if (targetId && targetId !== noteId) targetIds.add(targetId)
+    }
+    // 桌面端新格式：https://xinyue-note.local/{noteId}，沿用与旧格式相同的 ID 提取逻辑
+    const desktopLinkPattern = /https:\/\/xinyue-note\.local\/([^"'<>\s)]+)/g
+    while ((match = desktopLinkPattern.exec(content)) !== null) {
+      const raw = match[1]
+      let targetId = raw
+      try {
+        targetId = decodeURIComponent(raw)
+      } catch {
+        targetId = raw
+      }
+      if (targetId && targetId !== noteId) targetIds.add(targetId)
+    }
+    const findLocalByServerId = database.prepare(
+      "SELECT id FROM notes WHERE server_id = ? AND is_deleted = 0"
+    )
+    const webLinkPattern = /\/(?:notes|articles)\/(\d+)/g
+    while ((match = webLinkPattern.exec(content)) !== null) {
+      const local = findLocalByServerId.get(match[1])
+      if (local && local.id !== noteId) targetIds.add(local.id)
+    }
+    return targetIds
+  }
+
+  /**
+   * 根据笔记正文重新计算其指向的内部笔记链接引用关系。
+   *
+   * @param {string} noteId 当前笔记 ID。
+   * @param {string} content 笔记正文。
+   * @returns {void}
+   */
+  function refreshNoteLinks(noteId, content) {
+    const targetIds = resolveNoteLinkTargetIds(noteId, content)
+    const deleteLinks = database.prepare("DELETE FROM note_links WHERE source_note_id = ?")
+    const insertLink = database.prepare(
+      "INSERT OR IGNORE INTO note_links(source_note_id, target_note_id) VALUES (?, ?)"
+    )
+    const rebuild = database.transaction(() => {
+      deleteLinks.run(noteId)
+      for (const targetId of targetIds) insertLink.run(noteId, targetId)
+    })
+    rebuild()
+  }
+
+  /**
+   * 为所有未删除的笔记重建一次引用关系，仅在旧数据库首次升级时触发。
+   *
+   * :return: 无返回值。
+   */
+  function rebuildAllNoteLinks() {
+    const version = database.prepare(
+      "SELECT value FROM sync_state WHERE key = 'note_links_version'"
+    ).get()?.value
+    if (version === "1") return
+    const rows = database.prepare("SELECT id, content FROM notes WHERE is_deleted = 0").all()
+    const insertLink = database.prepare(
+      "INSERT OR IGNORE INTO note_links(source_note_id, target_note_id) VALUES (?, ?)"
+    )
+    const rebuild = database.transaction(() => {
+      database.prepare("DELETE FROM note_links").run()
+      for (const row of rows) {
+        for (const targetId of resolveNoteLinkTargetIds(row.id, row.content)) {
+          insertLink.run(row.id, targetId)
+        }
+      }
+      database.prepare(`
+        INSERT INTO sync_state(key, value) VALUES ('note_links_version', '1')
+        ON CONFLICT(key) DO UPDATE SET value = excluded.value
+      `).run()
+    })
+    rebuild()
+  }
+
+  /**
+   * 查询引用了指定笔记的所有本地笔记。
+   *
+   * @param {string} noteId 目标笔记 ID。
+   * @returns {Array<{ id: string, title: string, isDeleted: boolean, updatedAt: string }>} 引用来源列表。
+   */
+  function getBacklinks(noteId) {
+    return database.prepare(`
+      SELECT n.id AS id, n.title AS title, n.folder_id AS folderId,
+             n.is_deleted AS isDeleted, n.updated_at AS updatedAt
+      FROM note_links l
+      JOIN notes n ON n.id = l.source_note_id
+      WHERE l.target_note_id = ? AND n.is_deleted = 0
+      ORDER BY n.updated_at DESC
+    `).all(noteId).map((row) => ({
+      id: row.id,
+      title: row.title || "（无标题）",
+      folderId: row.folderId,
+      isDeleted: Boolean(row.isDeleted),
+      updatedAt: row.updatedAt
+    }))
+  }
+
+  // 提及计算的过滤配置：标题过短或命中通用停用词则不参与，且限制返回条数。
+  const MENTION_MIN_TITLE_LENGTH = 2
+  const MENTION_LIMIT = 12
+  const MENTION_STOP_WORDS = new Set([
+    "流程", "测试", "笔记", "文档", "模板", "面试题", "日报", "周报", "会议",
+    "记录", "清单", "待办", "目录", "大纲", "说明", "指南", "教程", "公告", "日志",
+    "todo", "todolist"
+  ])
+
+  /**
+   * 查询正文中提及了指定笔记标题、但未显式链接到它的本地笔记。
+   *
+   * @param {string} noteId 目标笔记 ID。
+   * @returns {Array<{ id: string, title: string, folderId: string | null, updatedAt: string, excerpt: string }>} 提及来源列表。
+   */
+  function getNoteMentions(noteId) {
+    const target = database.prepare("SELECT id, title FROM notes WHERE id = ?").get(noteId)
+    if (!target) return []
+    const title = String(target.title || "").trim()
+    const strippedTitle = title.replace(/\s+/g, "").toLowerCase()
+    if (!strippedTitle) return []
+    if (strippedTitle.length < MENTION_MIN_TITLE_LENGTH) return []
+    if (MENTION_STOP_WORDS.has(strippedTitle)) return []
+    const linked = new Set(
+      database.prepare("SELECT source_note_id FROM note_links WHERE target_note_id = ?")
+        .all(noteId)
+        .map((row) => row.source_note_id)
+    )
+    const escaped = title.replace(/[\\%_]/g, (char) => `\\${char}`)
+    const rows = database.prepare(`
+      SELECT id, title, folder_id AS folderId, content, updated_at AS updatedAt
+      FROM notes
+      WHERE is_deleted = 0 AND id != ? AND content LIKE ? ESCAPE '\\'
+      ORDER BY updated_at DESC
+      LIMIT 40
+    `).all(noteId, `%${escaped}%`)
+    return rows
+      .filter((row) => !linked.has(row.id))
+      .slice(0, MENTION_LIMIT)
+      .map((row) => ({
+        id: row.id,
+        title: row.title || "（无标题）",
+        folderId: row.folderId,
+        updatedAt: row.updatedAt,
+        excerpt: buildMentionExcerpt(row.content, title)
+      }))
+  }
+
+  /**
+   * 生成提及上下文片段，围绕标题首次出现处截取前后文本。
+   *
+   * @param {string} content 笔记正文。
+   * @param {string} title 当前笔记标题（作为提及词）。
+   * @returns {string} 上下文片段。
+   */
+  function buildMentionExcerpt(content, title) {
+    const text = String(content || "").replace(/\s+/g, " ").trim()
+    if (!text || !title) return ""
+    const index = text.indexOf(title)
+    const radius = 34
+    let start
+    let end
+    if (index === -1) {
+      start = 0
+      end = Math.min(text.length, 80)
+    } else {
+      start = Math.max(0, index - radius)
+      end = Math.min(text.length, index + title.length + radius)
+    }
+    const raw = text.slice(start, end).trim()
+    return `${start > 0 ? "…" : ""}${raw}${end < text.length ? "…" : ""}`
+  }
 
   /** 返回仍待处理且原笔记存在的同步冲突。 */
   function listNoteConflicts() {
@@ -2090,6 +2295,8 @@ function createRepository(database) {
     database.prepare(sql).run(...remoteServerIds)
   }
 
+  rebuildAllNoteLinks()
+
   return {
     backupTo,
     close: () => database.close(),
@@ -2105,6 +2312,8 @@ function createRepository(database) {
     duplicateNote,
     createQuickNote,
     updateNote,
+    getBacklinks,
+    getNoteMentions,
     bulkUpdateNotes,
     listNoteConflicts,
     resolveNoteConflict,

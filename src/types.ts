@@ -38,6 +38,22 @@ export interface OfflineNote {
   tags: NoteTag[]
 }
 
+export interface BacklinkNote {
+  id: string
+  title: string
+  folderId: string | null
+  isDeleted: boolean
+  updatedAt: string
+}
+
+export interface MentionNote {
+  id: string
+  title: string
+  folderId: string | null
+  updatedAt: string
+  excerpt: string
+}
+
 export interface WorkspaceData {
   folders: NoteFolder[]
   tags: NoteTag[]
@@ -341,6 +357,10 @@ export interface NotesDesktopApi {
   }): Promise<AiAssistantAnswer>
   /** 打开指定笔记。 */
   openNoteLink(noteId: string): Promise<boolean>
+  /** 查询引用了指定笔记的本地笔记列表。 */
+  getNoteBacklinks(noteId: string): Promise<BacklinkNote[]>
+  /** 查询正文提及了指定笔记标题、但未显式链接的本地笔记列表。 */
+  getNoteMentions(noteId: string): Promise<MentionNote[]>
   /** 获取冷启动期间待打开的笔记 ID。 */
   consumePendingNoteLink(): Promise<string>
   /** 监听外部应用触发的笔记深链接。 */

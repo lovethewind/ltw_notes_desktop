@@ -1906,6 +1906,8 @@ function registerIpcHandlers() {
       saveViewState: (noteId, scrollTop) => repository.saveNoteViewState(noteId, scrollTop),
       getNote: (noteId) => repository.getNoteForEditing(noteId),
       searchNotes: (keyword, options) => repository.searchNotes(keyword, options),
+      getBacklinks: (noteId) => repository.getBacklinks(noteId),
+      getMentions: (noteId) => repository.getNoteMentions(noteId),
       openNoteLink: (noteId) => {
         const normalizedNoteId = String(noteId || "").trim()
         if (normalizedNoteId) notifyOpenNoteLink(normalizedNoteId)

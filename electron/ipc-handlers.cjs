@@ -13,6 +13,8 @@ function registerWorkspaceHandlers(ipcMain, domain) {
   ipcMain.handle("note:detail", (_event, noteId) => domain.getNote(noteId))
   ipcMain.handle("note:search", (_event, keyword, options) => domain.searchNotes(keyword, options || {}))
   ipcMain.handle("note-link:open-local", (_event, noteId) => domain.openNoteLink(noteId))
+  ipcMain.handle("note:backlinks", (_event, noteId) => domain.getBacklinks(noteId))
+  ipcMain.handle("note:mentions", (_event, noteId) => domain.getMentions(noteId))
   ipcMain.handle("note-link:consume-pending", domain.consumePendingNoteLink)
 }
 

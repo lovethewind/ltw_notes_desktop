@@ -125,6 +125,12 @@ function initializeNotesDatabase(database) {
       scroll_top INTEGER NOT NULL DEFAULT 0,
       updated_at TEXT NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS note_links (
+      source_note_id TEXT NOT NULL REFERENCES notes(id) ON DELETE CASCADE,
+      target_note_id TEXT NOT NULL,
+      PRIMARY KEY(source_note_id, target_note_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_note_links_target ON note_links(target_note_id);
   `)
   initializeNotePreviews(database)
   initializeNoteSearch(database)
