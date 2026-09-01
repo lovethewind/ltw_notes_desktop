@@ -176,6 +176,16 @@ export interface UpdateCheckResult {
   downloadUrl: string
 }
 
+export interface UpdateDownloadProgress {
+  received: number
+  total: number
+}
+
+export interface UpdateDownloadResult {
+  filePath: string
+  total: number
+}
+
 export interface DataTransferResult {
   canceled: boolean
   message?: string
@@ -461,6 +471,10 @@ export interface NotesDesktopApi {
   clearSyncSettings(): Promise<SyncSettingsView>
   checkForUpdates(): Promise<UpdateCheckResult>
   openUpdateDownload(downloadUrl: string): Promise<void>
+  downloadUpdate(downloadUrl: string): Promise<UpdateDownloadResult>
+  openUpdateInstaller(filePath: string): Promise<string>
+  revealUpdateInstaller(filePath: string): Promise<boolean>
+  onUpdateDownloadProgress(callback: (progress: UpdateDownloadProgress) => void): () => void
   onCheckForUpdates(callback: (silent: boolean) => void): () => void
   onOpenSyncSettings(callback: () => void): () => void
   onSyncAuthResult(callback: (result: SyncConnectionResult) => void): () => void

@@ -316,7 +316,8 @@ test("编辑器不再注册双向链接功能", () => {
 
   assert.match(editorSource, /function createEditorDecorations/)
   assert.doesNotMatch(editorSource, /setProps\(\{ decorations: \(\) => DecorationSet\.empty/)
-  assert.doesNotMatch(editorSource, /wikiLink|WikiLink|note-id-link|xinyue-note\.local/)
+  // 编辑器不再注册第三方双向链接插件，但会通过 openNoteLink 处理 xinyue-note.local 链接以实现点击跳转。
+  assert.doesNotMatch(editorSource, /wikiLink|WikiLink|note-id-link/)
   assert.doesNotMatch(appSource, /wikiLink|WikiLink|backlinks-panel|反向链接/)
   assert.doesNotMatch(styleSource, /wiki-link|note-id-link|backlinks-panel/)
 })

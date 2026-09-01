@@ -108,6 +108,9 @@ function registerApplicationHandlers(ipcMain, domain) {
   ipcMain.handle("theme:set", (_event, theme) => domain.setTheme(theme))
   ipcMain.handle("app-update:check", domain.checkForUpdates)
   ipcMain.handle("app-update:open-download", (_event, downloadUrl) => domain.openUpdateDownload(downloadUrl))
+  ipcMain.handle("app-update:download", (_event, downloadUrl) => domain.downloadUpdate(downloadUrl))
+  ipcMain.handle("app-update:open-installer", (_event, filePath) => domain.openUpdateInstaller(filePath))
+  ipcMain.handle("app-update:reveal-installer", (_event, filePath) => domain.revealUpdateInstaller(filePath))
 }
 
 /** 注册 AI 助手设置与问答接口，密钥和网络请求只停留在主进程。 */

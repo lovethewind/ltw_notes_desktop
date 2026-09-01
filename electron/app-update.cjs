@@ -1,3 +1,7 @@
+const fs = require("node:fs")
+const path = require("node:path")
+const { finished } = require("node:stream/promises")
+
 const RELEASE_API_URL = "https://api.github.com/repos/lovethewind/ltw_notes_desktop/releases/latest"
 
 /**
@@ -94,8 +98,90 @@ async function checkForUpdates({ currentVersion, architecture, request }) {
   }
 }
 
+/**
+ * 从下载地址解析安全的安装包文件名。
+ *
+ * GitHub 的 Release 附件名可能包含中文（如“心悦笔记-0.7.0-arm64.dmg”），
+ * 路径会被 URL 编码，这里解码后再剔除文件系统不允许的字符。
+ *
+ * @param {string} downloadUrl 下载地址。
+ * @param {{ fallbackName?: string }} [options] 解析失败时的兜底文件名。
+ * @returns {string} 安全的 DMG 文件名。
+ */
+function resolveDownloadFileName(downloadUrl, { fallbackName } = {}) {
+  try {
+    const pathname = new URL(downloadUrl).pathname
+    const encoded = pathname.split("/").pop() || ""
+    const fileName = decodeURIComponent(encoded)
+    const safeName = fileName.replace(/[\\/:"*?<>|]/g, "_")
+    if (safeName && /\.dmg$/i.test(safeName)) return safeName
+  } catch {
+    // URL 无法解析或文件名非法时退回到兜底名称。
+  }
+  return fallbackName || "xinyue-notes.dmg"
+}
+
+/**
+ * 从 GitHub Release 流式下载 DMG 安装包并实时上报进度。
+ *
+ * 通过注入的 request 与进度回调，既能在主进程复用 Electron 的 net.fetch，
+ * 也能在单元测试里用模拟响应验证进度与落盘行为。
+ *
+ * @param {{
+ *   downloadUrl: string,
+ *   request: (url: string, options: Record<string, any>) => Promise<Record<string, any>>,
+ *   savePath: string,
+ *   onProgress?: (progress: { received: number; total: number }) => void
+ * }} options 下载参数。
+ * @returns {Promise<{ filePath: string; total: number }>} 下载完成后的文件信息。
+ */
+async function downloadReleaseAsset({ downloadUrl, request, savePath, onProgress }) {
+  const response = await request(downloadUrl, {
+    headers: {
+      Accept: "application/octet-stream",
+      "User-Agent": "xinyue-notes-desktop"
+    },
+    bypassCustomProtocolHandlers: true
+  })
+  if (!response.ok) {
+    throw new Error(`安装包下载失败（GitHub 返回 ${response.status || "未知状态"}）`)
+  }
+  if (!response.body || typeof response.body.getReader !== "function") {
+    throw new Error("安装包下载失败（响应缺少文件流）")
+  }
+  const total = Number(response.headers.get("content-length") || 0)
+  await fs.promises.mkdir(path.dirname(savePath), { recursive: true })
+  const fileStream = fs.createWriteStream(savePath)
+  let received = 0
+  try {
+    const reader = response.body.getReader()
+    while (true) {
+      const { value, done } = await reader.read()
+      if (done) break
+      if (!value || value.byteLength === 0) continue
+      received += value.byteLength
+      if (!fileStream.write(Buffer.from(value))) {
+        await new Promise((resolve, reject) => {
+          fileStream.once("drain", resolve)
+          fileStream.once("error", reject)
+        })
+      }
+      onProgress?.({ received, total })
+    }
+    fileStream.end()
+    await finished(fileStream)
+  } catch (error) {
+    fileStream.destroy()
+    if (fs.existsSync(savePath)) await fs.promises.unlink(savePath).catch(() => {})
+    throw error
+  }
+  return { filePath: savePath, total }
+}
+
 module.exports = {
   checkForUpdates,
   compareVersions,
-  selectMacDownloadUrl
+  selectMacDownloadUrl,
+  resolveDownloadFileName,
+  downloadReleaseAsset
 }

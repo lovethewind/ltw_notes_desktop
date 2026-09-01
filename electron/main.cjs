@@ -32,7 +32,11 @@ const {
   migrateDomainProfile,
   shouldConfirmLocalProfileTransfer
 } = require("./profile-storage.cjs")
-const { checkForUpdates } = require("./app-update.cjs")
+const {
+  checkForUpdates,
+  downloadReleaseAsset,
+  resolveDownloadFileName
+} = require("./app-update.cjs")
 const { createAiAssistant } = require("./ai-assistant.cjs")
 const {
   createDatabaseBackupManager,
@@ -1896,6 +1900,58 @@ function registerIpcHandlers() {
           throw new Error("更新下载地址不受信任")
         }
         return shell.openExternal(parsedUrl.toString())
+      },
+      downloadUpdate: (downloadUrl) => {
+        const parsedUrl = new URL(String(downloadUrl || ""))
+        if (
+          !["github.com", "objects.githubusercontent.com", "githubusercontent.com"]
+            .includes(parsedUrl.hostname)
+        ) {
+          throw new Error("更新下载地址不受信任")
+        }
+        const savePath = path.join(
+          app.getPath("downloads"),
+          resolveDownloadFileName(parsedUrl.toString(), {
+            fallbackName: `xinyue-notes-${app.getVersion()}-${process.arch}.dmg`
+          })
+        )
+        // 下载字节较大，限频推送进度，避免高频 IPC 挤占渲染进程。
+        let lastReportedBytes = 0
+        return downloadReleaseAsset({
+          downloadUrl: parsedUrl.toString(),
+          request: (url, options) => net.fetch(url, {
+            ...options,
+            bypassCustomProtocolHandlers: true
+          }),
+          savePath,
+          onProgress: (progress) => {
+            const reachedEnd = progress.total > 0 && progress.received >= progress.total
+            const enoughDelta = progress.received - lastReportedBytes >= 512 * 1024
+            if (!reachedEnd && !enoughDelta && lastReportedBytes > 0) return
+            lastReportedBytes = progress.received
+            if (mainWindow && !mainWindow.isDestroyed() && !mainWindow.webContents.isDestroyed()) {
+              mainWindow.webContents.send("app-update:download-progress", {
+                received: progress.received,
+                total: progress.total
+              })
+            }
+          }
+        })
+      },
+      openUpdateInstaller: (filePath) => {
+        const safePath = String(filePath || "")
+        if (!/\.dmg$/i.test(safePath) || !fs.existsSync(safePath)) {
+          throw new Error("安装包路径无效")
+        }
+        return shell.openPath(safePath)
+      },
+      revealUpdateInstaller: (filePath) => {
+        const safePath = String(filePath || "")
+        if (!/\.dmg$/i.test(safePath) || !fs.existsSync(safePath)) {
+          throw new Error("安装包路径无效")
+        }
+        shell.showItemInFolder(safePath)
+        return true
       }
     },
     aiAssistant,

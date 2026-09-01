@@ -150,8 +150,16 @@ const {
   updateError,
   updateResult,
   renderedUpdateReleaseNotes,
+  updateDownloading,
+  updateDownloadedPath,
+  updateDownloadError,
+  downloadPercent,
+  downloadSizeLabel,
   runUpdateCheck,
-  openUpdateDownload
+  openUpdateDownload,
+  downloadUpdate,
+  openInstaller,
+  revealInstaller
 } = useAppUpdate()
 const syncDialogVisible = ref(false)
 const conflictCenterVisible = ref(false)
@@ -4422,11 +4430,33 @@ onBeforeUnmount(() => {
             class="update-release-notes"
             v-html="renderedUpdateReleaseNotes"
           ></div>
+          <p v-if="updateDownloadError" class="update-download-error">{{ updateDownloadError }}</p>
         </template>
-        <div>
+        <div class="update-actions">
           <button v-if="updateError" type="button" @click="runUpdateCheck(false)">重新检查</button>
-          <button type="button" :disabled="updateChecking" @click="updateDialogVisible = false">稍后</button>
-          <button v-if="updateResult?.status === 'available'" class="primary" type="button" @click="openUpdateDownload">前往下载</button>
+          <template v-if="updateResult?.status === 'available'">
+            <div v-if="updateDownloading" class="update-progress">
+              <div class="update-progress-track" :class="{ indeterminate: downloadPercent === null }">
+                <div
+                  class="update-progress-fill"
+                  :style="{ width: downloadPercent === null ? '100%' : `${downloadPercent}%` }"
+                ></div>
+              </div>
+              <span class="update-progress-label">{{ downloadSizeLabel }}</span>
+            </div>
+            <template v-else-if="updateDownloadedPath">
+              <button type="button" @click="openInstaller">打开安装包</button>
+              <button type="button" @click="revealInstaller">在访达中显示</button>
+            </template>
+            <template v-else-if="updateDownloadError">
+              <button class="primary" type="button" @click="downloadUpdate">重试下载</button>
+              <button type="button" @click="openUpdateDownload">在浏览器中打开</button>
+            </template>
+            <template v-else>
+              <button class="primary" type="button" @click="downloadUpdate">下载更新</button>
+            </template>
+          </template>
+          <button type="button" :disabled="updateChecking || updateDownloading" @click="updateDialogVisible = false">稍后</button>
         </div>
       </section>
     </div>

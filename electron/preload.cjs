@@ -189,6 +189,14 @@ contextBridge.exposeInMainWorld("notesDesktop", {
   clearSyncSettings: () => ipcRenderer.invoke("sync-settings:clear"),
   checkForUpdates: () => ipcRenderer.invoke("app-update:check"),
   openUpdateDownload: (downloadUrl) => ipcRenderer.invoke("app-update:open-download", downloadUrl),
+  downloadUpdate: (downloadUrl) => ipcRenderer.invoke("app-update:download", downloadUrl),
+  openUpdateInstaller: (filePath) => ipcRenderer.invoke("app-update:open-installer", filePath),
+  revealUpdateInstaller: (filePath) => ipcRenderer.invoke("app-update:reveal-installer", filePath),
+  onUpdateDownloadProgress: (callback) => {
+    const listener = (_event, progress) => callback(progress)
+    ipcRenderer.on("app-update:download-progress", listener)
+    return () => ipcRenderer.removeListener("app-update:download-progress", listener)
+  },
   onCheckForUpdates: (callback) => {
     const listener = (_event, silent) => callback(Boolean(silent))
     ipcRenderer.on("app-update:check-request", listener)

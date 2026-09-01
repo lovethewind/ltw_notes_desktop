@@ -1,11 +1,14 @@
 const test = require("node:test")
 const assert = require("node:assert/strict")
-const { readFileSync } = require("node:fs")
-const { resolve } = require("node:path")
+const { existsSync, readFileSync, unlinkSync } = require("node:fs")
+const { tmpdir } = require("node:os")
+const { join, resolve } = require("node:path")
 const {
   checkForUpdates,
   compareVersions,
-  selectMacDownloadUrl
+  selectMacDownloadUrl,
+  resolveDownloadFileName,
+  downloadReleaseAsset
 } = require("../electron/app-update.cjs")
 
 test("版本比较支持 v 前缀和不同长度的语义版本", () => {
@@ -99,6 +102,79 @@ test("仓库尚无正式 Release 时返回未发布状态", async () => {
     releaseNotes: "",
     downloadUrl: ""
   })
+})
+
+test("从更新地址解析出安全的 DMG 文件名", () => {
+  const encoded = encodeURIComponent("心悦笔记-0.7.0-arm64.dmg")
+  const url = `https://github.com/lovethewind/ltw_notes_desktop/releases/download/v0.7.0/${encoded}`
+
+  assert.equal(resolveDownloadFileName(url), "心悦笔记-0.7.0-arm64.dmg")
+  assert.equal(
+    resolveDownloadFileName("https://example.com/not-a-dmg.zip", { fallbackName: "fallback.dmg" }),
+    "fallback.dmg"
+  )
+})
+
+test("流式下载安装包并按进度回调写盘", async () => {
+  const chunks = [Buffer.from("hello "), Buffer.from("world")]
+  const total = 11
+  let chunkIndex = 0
+  const request = async () => ({
+    ok: true,
+    headers: { get: (name) => (name === "content-length" ? String(total) : null) },
+    body: {
+      getReader: () => ({
+        read: async () => {
+          if (chunkIndex < chunks.length) return { value: chunks[chunkIndex++], done: false }
+          return { value: undefined, done: true }
+        }
+      })
+    }
+  })
+  const savePath = join(tmpdir(), `xinyue-notes-test-${Date.now()}.dmg`)
+  const progress = []
+
+  const result = await downloadReleaseAsset({
+    downloadUrl: "https://github.com/lovethewind/ltw_notes_desktop/releases/download/v0.7.0/x.dmg",
+    request,
+    savePath,
+    onProgress: (state) => progress.push(state)
+  })
+
+  assert.equal(result.filePath, savePath)
+  assert.equal(result.total, total)
+  assert.equal(readFileSync(savePath, "utf8"), "hello world")
+  assert.ok(progress.length >= 1)
+  assert.deepEqual(progress[progress.length - 1], { received: total, total })
+  unlinkSync(savePath)
+})
+
+test("下载失败时清理残留文件", async () => {
+  const chunks = [Buffer.from("partial")]
+  let chunkIndex = 0
+  const request = async () => ({
+    ok: true,
+    headers: { get: () => null },
+    body: {
+      getReader: () => ({
+        read: async () => {
+          if (chunkIndex < chunks.length) return { value: chunks[chunkIndex++], done: false }
+          throw new Error("网络中断")
+        }
+      })
+    }
+  })
+  const savePath = join(tmpdir(), `xinyue-notes-test-${Date.now()}.dmg`)
+
+  await assert.rejects(
+    () => downloadReleaseAsset({
+      downloadUrl: "https://github.com/lovethewind/ltw_notes_desktop/releases/download/v0.7.0/x.dmg",
+      request,
+      savePath
+    }),
+    /网络中断/
+  )
+  assert.equal(existsSync(savePath), false)
 })
 
 test("延迟检查更新前会确认主窗口仍然存活", () => {

@@ -957,6 +957,14 @@ body.markdown-editor-focus-mode .milkdown-editor-shell.is-focus-mode { position:
 .folder-dialog .update-release-notes th,
 .folder-dialog .update-release-notes td { border: 1px solid #d8e3ef; padding: 7px 9px; text-align: left; }
 .folder-dialog .update-release-notes img { max-width: 100%; border-radius: 8px; }
+.update-actions { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; justify-content: flex-end; }
+.update-actions > .update-progress { order: -1; flex: 1 1 100%; display: flex; align-items: center; gap: 12px; margin: 0 0 2px; }
+.update-progress-track { position: relative; flex: 1; height: 6px; overflow: hidden; border-radius: 999px; background: #e7eef6; }
+.update-progress-track .update-progress-fill { position: absolute; inset: 0 auto 0 0; width: 0; border-radius: 999px; background: var(--blue); }
+.update-progress-track.indeterminate .update-progress-fill { width: 40% !important; animation: update-progress-slide 1.2s ease-in-out infinite; }
+.update-progress-label { min-width: 150px; text-align: right; color: #65768c; font-size: 12px; font-variant-numeric: tabular-nums; }
+.update-download-error { margin: 0 0 12px; color: #c2465d; font-size: 13px; }
+@keyframes update-progress-slide { 0% { left: -40%; } 100% { left: 100%; } }
 
 button:focus-visible { outline: 3px solid rgba(47,128,237,.22); outline-offset: 2px; }
 @keyframes pulse { 50% { opacity: .35; } }
@@ -1318,6 +1326,9 @@ button:focus-visible { outline: 3px solid rgba(47,128,237,.22); outline-offset: 
   .folder-dialog .update-release-notes blockquote { background: #142842; color: #aebed2; }
   .folder-dialog .update-release-notes th,
   .folder-dialog .update-release-notes td { border-color: #30445f; }
+  .update-progress-track { background: #1d2e46; }
+  .update-progress-label { color: #aebed2; }
+  .update-download-error { color: #f28aab; }
   .resource-context-menu { border-color: #30445e; background: rgba(18,32,53,.98); box-shadow: 0 20px 58px rgba(0,0,0,.38); }
   .resource-context-menu button { color: #b9c7d9; }
   .resource-context-menu button svg { color: #79aff3; }
