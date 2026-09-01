@@ -1908,6 +1908,7 @@ function registerIpcHandlers() {
       searchNotes: (keyword, options) => repository.searchNotes(keyword, options),
       getBacklinks: (noteId) => repository.getBacklinks(noteId),
       getMentions: (noteId) => repository.getNoteMentions(noteId),
+      getNoteGraph: (noteId, maxDepth) => repository.getNoteGraph(noteId, maxDepth),
       openNoteLink: (noteId) => {
         const normalizedNoteId = String(noteId || "").trim()
         if (normalizedNoteId) notifyOpenNoteLink(normalizedNoteId)

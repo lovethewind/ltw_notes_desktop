@@ -18,6 +18,8 @@ contextBridge.exposeInMainWorld("notesDesktop", {
   getNoteBacklinks: (noteId) => ipcRenderer.invoke("note:backlinks", noteId),
   /** 查询正文提及了指定笔记标题、但未显式链接的本地笔记列表。 */
   getNoteMentions: (noteId) => ipcRenderer.invoke("note:mentions", noteId),
+  /** 以指定笔记为中心查询局部引用图谱。 @param {string} noteId @param {number} [maxDepth] */
+  getNoteGraph: (noteId, maxDepth) => ipcRenderer.invoke("note:graph", noteId, maxDepth),
   /** @returns {Promise<string>} 返回冷启动期间待打开的笔记 ID。 */
   consumePendingNoteLink: () => ipcRenderer.invoke("note-link:consume-pending"),
   /**

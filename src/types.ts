@@ -54,6 +54,24 @@ export interface MentionNote {
   excerpt: string
 }
 
+export interface GraphNode {
+  id: string
+  title: string
+  folderId: string | null
+  depth: number
+}
+
+export interface GraphLink {
+  source: string
+  target: string
+}
+
+export interface NoteGraph {
+  nodes: GraphNode[]
+  links: GraphLink[]
+  rootId: string
+}
+
 export interface WorkspaceData {
   folders: NoteFolder[]
   tags: NoteTag[]
@@ -361,6 +379,8 @@ export interface NotesDesktopApi {
   getNoteBacklinks(noteId: string): Promise<BacklinkNote[]>
   /** 查询正文提及了指定笔记标题、但未显式链接的本地笔记列表。 */
   getNoteMentions(noteId: string): Promise<MentionNote[]>
+  /** 以指定笔记为中心查询局部引用图谱。 */
+  getNoteGraph(noteId: string, maxDepth?: number): Promise<NoteGraph>
   /** 获取冷启动期间待打开的笔记 ID。 */
   consumePendingNoteLink(): Promise<string>
   /** 监听外部应用触发的笔记深链接。 */

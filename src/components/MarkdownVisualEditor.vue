@@ -69,6 +69,13 @@
         </button>
         <BacklinksPanel v-if="backlinksOpen" :note-id="props.documentId" />
       </section>
+      <section class="markdown-backlinks-section">
+        <button type="button" class="markdown-backlinks-section__toggle" @click="toggleNoteGraph">
+          <Icon icon="material-symbols:hub-rounded" />
+          <span>关系图谱{{ noteGraphOpen ? '' : ' · 点击展开' }}</span>
+        </button>
+        <NoteGraphPanel v-if="noteGraphOpen" :note-id="props.documentId" />
+      </section>
     </aside>
     <NoteLinkPicker
       :visible="noteLinkPickerVisible"
@@ -100,13 +107,16 @@ import { TextSelection } from '@milkdown/kit/prose/state'
 import { Decoration, DecorationSet } from '@milkdown/kit/prose/view'
 import { replaceAll } from '@milkdown/kit/utils'
 import { Icon } from '@iconify/vue'
-import { h, nextTick, onBeforeUnmount, onMounted, ref, render, watch } from 'vue'
+import { defineAsyncComponent, h, nextTick, onBeforeUnmount, onMounted, ref, render, watch } from 'vue'
 import { extractMarkdownOutline, type MarkdownOutlineItem } from '../utils/markdown-outline'
 import { formatJsonCode } from '../utils/json-code-formatter.js'
 import type { OfflineNote } from '../types'
 import NoteLinkPicker from './NoteLinkPicker.vue'
 import BacklinksPanel from './BacklinksPanel.vue'
 import LinkSuggestPopover from './LinkSuggestPopover.vue'
+
+// 关系图谱仅在展开时用到 d3-force，改为异步组件避免把布局库打进主 chunk。
+const NoteGraphPanel = defineAsyncComponent(() => import('./NoteGraphPanel.vue'))
 
 interface Props {
   value: string
@@ -153,6 +163,7 @@ const editorScrollRef = ref<HTMLDivElement | null>(null)
 const attachmentInputRef = ref<HTMLInputElement | null>(null)
 const noteLinkPickerVisible = ref(false)
 const backlinksOpen = ref(false)
+const noteGraphOpen = ref(false)
 const linkSuggestVisible = ref(false)
 const linkSuggestItems = ref<OfflineNote[]>([])
 const linkSuggestIndex = ref(0)
@@ -572,6 +583,15 @@ function syncOutlineToggle(): void {
  */
 function toggleBacklinks(): void {
   backlinksOpen.value = !backlinksOpen.value
+}
+
+/**
+ * 切换关系图谱面板的显示状态。
+ *
+ * :return: 无返回值。
+ */
+function toggleNoteGraph(): void {
+  noteGraphOpen.value = !noteGraphOpen.value
 }
 
 /**

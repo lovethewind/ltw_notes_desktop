@@ -1178,3 +1178,64 @@ test("反向链接识别桌面内部链接的旧版与新版格式", () => {
     assert.ok(repository.getBacklinks(target.id).some((item) => item.id === source.id))
   })
 })
+
+test("局部图谱按中心笔记双向展开并防环", () => {
+  withRepository((repository) => {
+    const center = repository.createNote(null)
+    const outA = repository.createNote(null)
+    const inB = repository.createNote(null)
+
+    // 出链：center -> outA；入链：inB -> center；三笔记联成一环。
+    repository.updateNote(center.id, { content: `link [outA](https://xinyue-note.local/${outA.id})` })
+    repository.updateNote(inB.id, { content: `link [center](https://xinyue-note.local/${center.id})` })
+    // 引用的笔记需要有标题才会被索引为 reach，但链接本身已写入 note_links。
+    repository.updateNote(outA.id, { title: "出链目标" })
+    repository.updateNote(inB.id, { title: "入链来源" })
+    repository.updateNote(center.id, { title: "中心" })
+
+    const graph = repository.getNoteGraph(center.id, 2)
+    const ids = graph.nodes.map((node) => node.id)
+    assert.ok(graph.nodes.length >= 3, `应包含中心与至少两个邻居，实际 ${ids.join(",")}`)
+    assert.ok(ids.includes(center.id), "应包含中心节点")
+    assert.ok(ids.includes(outA.id), "应包含出链节点")
+    assert.ok(ids.includes(inB.id), "应包含入链节点")
+
+    // 中心 depth=0，邻居 depth=1。
+    const centerNode = graph.nodes.find((node) => node.id === center.id)
+    const neighbor = graph.nodes.find((node) => node.id === outA.id)
+    assert.equal(centerNode?.depth, 0)
+    assert.equal(neighbor?.depth, 1)
+
+    // links 应覆盖 center->outA 与 inB->center 两条边，且无自环。
+    const pairSet = graph.links.map((edge) => `${edge.source}->${edge.target}`)
+    assert.ok(pairSet.includes(`${center.id}->${outA.id}`))
+    assert.ok(pairSet.includes(`${inB.id}->${center.id}`))
+    assert.ok(graph.links.every((edge) => edge.source !== edge.target))
+  })
+})
+
+test("局部图谱排除已删除笔记与自环，空引用返回空集", () => {
+  withRepository((repository) => {
+    const center = repository.createNote(null)
+    const deleted = repository.createNote(null)
+    repository.updateNote(deleted.id, { title: "将被删除" })
+    repository.updateNote(center.id, {
+      title: "中心",
+      content: `[del](https://xinyue-note.local/${deleted.id})`
+    })
+    repository.setNoteDeleted(deleted.id, true)
+
+    const graph = repository.getNoteGraph(center.id, 2)
+    const ids = graph.nodes.map((node) => node.id)
+    assert.ok(ids.includes(center.id), "中心节点始终保留")
+    assert.ok(!ids.includes(deleted.id), "已删除笔记不应出现在图谱中")
+    assert.ok(graph.links.every((edge) => edge.source !== edge.target), "不应存在自环边")
+
+    const lonely = repository.createNote(null)
+    repository.updateNote(lonely.id, { title: "孤立" })
+    const empty = repository.getNoteGraph(lonely.id, 2)
+    assert.equal(empty.nodes.length, 1)
+    assert.equal(empty.nodes[0].id, lonely.id)
+    assert.equal(empty.links.length, 0)
+  })
+})

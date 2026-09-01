@@ -1144,6 +1144,66 @@ function createRepository(database) {
   }
 
   /**
+   * 以指定笔记为中心，向外/向内展开 maxDepth 跳的局部引用图谱。
+   *
+   * 只基于 note_links 表（显式链接），每跳同时覆盖“引用它”与“它引用”两个方向，
+   * 用递归 CTE 配合路径串防环。已删除笔记不参与。
+   *
+   * @param {string} noteId 中心笔记 ID。
+   * @param {number} maxDepth 最大跳数（1-3，超出截断）。
+   * @returns {{ nodes: Array<{ id: string, title: string, folderId: string | null, depth: number }>, links: Array<{ source: string, target: string }>, rootId: string }} 图谱数据。
+   */
+  function getNoteGraph(noteId, maxDepth = 2) {
+    const depth = Math.max(1, Math.min(3, Number(maxDepth) || 2))
+    const root = database.prepare("SELECT id FROM notes WHERE id = ? AND is_deleted = 0").get(noteId)
+    if (!root) return { nodes: [], links: [], rootId: noteId }
+
+    // 递归 CTE：从中心出发，沿 note_links 双向展开（source -> target 及反向）。
+    // 用 path 记录已访问节点串，避免环形引用导致无限递归。
+    const rows = database.prepare(`
+      WITH RECURSIVE reach(note_id, depth, path) AS (
+        SELECT :root, 0, ',' || :root || ','
+        UNION ALL
+        SELECT next.target_id, reach.depth + 1, reach.path || next.target_id || ','
+        FROM reach
+        JOIN (
+          SELECT source_note_id AS source_id, target_note_id AS target_id FROM note_links WHERE source_note_id != target_note_id
+          UNION ALL
+          SELECT target_note_id AS source_id, source_note_id AS target_id FROM note_links WHERE source_note_id != target_note_id
+        ) next ON next.source_id = reach.note_id
+        WHERE reach.depth < :depth
+          AND instr(reach.path, ',' || next.target_id || ',') = 0
+      )
+      SELECT n.id AS id, n.title AS title, n.folder_id AS folderId,
+             reach.depth AS depth
+      FROM reach
+      LEFT JOIN notes n ON n.id = reach.note_id
+      WHERE n.is_deleted = 0 OR reach.note_id = :root
+      ORDER BY reach.depth, n.title
+    `).all({ root: noteId, depth })
+
+    const nodes = rows.map((row) => ({
+      id: row.id,
+      title: row.title || "（无标题）",
+      folderId: row.folderId,
+      depth: row.depth
+    }))
+
+    const nodeIds = new Set(nodes.map((node) => node.id))
+    // 收集可达集合内的邻接边（去重、排除自环），方向统一为 source -> target 的有向边。
+    const edgeRows = database.prepare(`
+      SELECT DISTINCT source_note_id AS source, target_note_id AS target
+      FROM note_links
+      WHERE source_note_id != target_note_id
+    `).all()
+    const links = edgeRows
+      .filter((edge) => nodeIds.has(edge.source) && nodeIds.has(edge.target))
+      .map((edge) => ({ source: edge.source, target: edge.target }))
+
+    return { nodes, links, rootId: noteId }
+  }
+
+  /**
    * 生成提及上下文片段，围绕标题首次出现处截取前后文本。
    *
    * @param {string} content 笔记正文。
@@ -2314,6 +2374,7 @@ function createRepository(database) {
     updateNote,
     getBacklinks,
     getNoteMentions,
+    getNoteGraph,
     bulkUpdateNotes,
     listNoteConflicts,
     resolveNoteConflict,
