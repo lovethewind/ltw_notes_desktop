@@ -56,6 +56,7 @@ const QuickOpenDialog = defineAsyncComponent(() => import('./components/QuickOpe
 const NoteHistoryDialog = defineAsyncComponent(() => import('./components/NoteHistoryDialog.vue'))
 const GeneralSettingsDialog = defineAsyncComponent(() => import('./components/GeneralSettingsDialog.vue'))
 const AiAssistantPanel = defineAsyncComponent(() => import('./components/AiAssistantPanel.vue'))
+const GlobalGraphPanel = defineAsyncComponent(() => import('./components/GlobalGraphPanel.vue'))
 
 type FilterKind = 'all' | 'pinned' | 'trash' | 'folder' | 'tag'
 type SaveState = 'idle' | 'saving' | 'saved' | 'error'
@@ -170,6 +171,7 @@ const conflictResolving = ref(false)
 const conflictError = ref('')
 let conflictDetailRequestId = 0
 const generalSettingsVisible = ref(false)
+const globalGraphVisible = ref(false)
 const aiAssistantVisible = ref(false)
 const quickOpenVisible = ref(false)
 const quickOpenShortcut = ref(window.localStorage.getItem('notes-quick-open-shortcut') || 'CommandOrControl+O')
@@ -3106,6 +3108,15 @@ onBeforeUnmount(() => {
         >
           <Icon icon="tabler:sparkles" />
         </button>
+        <button
+          class="global-graph-button"
+          type="button"
+          aria-label="全局知识图谱"
+          data-tooltip="全局知识图谱"
+          @click.stop="globalGraphVisible = true"
+        >
+          <Icon icon="material-symbols:hub-rounded" />
+        </button>
         <div class="sync-control">
           <button
             class="sync-state"
@@ -3451,6 +3462,11 @@ onBeforeUnmount(() => {
           </div>
         </section>
         </div>
+
+        <button class="sidebar-graph-toggle" type="button" @click="globalGraphVisible = true">
+          <Icon icon="material-symbols:hub-rounded" />
+          全局知识图谱
+        </button>
 
         <footer class="sidebar-footer">
           <div><span class="status-light"></span>离线可用</div>
@@ -3925,6 +3941,9 @@ onBeforeUnmount(() => {
       :show-tree-lines="showTreeLines"
       @saved="applyGeneralSettings"
     />
+    <div v-if="globalGraphVisible" class="dialog-backdrop global-graph-backdrop" @click.self="globalGraphVisible = false">
+      <GlobalGraphPanel @close="globalGraphVisible = false" />
+    </div>
 
     <div v-if="syncDialogVisible" class="dialog-backdrop sync-dialog-backdrop" @click.self="syncDialogVisible = false">
       <form class="folder-dialog sync-dialog sync-center-dialog" @submit.prevent="saveSyncSettings">

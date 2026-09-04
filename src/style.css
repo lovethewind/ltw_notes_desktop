@@ -121,6 +121,9 @@ button { color: inherit; }
 .attachment-manager-button { position: relative; width: 32px; height: 32px; display: grid; place-items: center; border: 1px solid rgba(79,101,190,.2); border-radius: 10px; padding: 0; background: rgba(79,101,190,.08); color: #536db9; cursor: pointer; transition: color .14s ease, background .14s ease, border-color .14s ease, transform .14s ease; }
 .attachment-manager-button svg { font-size: 17px; }
 .attachment-manager-button:hover, .attachment-manager-button:focus-visible { border-color: rgba(79,101,190,.38); background: rgba(79,101,190,.14); transform: translateY(-1px); }
+.global-graph-button { position: relative; width: 32px; height: 32px; display: grid; place-items: center; border: 1px solid rgba(139,92,246,.22); border-radius: 10px; padding: 0; background: rgba(139,92,246,.08); color: #7c5cd6; cursor: pointer; transition: color .14s ease, background .14s ease, border-color .14s ease, transform .14s ease; }
+.global-graph-button svg { font-size: 18px; }
+.global-graph-button:hover, .global-graph-button:focus-visible { border-color: rgba(139,92,246,.4); background: rgba(139,92,246,.14); transform: translateY(-1px); }
 
 .error-banner { z-index: 5; display: flex; align-items: center; gap: 8px; padding: 9px 18px; background: #fff0f1; color: #be3445; font-size: 13px; }
 .error-banner button { margin-left: auto; border: 0; background: transparent; cursor: pointer; color: inherit; }
@@ -605,6 +608,10 @@ body.markdown-editor-focus-mode .milkdown-editor-shell.is-focus-mode { position:
 .folder-dialog p.general-settings-message { margin: 10px 0 0; color: #c94c59; font-weight: 650; }
 .folder-dialog .general-settings-actions { margin-top: 14px; }
 .data-transfer-dialog { width: min(570px, calc(100vw - 40px)); }
+.sidebar-graph-toggle { display: flex; align-items: center; gap: 7px; width: calc(100% - 24px); margin: 8px 12px 0; height: 36px; padding: 0 12px; border: 1px solid #dfe7f1; border-radius: 9px; background: #f8fbff; color: #47709f; cursor: pointer; font-size: 12px; font-weight: 600; }
+.sidebar-graph-toggle svg { width: 16px; height: 16px; }
+.sidebar-graph-toggle:hover { border-color: var(--blue); background: #edf5ff; color: var(--blue); }
+.global-graph-backdrop { z-index: 230; }
 .folder-dialog .data-transfer-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 4px; }
 .folder-dialog .data-transfer-grid > button { height: auto; min-height: 72px; display: flex; align-items: center; gap: 12px; border: 1px solid #dfe7f1; padding: 12px 14px; background: #f8fbff; color: #33445d; text-align: left; transition: border-color .14s ease, background .14s ease, transform .14s ease, box-shadow .14s ease; }
 .folder-dialog .data-transfer-grid > button:hover, .folder-dialog .data-transfer-grid > button:focus-visible { border-color: #9bc3f1; background: #f0f7ff; box-shadow: 0 8px 20px rgba(47,128,237,.1); transform: translateY(-1px); }
@@ -1016,6 +1023,8 @@ button:focus-visible { outline: 3px solid rgba(47,128,237,.22); outline-offset: 
   .data-transfer-button:hover, .data-transfer-button:focus-visible { border-color: #47838a; background: #1a444b; color: #b1eee6; }
   .attachment-manager-button { border-color: #3b466e; background: #202944; color: #a9b8f3; }
   .attachment-manager-button:hover, .attachment-manager-button:focus-visible { border-color: #576799; background: #293556; color: #d1d9ff; }
+  .global-graph-button { border-color: #46346e; background: #241c3c; color: #b7a3f3; }
+  .global-graph-button:hover, .global-graph-button:focus-visible { border-color: #6b57a0; background: #2f2450; color: #d6c9ff; }
   .navigation-panel, .note-list-panel, .editor-panel { border-color: #263750; background: rgba(15,27,45,.92); box-shadow: 0 20px 50px rgba(0,0,0,.2); }
   .editor-panel { background: rgba(14,25,42,.96); }
   .note-tab-bar { background: rgba(10,21,37,.9); }
@@ -1145,6 +1154,9 @@ button:focus-visible { outline: 3px solid rgba(47,128,237,.22); outline-offset: 
   .folder-dialog .general-shortcut-recorder.recording { border-color: #5795df; background: #203753; color: #9fc8fa; }
   .folder-dialog .general-setting-switch { background: #40536a; }
   .folder-dialog .general-setting-switch.active { background: #4389df; }
+  .sidebar-graph-toggle { border-color: #2c405b; background: #14253c; color: #9fc8fa; }
+  .sidebar-graph-toggle:hover { border-color: #5795df; background: #203753; color: #9fc8fa; }
+  :scope { --global-graph-bg: #101d30; --global-graph-border: #2a3c56; --global-graph-header: #14253c; }
   .folder-dialog .data-transfer-grid > button { border-color: #2c405b; background: #14253c; color: #d5e1f0; }
   .folder-dialog .data-transfer-grid > button:hover, .folder-dialog .data-transfer-grid > button:focus-visible { border-color: #416b99; background: #1b304c; }
   .data-transfer-grid strong { color: #e5effc; }

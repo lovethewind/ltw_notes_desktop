@@ -1239,3 +1239,41 @@ test("局部图谱排除已删除笔记与自环，空引用返回空集", () =>
     assert.equal(empty.links.length, 0)
   })
 })
+
+test("全局图谱只包含有双链关系的未删除笔记并按连接度裁剪", () => {
+  withRepository((repository) => {
+    const hub = repository.createNote(null)
+    const leafA = repository.createNote(null)
+    const leafB = repository.createNote(null)
+    const lonely = repository.createNote(null)
+    const deleted = repository.createNote(null)
+
+    repository.updateNote(hub.id, { title: "枢纽" })
+    repository.updateNote(leafA.id, { title: "叶子A" })
+    repository.updateNote(leafB.id, { title: "叶子B" })
+    repository.updateNote(lonely.id, { title: "孤立" })
+    repository.updateNote(deleted.id, { title: "删除" })
+    // hub 同时指向 leafA 与 leafB，形成两条边；删除节点参与一条已删除边。
+    repository.updateNote(hub.id, {
+      title: "枢纽",
+      content: `[a](https://xinyue-note.local/${leafA.id}) [b](https://xinyue-note.local/${leafB.id}) [del](https://xinyue-note.local/${deleted.id})`
+    })
+    repository.setNoteDeleted(deleted.id, true)
+
+    const graph = repository.getGlobalGraph(500)
+    const ids = graph.nodes.map((node) => node.id)
+    assert.ok(ids.includes(hub.id), "枢纽应出现")
+    assert.ok(ids.includes(leafA.id), "叶子A应出现")
+    assert.ok(ids.includes(leafB.id), "叶子B应出现")
+    assert.ok(!ids.includes(lonely.id), "孤立笔记不应出现")
+    assert.ok(!ids.includes(deleted.id), "已删除笔记不应出现")
+    assert.ok(graph.links.length >= 2, `至少应有两条有效边，实际 ${graph.links.length}`)
+    assert.ok(graph.links.every((edge) => edge.source !== edge.target), "不应存在自环")
+
+    // 裁剪到 2 个节点时，只保留连接度最高的枢纽与一个叶子。
+    const limited = repository.getGlobalGraph(2)
+    assert.equal(limited.nodes.length, 2)
+    assert.ok(limited.nodes.some((node) => node.id === hub.id), "裁剪后仍保留枢纽")
+    assert.ok(limited.links.length === 1, "裁剪后只保留一条边")
+  })
+})

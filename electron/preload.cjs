@@ -20,6 +20,8 @@ contextBridge.exposeInMainWorld("notesDesktop", {
   getNoteMentions: (noteId) => ipcRenderer.invoke("note:mentions", noteId),
   /** 以指定笔记为中心查询局部引用图谱。 @param {string} noteId @param {number} [maxDepth] */
   getNoteGraph: (noteId, maxDepth) => ipcRenderer.invoke("note:graph", noteId, maxDepth),
+  /** 查询全库双链关系图谱。 @param {number} [maxNodes] 节点数量上限。 */
+  getGlobalGraph: (maxNodes) => ipcRenderer.invoke("note:graph:global", maxNodes),
   /** @returns {Promise<string>} 返回冷启动期间待打开的笔记 ID。 */
   consumePendingNoteLink: () => ipcRenderer.invoke("note-link:consume-pending"),
   /**

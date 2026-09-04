@@ -72,6 +72,12 @@ export interface NoteGraph {
   rootId: string
 }
 
+/** 全库双链关系图谱，节点仅包含至少参与一条关系的未删除笔记。 */
+export interface GlobalGraph {
+  nodes: GraphNode[]
+  links: GraphLink[]
+}
+
 export interface WorkspaceData {
   folders: NoteFolder[]
   tags: NoteTag[]
@@ -391,6 +397,8 @@ export interface NotesDesktopApi {
   getNoteMentions(noteId: string): Promise<MentionNote[]>
   /** 以指定笔记为中心查询局部引用图谱。 */
   getNoteGraph(noteId: string, maxDepth?: number): Promise<NoteGraph>
+  /** 查询全库双链关系图谱。 */
+  getGlobalGraph(maxNodes?: number): Promise<GlobalGraph>
   /** 获取冷启动期间待打开的笔记 ID。 */
   consumePendingNoteLink(): Promise<string>
   /** 监听外部应用触发的笔记深链接。 */

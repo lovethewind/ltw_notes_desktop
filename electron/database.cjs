@@ -1204,6 +1204,62 @@ function createRepository(database) {
   }
 
   /**
+   * 构建全库双链关系图谱。
+   *
+   * 只纳入至少参与一条关系的未删除笔记，并按连接度从高到低裁剪到上限，
+   * 避免全库节点过多时力导向布局卡顿。返回的边均为两端都在节点集合内的去重有向边。
+   *
+   * @param {number} [maxNodes=500] 节点数量上限。
+   * @returns {{ nodes: Array<{ id: string, title: string, folderId: string | null, depth: number }>, links: Array<{ source: string, target: string }> }} 全库图谱数据。
+   */
+  function getGlobalGraph(maxNodes = 500) {
+    // maxNodes 是节点的硬上限，避免渲染超大图；下限为 1，防止取非正值时返回空图。
+    const requested = Number(maxNodes)
+    const limit = Math.max(1, Math.min(1000, Number.isFinite(requested) && requested > 0 ? requested : 500))
+    const liveRows = database.prepare(`
+      SELECT id, title, folder_id AS folderId FROM notes WHERE is_deleted = 0
+    `).all()
+    const liveById = new Map(liveRows.map((row) => [row.id, row]))
+    if (liveById.size === 0) return { nodes: [], links: [] }
+
+    const edgeRows = database.prepare(`
+      SELECT DISTINCT source_note_id AS source, target_note_id AS target
+      FROM note_links WHERE source_note_id != target_note_id
+    `).all()
+
+    // 只保留两端都是未删除笔记的边，并累计每条节点被引用的次数作为连接度。
+    const degreeByNode = new Map()
+    const validEdges = []
+    for (const edge of edgeRows) {
+      if (!liveById.has(edge.source) || !liveById.has(edge.target)) continue
+      validEdges.push(edge)
+      degreeByNode.set(edge.source, (degreeByNode.get(edge.source) || 0) + 1)
+      degreeByNode.set(edge.target, (degreeByNode.get(edge.target) || 0) + 1)
+    }
+    if (validEdges.length === 0) return { nodes: [], links: [] }
+
+    // 有参与关系的节点按连接度降序，再按标题稳定排序后截断。
+    const rankedNodeIds = [...degreeByNode.keys()]
+      .sort((left, right) => {
+        const byDegree = (degreeByNode.get(right) || 0) - (degreeByNode.get(left) || 0)
+        if (byDegree !== 0) return byDegree
+        return String(liveById.get(left)?.title || "").localeCompare(String(liveById.get(right)?.title || ""))
+      })
+      .slice(0, limit)
+    const selectedIds = new Set(rankedNodeIds)
+    const nodes = rankedNodeIds.map((id) => ({
+      id,
+      title: liveById.get(id)?.title || "（无标题）",
+      folderId: liveById.get(id)?.folderId ?? null,
+      depth: 0
+    }))
+    const links = validEdges
+      .filter((edge) => selectedIds.has(edge.source) && selectedIds.has(edge.target))
+      .map((edge) => ({ source: edge.source, target: edge.target }))
+    return { nodes, links }
+  }
+
+  /**
    * 生成提及上下文片段，围绕标题首次出现处截取前后文本。
    *
    * @param {string} content 笔记正文。
@@ -2375,6 +2431,7 @@ function createRepository(database) {
     getBacklinks,
     getNoteMentions,
     getNoteGraph,
+    getGlobalGraph,
     bulkUpdateNotes,
     listNoteConflicts,
     resolveNoteConflict,

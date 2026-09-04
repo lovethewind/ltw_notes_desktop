@@ -16,6 +16,7 @@ function registerWorkspaceHandlers(ipcMain, domain) {
   ipcMain.handle("note:backlinks", (_event, noteId) => domain.getBacklinks(noteId))
   ipcMain.handle("note:mentions", (_event, noteId) => domain.getMentions(noteId))
   ipcMain.handle("note:graph", (_event, noteId, maxDepth) => domain.getNoteGraph(noteId, maxDepth))
+  ipcMain.handle("note:graph:global", (_event, maxNodes) => domain.getGlobalGraph(maxNodes))
   ipcMain.handle("note-link:consume-pending", domain.consumePendingNoteLink)
 }
 
