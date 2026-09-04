@@ -2204,8 +2204,53 @@ function installMenu() {
         { label: "缩放", role: "zoom" },
         { label: "前置全部窗口", role: "front" }
       ]
+    },
+    {
+      label: "开发者",
+      submenu: [
+        {
+          label: "打开开发者工具",
+          accelerator: "CmdOrCtrl+Alt+I",
+          click: () => openDevToolsForCurrentTarget()
+        },
+        { type: "separator" },
+        {
+          label: "重新加载主窗口",
+          click: () => reloadCurrentTarget()
+        }
+      ]
     }
   ]))
+}
+
+/**
+ * 打开当前活跃窗口（主窗口或快速记录窗口）的开发者工具，
+ * 便于诊断渲染层报错。若没有可用的窗口则忽略。
+ *
+ * @returns {void}
+ */
+function openDevToolsForCurrentTarget() {
+  const candidate = (BrowserWindow.getFocusedWindow() || mainWindow)
+  if (candidate && !candidate.isDestroyed() && !candidate.webContents.isDestroyed()) {
+    candidate.webContents.openDevTools({ mode: "detach" })
+    return
+  }
+  if (quickCaptureWindow && !quickCaptureWindow.isDestroyed()
+      && !quickCaptureWindow.webContents.isDestroyed()) {
+    quickCaptureWindow.webContents.openDevTools({ mode: "detach" })
+  }
+}
+
+/**
+ * 重新加载当前活跃窗口（主窗口优先），用于菜单调试入口。
+ *
+ * @returns {void}
+ */
+function reloadCurrentTarget() {
+  const candidate = (BrowserWindow.getFocusedWindow() || mainWindow)
+  if (candidate && !candidate.isDestroyed() && !candidate.webContents.isDestroyed()) {
+    candidate.webContents.reload()
+  }
 }
 
 /**
