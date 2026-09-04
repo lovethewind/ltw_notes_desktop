@@ -79,8 +79,18 @@
     </aside>
     <NoteLinkPicker
       :visible="noteLinkPickerVisible"
+      :all-notes="props.allNotes"
+      :folders="props.folders"
       @close="noteLinkPickerVisible = false"
       @select="insertNoteLink"
+    />
+    <NoteLinkPicker
+      :visible="noteEmbedPickerVisible"
+      title="插入笔记嵌入"
+      :all-notes="props.allNotes"
+      :folders="props.folders"
+      @close="noteEmbedPickerVisible = false"
+      @select="insertNoteEmbed"
     />
     <LinkSuggestPopover
       :visible="linkSuggestVisible"
@@ -102,18 +112,24 @@ import { commandsCtx, editorViewCtx } from '@milkdown/kit/core'
 import { historyProviderPlugin, redoCommand, undoCommand } from '@milkdown/kit/plugin/history'
 import { redoDepth, undoDepth } from '@milkdown/kit/prose/history'
 import type { Node as ProseMirrorNode } from '@milkdown/kit/prose/model'
-import { paragraphSchema } from '@milkdown/kit/preset/commonmark'
+import {
+  paragraphSchema,
+  clearTextInCurrentBlockCommand,
+  addBlockTypeCommand
+} from '@milkdown/kit/preset/commonmark'
 import { TextSelection } from '@milkdown/kit/prose/state'
 import { Decoration, DecorationSet } from '@milkdown/kit/prose/view'
 import { replaceAll } from '@milkdown/kit/utils'
+import { installXynoteEmbedFeature } from '../editor/xynote-embed'
 import { Icon } from '@iconify/vue'
 import { defineAsyncComponent, h, nextTick, onBeforeUnmount, onMounted, ref, render, watch } from 'vue'
 import { extractMarkdownOutline, type MarkdownOutlineItem } from '../utils/markdown-outline'
 import { formatJsonCode } from '../utils/json-code-formatter.js'
-import type { OfflineNote } from '../types'
+import type { NoteFolder, OfflineNote } from '../types'
 import NoteLinkPicker from './NoteLinkPicker.vue'
 import BacklinksPanel from './BacklinksPanel.vue'
 import LinkSuggestPopover from './LinkSuggestPopover.vue'
+import { dispatchOpenNote } from '../utils/note-open-events'
 
 // 关系图谱仅在展开时用到 d3-force，改为异步组件避免把布局库打进主 chunk。
 const NoteGraphPanel = defineAsyncComponent(() => import('./NoteGraphPanel.vue'))
@@ -125,6 +141,10 @@ interface Props {
   showToolbar?: boolean
   showOutline?: boolean
   scrollTop?: number
+  /** 当前工作区全部笔记，供插入链接/嵌入的候选框在未搜索时展示「最近更新」列表。 */
+  allNotes?: OfflineNote[]
+  /** 当前工作区文件夹树，供候选框把笔记位置解析为完整路径。 */
+  folders?: NoteFolder[]
 }
 
 interface OutlineCacheEntry {
@@ -151,7 +171,9 @@ const props = withDefaults(defineProps<Props>(), {
   readonly: false,
   showToolbar: true,
   showOutline: true,
-  scrollTop: 0
+  scrollTop: 0,
+  allNotes: () => [],
+  folders: () => []
 })
 const emit = defineEmits<{
   (event: 'change', value: string, documentId: string): void
@@ -162,6 +184,7 @@ const editorRootRef = ref<HTMLDivElement | null>(null)
 const editorScrollRef = ref<HTMLDivElement | null>(null)
 const attachmentInputRef = ref<HTMLInputElement | null>(null)
 const noteLinkPickerVisible = ref(false)
+const noteEmbedPickerVisible = ref(false)
 const backlinksOpen = ref(false)
 const noteGraphOpen = ref(false)
 const linkSuggestVisible = ref(false)
@@ -237,9 +260,8 @@ function handleEditorLinkClick(event: MouseEvent): void {
     event.stopPropagation()
     if (event.button !== 0 || !shouldOpenLink) return
     const noteId = decodeURIComponent(new URL(href).pathname.slice(1))
-    void window.notesDesktop.openNoteLink(noteId).catch((error: unknown) => {
-      showFeedback(error instanceof Error ? error.message : '笔记打开失败')
-    })
+    // 内部链接 → 新标签页打开（原 IPC openNoteLink 是原地切换当前文档）
+    if (noteId) dispatchOpenNote(noteId, true)
     return
   }
   if (href && new URL(href).hostname === 'xinyue-asset.local') {
@@ -815,6 +837,57 @@ async function insertNoteLink(noteId: string, title: string): Promise<void> {
   }
 }
 
+/**
+ * 打开「插入笔记嵌入」选择器（与插入链接共用 NoteLinkPicker，入口独立）。
+ *
+ * :return: 无返回值。
+ */
+function openNoteEmbedPicker(): void {
+  if (props.readonly) {
+    showFeedback('只读模式下无法插入笔记嵌入')
+    return
+  }
+  noteEmbedPickerVisible.value = true
+}
+
+/**
+ * 将选中的笔记以嵌入卡片形式插入当前光标所在块。
+ *
+ * 复用 noteEmbed 自定义块节点（src/editor/xynote-embed.ts）：markdown 以
+ * `<div data-xynote-embed="note:<id>" title="..."></div>` 承载，往返无损；
+ * 渲染阶段由 nodeView 呈现为真实卡片。
+ *
+ * :param noteId: 目标笔记 ID。
+ * :param title: 卡片兜底标题（markdown title 属性，可空）。
+ * :return: 无返回值。
+ */
+async function insertNoteEmbed(noteId: string, title: string): Promise<void> {
+  noteEmbedPickerVisible.value = false
+  if (!editor || !editorReady || props.readonly) return
+  if (!noteId) {
+    showFeedback('无法插入空笔记嵌入')
+    return
+  }
+  try {
+    await editor.editor.action((context) => {
+      const commands = context.get(commandsCtx)
+      const view = context.get(editorViewCtx)
+      const embedType = view.state.schema.nodes.xynoteEmbed
+      if (!embedType) throw new Error('笔记嵌入能力不可用')
+      // 与 Crepe 内置 image/table 的插入同套路：先清空当前块文本，再把块替换为卡片节点。
+      // 由 ProseMirror 命令层处理光标位置，规避手写 transaction 的块内嵌块越界风险。
+      commands.call(clearTextInCurrentBlockCommand.key)
+      commands.call(addBlockTypeCommand.key, {
+        nodeType: embedType,
+        attrs: { noteId, title: title || null }
+      })
+      view.focus()
+    })
+  } catch (error) {
+    showFeedback(error instanceof Error ? error.message : '插入笔记嵌入失败')
+  }
+}
+
 /** 当前编辑器的 ProseMirror 视图，供 [ [ 补全同步读取光标与文本。 */
 let linkSuggestEditorView: any = null
 
@@ -1383,6 +1456,7 @@ function groupTopBarActions(actions: HTMLElement): void {
   }, [
     createToolbarActionButton({ label: '附件', icon: 'tabler:paperclip', action: openAttachmentPicker }),
     createToolbarActionButton({ label: '插入笔记链接', icon: 'tabler:link', action: openNoteLinkPicker }),
+    createToolbarActionButton({ label: '嵌入笔记', icon: 'material-symbols:note-add', action: openNoteEmbedPicker }),
     ...pickButtons(['表格', '公式', '引用', '分隔线']),
     createToolbarActionButton({ label: '行内公式', icon: 'material-symbols:functions-rounded', action: toggleInlineFormula })
   ])
@@ -1537,6 +1611,8 @@ async function createEditor(): Promise<void> {
     }
   })
   editor = crepe
+  // T1 spike：注册笔记嵌入自定义节点（自包含、可回退，见 src/editor/xynote-embed.ts）
+  crepe.addFeature(installXynoteEmbedFeature)
   crepe.on((listener) => {
     listener.updated(() => {
       if (editorRootRef.value) syncHistoryActionButtons(editorRootRef.value)

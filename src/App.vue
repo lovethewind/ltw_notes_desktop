@@ -28,6 +28,7 @@ import type { GeneralSettingsResult } from './components/GeneralSettingsDialog.v
 import type { QuickOpenSelection } from './components/QuickOpenDialog.vue'
 import SearchExcerpt from './components/SearchExcerpt.vue'
 import { matchesShortcut } from './utils/keyboard-shortcuts'
+import { OPEN_NOTE_EVENT, type OpenNoteEventDetail } from './utils/note-open-events'
 import { useAppUpdate } from './composables/useAppUpdate'
 import { useAttachmentManager } from './composables/useAttachmentManager'
 import { useDatabaseBackups } from './composables/useDatabaseBackups'
@@ -2715,6 +2716,41 @@ async function openNoteFromLink(noteId: string): Promise<void> {
 }
 
 /**
+ * 处理渲染进程内自定义「打开笔记」事件（如嵌入卡片点击）。
+ *
+ * 与 IPC 驱动的 openNoteFromLink 不同：此事件来自同渲染进程的深居组件（NoteEmbedCard 等），
+ * 可按 newTab 路由到 openNoteInNewTab（新标签页，保留当前阅读上下文）或原地切换。
+ *
+ * :param detail: 事件载荷，含 noteId 与 newTab 标志。
+ * :return: 无返回值。
+ */
+async function handleOpenNoteEvent(detail: OpenNoteEventDetail): Promise<void> {
+  const { noteId, newTab } = detail
+  if (!noteId) return
+  if (initialWorkspaceLoad) await initialWorkspaceLoad
+  const note = workspace.notes.find(
+    (item) => (item.id === noteId || item.serverId === noteId) && !item.isDeleted
+  )
+  if (!note) {
+    actionError.value = '链接对应的笔记不存在，或已被删除'
+    return
+  }
+  if (newTab) {
+    await openNoteInNewTab(note)
+    return
+  }
+  searchKeyword.value = ''
+  setFilter('all')
+  await selectNote(note)
+}
+
+/** window 级「打开笔记」事件监听器（稳定引用，便于挂载/卸载时 add/remove）。 */
+const handleWindowOpenNote = (event: Event): void => {
+  const detail = (event as CustomEvent<OpenNoteEventDetail>).detail
+  if (detail) void handleOpenNoteEvent(detail)
+}
+
+/**
  * 执行标签右键菜单中的删除命令。
  *
  * :return: 删除完成后的 Promise。
@@ -3004,6 +3040,7 @@ onMounted(() => {
   window.addEventListener('keydown', handleShortcut)
   window.addEventListener('drop', finishResourceDrag)
   window.addEventListener('dragend', finishResourceDrag)
+  window.addEventListener(OPEN_NOTE_EVENT, handleWindowOpenNote)
   systemThemeMedia.addEventListener('change', handleSystemThemeChange)
   document.addEventListener('pointerover', showButtonTooltip)
   document.addEventListener('pointerout', hideButtonTooltip)
@@ -3055,6 +3092,7 @@ onBeforeUnmount(() => {
   window.removeEventListener('keydown', handleShortcut)
   window.removeEventListener('drop', finishResourceDrag)
   window.removeEventListener('dragend', finishResourceDrag)
+  window.removeEventListener(OPEN_NOTE_EVENT, handleWindowOpenNote)
   finishResourceDrag()
   systemThemeMedia.removeEventListener('change', handleSystemThemeChange)
   document.removeEventListener('pointerover', showButtonTooltip)
@@ -3673,6 +3711,8 @@ onBeforeUnmount(() => {
               :document-id="activeNote.id"
               :scroll-top="noteScrollTops[activeNote.id] ?? 0"
               :value="draft.content"
+              :all-notes="workspace.notes"
+              :folders="workspace.folders"
               @change="updateDraftContent"
               @scroll-position-change="updateNoteScrollPosition"
             />

@@ -391,7 +391,9 @@ test("笔记右键菜单可复制并响应应用深链接", () => {
   assert.match(preloadSource, /onOpenNoteLink/)
   assert.match(preloadSource, /ipcRenderer\.on\("note-link:open"/)
   assert.match(preloadSource, /note-link:open-local/)
-  assert.match(editorSource, /window\.notesDesktop\.openNoteLink\(noteId\)/)
+  // 编辑器内部链接点击改为「新标签页打开」：经 note-open-events 总线派发，而非 IPC 原地切换。
+  assert.match(editorSource, /dispatchOpenNote\(noteId, true\)/)
+  assert.match(editorSource, /import \{ dispatchOpenNote \} from '\.\.\/utils\/note-open-events'/)
 })
 
 test("退出账号只清除认证并保留当前用户档案", () => {
