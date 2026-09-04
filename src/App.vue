@@ -3029,7 +3029,9 @@ onMounted(() => {
     Object.assign(databaseBackupStatus, status)
   })
   disposeSyncAuthResult = window.notesDesktop.onSyncAuthResult((result) => void handleSyncAuthResult(result))
-  disposeSyncStatus = window.notesDesktop.onSyncStatus((status) => Object.assign(syncStatus, status))
+  disposeSyncStatus = window.notesDesktop.onSyncStatus((status) => {
+    Object.assign(syncStatus, status)
+  })
   disposeWorkspaceChanged = window.notesDesktop.onWorkspaceChanged(() => void refreshWorkspace())
   void window.notesDesktop.setTheme(themeMode.value)
   void loadSyncSettings()
