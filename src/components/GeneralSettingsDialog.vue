@@ -2,15 +2,18 @@
 import { ref, watch } from 'vue'
 import { Icon } from '@iconify/vue'
 import { formatShortcut, getShortcutFromEvent } from '../utils/keyboard-shortcuts'
+import type { NoteSortOrder } from '../types'
 
 export interface GeneralSettingsResult {
   quickOpenShortcut: string
   showTreeLines: boolean
+  noteSortOrder: NoteSortOrder
 }
 
 const props = defineProps<{
   quickOpenShortcut: string
   showTreeLines: boolean
+  noteSortOrder: NoteSortOrder
 }>()
 
 const emit = defineEmits<{
@@ -26,6 +29,14 @@ const generalShortcut = ref('CommandOrControl+Shift+Space')
 const quickCaptureFolderId = ref<string | null>(null)
 const draftQuickOpenShortcut = ref(props.quickOpenShortcut)
 const draftShowTreeLines = ref(props.showTreeLines)
+const draftNoteSortOrder = ref<NoteSortOrder>(props.noteSortOrder)
+
+/** 笔记列表排序选项，供主列表与文件夹树统一使用。 */
+const sortOptions: Array<{ value: NoteSortOrder, label: string }> = [
+  { value: 'updated', label: '最近更新' },
+  { value: 'created', label: '创建时间' },
+  { value: 'title', label: '标题' }
+]
 
 /** 每次打开都读取桌面主进程中的快速记录设置，避免展示过期值。 */
 async function loadSettings(): Promise<void> {
@@ -34,6 +45,7 @@ async function loadSettings(): Promise<void> {
   quickOpenShortcutRecording.value = false
   draftQuickOpenShortcut.value = props.quickOpenShortcut
   draftShowTreeLines.value = props.showTreeLines
+  draftNoteSortOrder.value = props.noteSortOrder
   try {
     const settings = await window.notesDesktop.getQuickCaptureSettings()
     generalShortcut.value = settings.shortcut
@@ -70,9 +82,11 @@ async function saveSettings(): Promise<void> {
     })
     window.localStorage.setItem('notes-show-tree-lines', String(draftShowTreeLines.value))
     window.localStorage.setItem('notes-quick-open-shortcut', draftQuickOpenShortcut.value)
+    window.localStorage.setItem('notes-note-sort-order', draftNoteSortOrder.value)
     emit('saved', {
       quickOpenShortcut: draftQuickOpenShortcut.value,
-      showTreeLines: draftShowTreeLines.value
+      showTreeLines: draftShowTreeLines.value,
+      noteSortOrder: draftNoteSortOrder.value
     })
     visible.value = false
   } catch (error) {
@@ -105,6 +119,12 @@ watch(visible, (isVisible) => {
         <section class="general-setting-item">
           <div><strong>文件夹树连接线</strong><small>显示侧边栏文件夹层级之间的辅助线</small></div>
           <button :class="['general-setting-switch', { active: draftShowTreeLines }]" type="button" role="switch" :aria-checked="draftShowTreeLines" @click="draftShowTreeLines = !draftShowTreeLines"><span></span></button>
+        </section>
+        <section class="general-setting-item">
+          <div><strong>笔记列表排序</strong><small>决定主列表与文件夹树中的笔记顺序</small></div>
+          <select v-model="draftNoteSortOrder" class="general-setting-select" aria-label="笔记列表排序">
+            <option v-for="option in sortOptions" :key="option.value" :value="option.value">{{ option.label }}</option>
+          </select>
         </section>
       </div>
       <p v-if="message" class="general-settings-message">{{ message }}</p>

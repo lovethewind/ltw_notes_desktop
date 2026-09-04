@@ -40,6 +40,7 @@ import type {
   NoteFolder,
   NoteConflictPair,
   NotePatch,
+  NoteSortOrder,
   NoteTag,
   OfflineNote,
   SyncConnectionResult,
@@ -177,6 +178,8 @@ const quickOpenVisible = ref(false)
 const quickOpenShortcut = ref(window.localStorage.getItem('notes-quick-open-shortcut') || 'CommandOrControl+O')
 const storedShowTreeLines = window.localStorage.getItem('notes-show-tree-lines')
 const showTreeLines = ref(storedShowTreeLines !== 'false')
+const storedNoteSortOrder = window.localStorage.getItem('notes-note-sort-order') as NoteSortOrder | null
+const noteSortOrder = ref<NoteSortOrder>(['updated', 'created', 'title'].includes(storedNoteSortOrder ?? '') ? storedNoteSortOrder! : 'updated')
 const syncTesting = ref(false)
 const syncBrowserLoginPending = ref(false)
 const syncSaving = ref(false)
@@ -433,6 +436,25 @@ const navigationActive = computed<NoteNavigationKind | null>(() =>
     ? activeFilter.kind
     : null
 )
+/**
+ * 按用户选择的排序基准比较两篇笔记，置顶始终优先。
+ *
+ * :param left: 左侧笔记。
+ * :param right: 右侧笔记。
+ * :return: 负数表示 left 应排在 right 前。
+ */
+function compareNotesBySortOrder(left: OfflineNote, right: OfflineNote): number {
+  if (left.isPinned !== right.isPinned) return left.isPinned ? -1 : 1
+  switch (noteSortOrder.value) {
+    case 'created':
+      return Date.parse(right.createdAt) - Date.parse(left.createdAt)
+    case 'title':
+      return left.title.localeCompare(right.title, undefined, { numeric: true, sensitivity: 'base' })
+    case 'updated':
+    default:
+      return Date.parse(right.updatedAt) - Date.parse(left.updatedAt)
+  }
+}
 const visibleNotes = computed(() => {
   const keyword = searchKeyword.value.trim().toLocaleLowerCase()
   const sourceNotes = keyword ? workspaceSearchNotes.value : workspace.notes
@@ -443,7 +465,7 @@ const visibleNotes = computed(() => {
     if (activeFilter.kind === 'tag' && !note.tags.some((tag) => tag.id === activeFilter.id)) return false
     return true
   }).sort((left, right) => {
-    if (!keyword) return 0
+    if (!keyword) return compareNotesBySortOrder(left, right)
     return Number(right.title.toLocaleLowerCase().includes(keyword))
       - Number(left.title.toLocaleLowerCase().includes(keyword))
   })
@@ -456,7 +478,7 @@ const explorerNotes = computed(() => {
     if (activeFilter.kind === 'tag' && !note.tags.some((tag) => tag.id === activeFilter.id)) return false
     return true
   }).sort((left, right) => {
-    if (!keyword) return 0
+    if (!keyword) return compareNotesBySortOrder(left, right)
     return Number(right.title.toLocaleLowerCase().includes(keyword))
       - Number(left.title.toLocaleLowerCase().includes(keyword))
   })
@@ -829,6 +851,7 @@ function openGeneralSettings(): void {
 function applyGeneralSettings(settings: GeneralSettingsResult): void {
   quickOpenShortcut.value = settings.quickOpenShortcut
   showTreeLines.value = settings.showTreeLines
+  noteSortOrder.value = settings.noteSortOrder
 }
 
 /** 查询工作区笔记；本地列表缺失时只刷新一次，集中复用定位流程。 */
@@ -1554,10 +1577,7 @@ function replaceNote(note: OfflineNote): void {
   const index = workspace.notes.findIndex((item) => item.id === note.id)
   if (index >= 0) workspace.notes[index] = note
   else workspace.notes.unshift(note)
-  workspace.notes.sort((left, right) => {
-    if (left.isPinned !== right.isPinned) return left.isPinned ? -1 : 1
-    return Date.parse(right.updatedAt) - Date.parse(left.updatedAt)
-  })
+  workspace.notes.sort(compareNotesBySortOrder)
 }
 
 /**
@@ -3939,6 +3959,7 @@ onBeforeUnmount(() => {
       v-model:visible="generalSettingsVisible"
       :quick-open-shortcut="quickOpenShortcut"
       :show-tree-lines="showTreeLines"
+      :note-sort-order="noteSortOrder"
       @saved="applyGeneralSettings"
     />
     <div v-if="globalGraphVisible" class="dialog-backdrop global-graph-backdrop" @click.self="globalGraphVisible = false">

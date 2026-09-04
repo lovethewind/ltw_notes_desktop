@@ -78,6 +78,9 @@ export interface GlobalGraph {
   links: GraphLink[]
 }
 
+/** 笔记列表可选的排序方式。 */
+export type NoteSortOrder = 'updated' | 'created' | 'title'
+
 export interface WorkspaceData {
   folders: NoteFolder[]
   tags: NoteTag[]
