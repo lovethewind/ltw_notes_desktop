@@ -105,10 +105,16 @@ test("仓库尚无正式 Release 时返回未发布状态", async () => {
 })
 
 test("从更新地址解析出安全的 DMG 文件名", () => {
-  const encoded = encodeURIComponent("心悦笔记-0.7.0-arm64.dmg")
+  const encoded = encodeURIComponent("xinyue-notes-macos-0.7.0-arm64.dmg")
   const url = `https://github.com/lovethewind/ltw_notes_desktop/releases/download/v0.7.0/${encoded}`
 
-  assert.equal(resolveDownloadFileName(url), "心悦笔记-0.7.0-arm64.dmg")
+  assert.equal(resolveDownloadFileName(url), "xinyue-notes-macos-0.7.0-arm64.dmg")
+
+  // 中文附件名同样能正确解码。
+  const encodedCn = encodeURIComponent("心悦笔记-0.7.0-arm64.dmg")
+  const cnUrl = `https://github.com/lovethewind/ltw_notes_desktop/releases/download/v0.7.0/${encodedCn}`
+  assert.equal(resolveDownloadFileName(cnUrl), "心悦笔记-0.7.0-arm64.dmg")
+
   assert.equal(
     resolveDownloadFileName("https://example.com/not-a-dmg.zip", { fallbackName: "fallback.dmg" }),
     "fallback.dmg"

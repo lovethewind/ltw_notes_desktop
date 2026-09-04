@@ -1912,7 +1912,7 @@ function registerIpcHandlers() {
         const savePath = path.join(
           app.getPath("downloads"),
           resolveDownloadFileName(parsedUrl.toString(), {
-            fallbackName: `xinyue-notes-${app.getVersion()}-${process.arch}.dmg`
+            fallbackName: `xinyue-notes-macos-${app.getVersion()}-${process.arch}.dmg`
           })
         )
         // 下载字节较大，限频推送进度，避免高频 IPC 挤占渲染进程。

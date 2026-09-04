@@ -101,8 +101,8 @@ async function checkForUpdates({ currentVersion, architecture, request }) {
 /**
  * 从下载地址解析安全的安装包文件名。
  *
- * GitHub 的 Release 附件名可能包含中文（如“心悦笔记-0.7.0-arm64.dmg”），
- * 路径会被 URL 编码，这里解码后再剔除文件系统不允许的字符。
+ * GitHub 的 Release 附件名通常为“xinyue-notes-macos-0.7.0-arm64.dmg”，
+ * 也可能包含中文（如“心悦笔记-0.7.0-arm64.dmg”），路径会被 URL 编码，这里解码后再剔除文件系统不允许的字符。
  *
  * @param {string} downloadUrl 下载地址。
  * @param {{ fallbackName?: string }} [options] 解析失败时的兜底文件名。
