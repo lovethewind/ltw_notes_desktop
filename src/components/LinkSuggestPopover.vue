@@ -45,7 +45,7 @@ const props = defineProps<{
 
 const emit = defineEmits<{
   (event: 'hover', index: number): void
-  (event: 'select', noteId: string, title: string): void
+  (event: 'select', noteId: string, serverId: string | null, title: string): void
 }>()
 
 const GAP = 6
@@ -132,7 +132,7 @@ onBeforeUnmount(() => {
 })
 
 function choose(note: OfflineNote): void {
-  emit('select', note.id, note.title || '（无标题）')
+  emit('select', note.id, note.serverId ?? null, note.title || '（无标题）')
 }
 </script>
 

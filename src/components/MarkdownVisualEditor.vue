@@ -27,6 +27,14 @@
         </button>
       </div>
     </Teleport>
+    <EditorContextMenu
+      :visible="editorContextMenu.visible"
+      :x="editorContextMenu.x"
+      :y="editorContextMenu.y"
+      :groups="editorContextMenu.groups"
+      @close="closeEditorContextMenu"
+      @command="runEditorContextCommand"
+    />
     <input
       ref="attachmentInputRef"
       class="attachment-file-input"
@@ -114,11 +122,18 @@ import { redoDepth, undoDepth } from '@milkdown/kit/prose/history'
 import type { Node as ProseMirrorNode } from '@milkdown/kit/prose/model'
 import {
   paragraphSchema,
+  headingSchema,
+  blockquoteSchema,
+  bulletListSchema,
+  orderedListSchema,
+  codeBlockSchema,
   clearTextInCurrentBlockCommand,
-  addBlockTypeCommand
+  addBlockTypeCommand,
+  setBlockTypeCommand,
+  wrapInBlockTypeCommand
 } from '@milkdown/kit/preset/commonmark'
-import { TextSelection } from '@milkdown/kit/prose/state'
-import { Decoration, DecorationSet } from '@milkdown/kit/prose/view'
+import { AllSelection, TextSelection } from '@milkdown/kit/prose/state'
+import { Decoration, DecorationSet, type EditorView as ProseMirrorView } from '@milkdown/kit/prose/view'
 import { replaceAll } from '@milkdown/kit/utils'
 import { installXynoteEmbedFeature } from '../editor/xynote-embed'
 import { Icon } from '@iconify/vue'
@@ -127,6 +142,8 @@ import { extractMarkdownOutline, type MarkdownOutlineItem } from '../utils/markd
 import { formatJsonCode } from '../utils/json-code-formatter.js'
 import type { NoteFolder, OfflineNote } from '../types'
 import NoteLinkPicker from './NoteLinkPicker.vue'
+import EditorContextMenu from './EditorContextMenu.vue'
+import type { EditorContextMenuGroup } from './EditorContextMenu.vue'
 import BacklinksPanel from './BacklinksPanel.vue'
 import LinkSuggestPopover from './LinkSuggestPopover.vue'
 import { dispatchOpenNote } from '../utils/note-open-events'
@@ -145,6 +162,11 @@ interface Props {
   allNotes?: OfflineNote[]
   /** 当前工作区文件夹树，供候选框把笔记位置解析为完整路径。 */
   folders?: NoteFolder[]
+  /**
+   * 同步站点域名（网页版地址，如 https://lovethewind.cn）。为空时插入的笔记链接退回本地
+   * xinyue-note.local 假域名（目标笔记未同步到云端时同样如此）。
+   */
+  webBaseUrl?: string
 }
 
 interface OutlineCacheEntry {
@@ -173,7 +195,8 @@ const props = withDefaults(defineProps<Props>(), {
   showOutline: true,
   scrollTop: 0,
   allNotes: () => [],
-  folders: () => []
+  folders: () => [],
+  webBaseUrl: ''
 })
 const emit = defineEmits<{
   (event: 'change', value: string, documentId: string): void
@@ -203,6 +226,13 @@ const focusMode = ref(false)
 const activeOutlineIndex = ref(0)
 const feedbackText = ref('')
 const imageContextMenu = ref({ visible: false, x: 0, y: 0, address: '' })
+/** 正文右键菜单状态。visible 控制显示，x/y 为弹出坐标，groups 为当前可用命令分组。 */
+const editorContextMenu = ref({
+  visible: false,
+  x: 0,
+  y: 0,
+  groups: [] as EditorContextMenuGroup[]
+})
 let editor: Crepe | null = null
 let editorReady = false
 let destroyed = false
@@ -255,6 +285,27 @@ function handleEditorLinkClick(event: MouseEvent): void {
     : null
   const href = anchor?.href ?? ''
   const shouldOpenLink = previewMode.value || props.readonly || event.metaKey || event.ctrlKey
+  // 网页版真实笔记链接 {webUrl}/notes/{serverId}：同样当作内部笔记链接，按 serverId 回落本地打开。
+  const webBaseHost = (() => {
+    try {
+      return props.webBaseUrl ? new URL(props.webBaseUrl).hostname : ''
+    } catch {
+      return ''
+    }
+  })()
+  if (href && webBaseHost && new URL(href).hostname === webBaseHost) {
+    const path = new URL(href).pathname
+    const notePathMatch = /^\/notes\/(\d+)\/?$/.exec(path)
+    if (notePathMatch) {
+      event.preventDefault()
+      event.stopPropagation()
+      if (event.button !== 0 || !shouldOpenLink) return
+      const serverId = notePathMatch[1]
+      // 云端 serverId → 由 App.vue 按 serverId 回落本地打开。
+      if (serverId) dispatchOpenNote(serverId, true)
+      return
+    }
+  }
   if (href && new URL(href).hostname === 'xinyue-note.local') {
     event.preventDefault()
     event.stopPropagation()
@@ -329,6 +380,194 @@ async function copyImageAddress(): Promise<void> {
   } catch {
     showFeedback('复制失败，请检查剪贴板权限')
   }
+}
+
+/** 关闭正文右键菜单。 */
+function closeEditorContextMenu(): void {
+  editorContextMenu.value.visible = false
+}
+
+/** 便捷构造单个菜单项（默认可用）。 */
+function menuItem(action: string, label: string, opts: { icon?: string, disabled?: boolean, danger?: boolean } = {}): {
+  action: string, label: string, icon?: string, disabled?: boolean, danger?: boolean
+} {
+  return { action, label, icon: opts.icon, disabled: opts.disabled, danger: opts.danger }
+}
+
+/**
+ * 构造正文右键菜单分组：按当前选区/历史/只读状态标记可用与置灰。
+ *
+ * @param view: 编辑器视图（读取选区与 history 状态）。
+ * @return 供 EditorContextMenu 渲染的分组数组。
+ */
+function buildEditorContextGroups(view: ProseMirrorView): EditorContextMenuGroup[] {
+  const selection = view.state.selection
+  const readonly = props.readonly || previewMode.value
+  const hasSelection = !selection.empty
+  const canEdit = !readonly
+  const canUndo = canEdit && undoDepth(view.state) > 0
+  const canRedo = canEdit && redoDepth(view.state) > 0
+
+  return [
+    {
+      items: [
+        menuItem('undo', '撤销', { icon: 'material-symbols:undo-rounded', disabled: !canUndo }),
+        menuItem('redo', '重做', { icon: 'material-symbols:redo-rounded', disabled: !canRedo })
+      ]
+    },
+    {
+      items: [
+        menuItem('cut', '剪切', { icon: 'material-symbols:content-cut-rounded', disabled: !canEdit || !hasSelection }),
+        menuItem('copy', '复制', { icon: 'material-symbols:content-copy-rounded', disabled: !hasSelection }),
+        menuItem('paste', '粘贴', { icon: 'material-symbols:content-paste-rounded', disabled: !canEdit }),
+        menuItem('selectAll', '全选', { icon: 'material-symbols:select-all-rounded' }),
+        menuItem('delete', '删除', { icon: 'material-symbols:delete-outline-rounded', disabled: !canEdit || !hasSelection })
+      ]
+    },
+    {
+      items: [
+        menuItem('paragraph', '正文', { icon: 'material-symbols:notes-rounded', disabled: !canEdit }),
+        menuItem('h1', '一级标题', { icon: 'material-symbols:title', disabled: !canEdit }),
+        menuItem('h2', '二级标题', { icon: 'material-symbols:title', disabled: !canEdit }),
+        menuItem('h3', '三级标题', { icon: 'material-symbols:title', disabled: !canEdit }),
+        menuItem('quote', '引用', { icon: 'material-symbols:format-quote-rounded', disabled: !canEdit }),
+        menuItem('bulletList', '无序列表', { icon: 'material-symbols:format-list-bulleted-rounded', disabled: !canEdit }),
+        menuItem('orderedList', '有序列表', { icon: 'material-symbols:format-list-numbered-rounded', disabled: !canEdit }),
+        menuItem('codeBlock', '代码块', { icon: 'material-symbols:code-rounded', disabled: !canEdit })
+      ]
+    },
+    {
+      items: [
+        menuItem('insertLink', '插入笔记链接', { icon: 'tabler:link', disabled: !canEdit }),
+        menuItem('insertEmbed', '插入笔记嵌入', { icon: 'material-symbols:note-add-rounded', disabled: !canEdit })
+      ]
+    }
+  ]
+}
+
+/**
+ * 右键拦截：目标为正文（非图片）时，弹出正文编辑菜单。
+ *
+ * @param event: 原生 contextmenu 事件。
+ * @return 无返回值。
+ */
+function handleEditorContextMenu(event: MouseEvent): void {
+  if (!editor || !editorReady) return
+  // 只读/预览态放行浏览器原生右键（文本仍可复制），仅编辑态弹自定义菜单
+  if (props.readonly || previewMode.value) return
+  // 图片已有独立右键菜单（复制地址），跳过避免冲突
+  const target = event.target instanceof Element ? event.target : null
+  if (target?.closest('img')) return
+  event.preventDefault()
+  event.stopPropagation()
+  // 在 editor context 内读取 view 状态后弹出菜单
+  editor.editor.action((ctx) => {
+    const view = ctx.get(editorViewCtx)
+    editorContextMenu.value = {
+      visible: true,
+      x: Math.min(event.clientX, window.innerWidth - 16),
+      y: Math.min(event.clientY, window.innerHeight - 16),
+      groups: buildEditorContextGroups(view)
+    }
+  })
+}
+
+/**
+ * 执行正文右键菜单命令（按 action 分发）。
+ *
+ * @param action: 菜单项 action 标识。
+ * @return 无返回值。
+ */
+function runEditorContextCommand(action: string): void {
+  closeEditorContextMenu()
+  if (!editor || !editorReady) return
+  // 全选：只读/预览态也允许
+  if (action === 'selectAll') {
+    editor.editor.action((ctx) => {
+      const view = ctx.get(editorViewCtx)
+      view.dispatch(view.state.tr.setSelection(new AllSelection(view.state.doc)))
+      view.focus()
+    })
+    return
+  }
+  // 打开选择器类：依赖渲染层弹窗
+  if (action === 'insertLink') { openNoteLinkPicker(); return }
+  if (action === 'insertEmbed') { openNoteEmbedPicker(); return }
+  // 撤销/重做/删除：简单命令
+  if (action === 'undo' || action === 'redo' || action === 'delete') {
+    editor.editor.action((ctx) => {
+      const view = ctx.get(editorViewCtx)
+      const commands = ctx.get(commandsCtx)
+      if (props.readonly || previewMode.value) return
+      if (action === 'undo') commands.call(undoCommand.key)
+      else if (action === 'redo') commands.call(redoCommand.key)
+      else if (!view.state.selection.empty) view.dispatch(view.state.tr.deleteSelection())
+    })
+    return
+  }
+  // 块类型转换
+  if (action === 'paragraph' || action === 'quote' || action === 'bulletList'
+    || action === 'orderedList' || action === 'codeBlock' || /^h[1-6]$/.test(action)) {
+    editor.editor.action((ctx) => {
+      const view = ctx.get(editorViewCtx)
+      const commands = ctx.get(commandsCtx)
+      if (props.readonly || previewMode.value) return
+      const { $from } = view.state.selection
+      const parent = $from.parent
+      // 只读保护：若光标落在嵌入等自定义节点上则不转换
+      if (parent.type.name === 'xynoteEmbed') return
+      switch (action) {
+        case 'paragraph': commands.call(setBlockTypeCommand.key, { nodeType: paragraphSchema.type(ctx) }); break
+        case 'quote': commands.call(wrapInBlockTypeCommand.key, { nodeType: blockquoteSchema.type(ctx) }); break
+        case 'bulletList':
+          commands.call(clearTextInCurrentBlockCommand.key)
+          commands.call(wrapInBlockTypeCommand.key, { nodeType: bulletListSchema.type(ctx) }); break
+        case 'orderedList':
+          commands.call(clearTextInCurrentBlockCommand.key)
+          commands.call(wrapInBlockTypeCommand.key, { nodeType: orderedListSchema.type(ctx) }); break
+        case 'codeBlock': commands.call(setBlockTypeCommand.key, { nodeType: codeBlockSchema.type(ctx) }); break
+        default: {
+          const level = Number(action.slice(1))
+          commands.call(setBlockTypeCommand.key, { nodeType: headingSchema.type(ctx), attrs: { level } }); break
+        }
+      }
+      view.focus()
+    })
+    return
+  }
+  // 剪贴板类动作（复制/剪切/粘贴）
+  if (action === 'copy' || action === 'cut' || action === 'paste') {
+    void runClipboardAction(action)
+  }
+}
+
+/**
+ * 剪贴板类动作（复制/剪切/粘贴）。
+ * 复制读取选区序列化为纯文本；粘贴读剪贴板后插入光标；剪切=复制并删除选区。
+ *
+ * @param action: copy | cut | paste。
+ * @return 异步完成后无返回值。
+ */
+async function runClipboardAction(action: string): Promise<void> {
+  if (!editor) return
+  await editor.editor.action(async (ctx) => {
+    const view = ctx.get(editorViewCtx)
+    const selection = view.state.selection
+    try {
+      if (action === 'copy' || action === 'cut') {
+        if (selection.empty) { showFeedback('请先选中内容再复制'); return }
+        const text = view.state.doc.textBetween(selection.from, selection.to, '\n')
+        await navigator.clipboard.writeText(text)
+        if (action === 'cut') view.dispatch(view.state.tr.deleteSelection())
+        showFeedback('已复制')
+      } else if (action === 'paste') {
+        const text = await navigator.clipboard.readText()
+        view.dispatch(view.state.tr.insertText(text))
+      }
+    } catch {
+      showFeedback('剪贴板操作失败，请检查权限')
+    }
+  })
 }
 
 /**
@@ -812,16 +1051,40 @@ function openNoteLinkPicker(): void {
 }
 
 /**
+ * 根据目标笔记的云端 serverId 与同步域名，构造笔记链接的存储 href。
+ *
+ * 优先产出网页版真实地址 `{webUrl}/notes/{serverId}`（同步到网页端后天然可点击跳转）；
+ * 目标笔记尚未同步（无 serverId）或未配置同步域名时，退回桌面端本地假域名
+ * `https://xinyue-note.local/{noteId}`（仅供本机识别，网页端无法解析）。
+ *
+ * :param noteId: 目标笔记本地 ID。
+ * :param serverId: 目标笔记云端 serverId，可为空。
+ * :return: 存储到正文链接 mark 的 href。
+ */
+function buildNoteHref(noteId: string, serverId: string | null): string {
+  const base = props.webBaseUrl?.trim()
+  if (serverId && base) {
+    return `${base.replace(/\/+$/, '')}/notes/${encodeURIComponent(serverId)}`
+  }
+  return `https://xinyue-note.local/${encodeURIComponent(noteId)}`
+}
+
+/**
  * 将选中的笔记以内部链接形式插入当前光标位置。
  *
  * :param noteId: 目标笔记 ID。
+ * :param serverId: 目标笔记云端 serverId（可为空，用于生成网页版可点击地址）。
  * :param title: 链接展示用的笔记标题。
  * :return: 无返回值。
  */
-async function insertNoteLink(noteId: string, title: string): Promise<void> {
+async function insertNoteLink(
+  noteId: string,
+  serverId: string | null,
+  title: string
+): Promise<void> {
   noteLinkPickerVisible.value = false
   if (!editor || !editorReady || props.readonly) return
-  const href = `https://xinyue-note.local/${encodeURIComponent(noteId)}`
+  const href = buildNoteHref(noteId, serverId)
   try {
     editor.editor.action((context) => {
       const view = context.get(editorViewCtx)
@@ -858,10 +1121,12 @@ function openNoteEmbedPicker(): void {
  * 渲染阶段由 nodeView 呈现为真实卡片。
  *
  * :param noteId: 目标笔记 ID。
+ * :param _serverId: 目标笔记云端 serverId（嵌入卡片以本地 note:<id> 存储，此项不使用，仅为对齐
+ *   NoteLinkPicker 的 select 载荷签名）。
  * :param title: 卡片兜底标题（markdown title 属性，可空）。
  * :return: 无返回值。
  */
-async function insertNoteEmbed(noteId: string, title: string): Promise<void> {
+async function insertNoteEmbed(noteId: string, _serverId: string | null, title: string): Promise<void> {
   noteEmbedPickerVisible.value = false
   if (!editor || !editorReady || props.readonly) return
   if (!noteId) {
@@ -1044,22 +1309,23 @@ function commitLinkSuggest(): void {
     closeLinkSuggest()
     return
   }
-  insertNoteLinkFromPos(note.id, note.title || '（无标题）')
+  insertNoteLinkFromPos(note.id, note.serverId ?? null, note.title || '（无标题）')
 }
 
 /**
  * 用选中笔记替换 [ [ 补全片段，生成内部链接。
  *
  * :param noteId: 目标笔记 ID。
+ * :param serverId: 目标笔记云端 serverId（可为空，用于生成网页版可点击地址）。
  * :param title: 链接展示标题。
  * :return: 无返回值。
  */
-function insertNoteLinkFromPos(noteId: string, title: string): void {
+function insertNoteLinkFromPos(noteId: string, serverId: string | null, title: string): void {
   const start = linkSuggestStart.value
   const view = linkSuggestEditorView
   closeLinkSuggest()
   if (start === null || !editor || props.readonly) return
-  const href = `https://xinyue-note.local/${encodeURIComponent(noteId)}`
+  const href = buildNoteHref(noteId, serverId)
   const currentFrom = typeof view?.state?.selection?.from === 'number' ? view.state.selection.from : start
   try {
     editor.editor.action((context) => {
@@ -1571,6 +1837,7 @@ async function createEditor(): Promise<void> {
     features: { [Crepe.Feature.TopBar]: true },
     featureConfigs: {
       [Crepe.Feature.BlockEdit]: {
+        blockHandle: { getOffset: () => 5 },
         textGroup: {
           label: '文本', text: { label: '正文' }, h1: { label: '一级标题' }, h2: { label: '二级标题' },
           h3: { label: '三级标题' }, h4: { label: '四级标题' }, h5: { label: '五级标题' },
@@ -1642,6 +1909,7 @@ async function createEditor(): Promise<void> {
   startToolbarSync(editorRootRef.value)
   editorRootRef.value.addEventListener('click', handleEditorLinkClick)
   editorRootRef.value.addEventListener('contextmenu', handleImageContextMenu)
+  editorRootRef.value.addEventListener('contextmenu', handleEditorContextMenu)
   editorRootRef.value.addEventListener('click', handleJsonCodeFormatClick)
   editorRootRef.value.addEventListener('paste', handleAttachmentPaste, true)
   editorRootRef.value.addEventListener('dragover', handleAttachmentDragOver)
@@ -1773,7 +2041,9 @@ onMounted(() => {
   document.addEventListener('mousemove', syncLinkModifierState)
   window.addEventListener('blur', clearLinkModifierState)
   document.addEventListener('pointerdown', closeImageContextMenu)
+  document.addEventListener('pointerdown', closeEditorContextMenu)
   editorScrollRef.value?.addEventListener('scroll', closeImageContextMenu, { passive: true })
+  editorScrollRef.value?.addEventListener('scroll', closeEditorContextMenu, { passive: true })
   void createEditor()
 })
 onBeforeUnmount(() => {
@@ -1791,7 +2061,9 @@ onBeforeUnmount(() => {
   document.removeEventListener('mousemove', syncLinkModifierState)
   window.removeEventListener('blur', clearLinkModifierState)
   document.removeEventListener('pointerdown', closeImageContextMenu)
+  document.removeEventListener('pointerdown', closeEditorContextMenu)
   editorScrollRef.value?.removeEventListener('scroll', closeImageContextMenu)
+  editorScrollRef.value?.removeEventListener('scroll', closeEditorContextMenu)
   readonlyObserver?.disconnect()
   readonlyObserver = null
   jsonFormatObserver?.disconnect()
@@ -1800,6 +2072,7 @@ onBeforeUnmount(() => {
   toolbarObserver = null
   editorRootRef.value?.removeEventListener('click', handleEditorLinkClick)
   editorRootRef.value?.removeEventListener('contextmenu', handleImageContextMenu)
+  editorRootRef.value?.removeEventListener('contextmenu', handleEditorContextMenu)
   editorRootRef.value?.removeEventListener('click', handleJsonCodeFormatClick)
   editorRootRef.value?.removeEventListener('paste', handleAttachmentPaste, true)
   editorRootRef.value?.removeEventListener('dragover', handleAttachmentDragOver)

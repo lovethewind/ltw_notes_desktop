@@ -493,7 +493,7 @@ body.is-link-modifier-active .milkdown-editor-root a[href] { cursor: pointer; }
 .milkdown-editor-root .milkdown .milkdown-code-block .cm-content ::selection { background: rgba(47,128,237,.32); }
 .milkdown-editor-root .milkdown .milkdown-code-block .cm-activeLine,
 .milkdown-editor-root .milkdown .milkdown-code-block .cm-activeLineGutter { background: rgba(47,128,237,.07); }
-.milkdown-editor-root .milkdown .ProseMirror { box-sizing: border-box; width: min(100%, var(--markdown-content-width)); min-height: calc(100vh - 250px); margin: 0 auto; padding: 34px clamp(32px, 5vw, 68px) 100px; color: #283950; font-size: 14px; line-height: 1.9; outline: 0; }
+.milkdown-editor-root .milkdown .ProseMirror { box-sizing: border-box; width: min(100%, var(--markdown-content-width)); min-height: calc(100vh - 250px); margin: 0 auto; padding: 34px clamp(64px, 5vw, 96px) 100px; color: #283950; font-size: 14px; line-height: 1.9; outline: 0; }
 .milkdown-editor-root .milkdown .milkdown-top-bar { container-type: inline-size; position: sticky; z-index: 20; top: 0; min-height: 48px; padding: 0 12px; border-bottom: 1px solid var(--milkdown-toolbar-divider); background: rgba(248,251,255,.94); backdrop-filter: blur(16px); }
 .milkdown-editor-root .milkdown .milkdown-top-bar .top-bar-inner { display: flex; flex-wrap: nowrap; width: 100%; min-width: 0; align-items: center; }
 .milkdown-editor-root .milkdown .milkdown-top-bar .top-bar-heading-selector { flex: 0 0 104px; width: 104px; margin-right: 3px; padding: 3px; }

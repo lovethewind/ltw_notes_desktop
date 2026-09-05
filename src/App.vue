@@ -3713,6 +3713,7 @@ onBeforeUnmount(() => {
               :value="draft.content"
               :all-notes="workspace.notes"
               :folders="workspace.folders"
+              :web-base-url="syncSettings.webUrl"
               @change="updateDraftContent"
               @scroll-position-change="updateNoteScrollPosition"
             />

@@ -88,7 +88,7 @@ const props = withDefaults(defineProps<{
 })
 const emit = defineEmits<{
   (event: 'close'): void
-  (event: 'select', noteId: string, title: string): void
+  (event: 'select', noteId: string, serverId: string | null, title: string): void
 }>()
 
 const keyword = ref('')
@@ -175,7 +175,7 @@ watch(
 )
 
 function choose(note: OfflineNote): void {
-  emit('select', note.id, note.title || '（无标题）')
+  emit('select', note.id, note.serverId ?? null, note.title || '（无标题）')
 }
 
 function handleKeydown(event: KeyboardEvent): void {
