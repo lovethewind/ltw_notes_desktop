@@ -1,14 +1,14 @@
 # 笔记嵌入卡片（Note Embed Block / Card）
 
-> 状态：待评审（draft）
-> 日期：2026-09-03
+> 状态：已实施（T2 ~ T2I 全部落地；剩余「展开整篇 / 卡片操作入口」见文末未决）
+> 日期：2026-09-03（末次更新 2026-09-10）
 > 领域：编辑器（MarkdownVisualEditor / Crepe）+ 渲染层新组件
 > 分级：L3（跨模块、涉及编辑器 schema 扩展、影响 markdown 往返 / 导出 / 同步一致性）
 
 ## 背景与澄清记录（避免重蹈上次误判）
 
 前一轮曾误把「全局关系图谱」当待开发并写了 spec，后读代码确认 `GlobalGraphPanel.vue` **已存在并已接入 App.vue**
-（侧栏「全局知识图谱」入口 + 浮层 + 深色模式样式）。该错误 spec 已删除。本 spec 基于真实代码事实重新评估。
+（顶栏图标按钮 + 浮层 + 深色模式样式；侧栏文字入口已于 2026-09-10 移除）。该错误 spec 已删除。本 spec 基于真实代码事实重新评估。
 
 **确认缺失项（用户判断正确）**：`src/components` 下无任何 card/embed/preview 类组件；
 编辑区内部链接 `https://xinyue-note.local/{id}`（旧 `xinyue-notes://note/{id}`）目前**只有**：
@@ -309,3 +309,48 @@ Cmd+O 空搜索本就直接用它渲染摘要，故同源同函数安全；搜�
 
 **T2H 修正版（19:37 复测后）**：见上文 a 段「首版方向修正」——句柄贴正文留小缝用
 `blockHandle.getOffset:()=>4` + 非对称内边距，重打包 arm64 供手测。
+
+---
+
+## T2I 落地记录（2026-09-09 ~ 09-10）：slash `/` 菜单「嵌入笔记」项 + 菜单紧凑化
+
+**需求**：补齐「未决（可后续）」里的**输入侧**——除工具栏按钮外，在 Crepe 的 slash `/` 命令菜单里
+增加「嵌入笔记」项，做成 Obsidian 式的快捷插入。用户对交互时序明确选 **B（选完再删）**：
+点「嵌入笔记」→ 只弹既有 NoteLinkPicker，**不动 `/xxx` 文本**；选中笔记后由 `insertNoteEmbed`
+清块再插卡片；**中途取消则 `/xxx` 原样保留**。
+
+**实现（`src/components/MarkdownVisualEditor.vue`，单文件）**：
+- 新增模块级常量 `EMBED_SLASH_ICON`（Material Symbols `note_add` 内联 SVG，`fill="currentColor"`，
+  与工具栏「嵌入笔记」同语义）。
+- 在 `[Crepe.Feature.BlockEdit].featureConfigs` 里加官方扩展点 **`buildMenu: (builder) => {...}`**：
+  `builder.getGroup('advanced')?.addItem('xynote-embed', { label:'嵌入笔记', icon, onRun })`。
+  `onRun` 内：`props.readonly` 时 `showFeedback` 拦截；否则仅调 `openNoteEmbedPicker()`（复用既有入口），
+  **不触碰编辑器文本**——`insertNoteEmbed` 的 `clearTextInCurrentBlockCommand` 在选中笔记后才执行，
+  天然满足「选完再删」；slash `hide()` 不清 ProseMirror selection，故选中后仍能定位回原块。
+- `buildMenu` 是 Crepe 官方 `BlockEditConfig` 字段（esm 里默认 text/list/advanced 三组构建后
+  `config.buildMenu?.call(config, groupBuilder)` 再调），非 hack；`GroupBuilder.addItem` 的 item
+  类型为 `MenuItem<SlashMenuItem>`，允许携带 `onRun(ctx)`。
+- 工具栏入口 / `openNoteEmbedPicker` / `insertNoteEmbed` **零改动**，无回归。
+
+**菜单紧凑化（两轮，用户反馈驱动）**：
+- 问题一：追加「嵌入笔记」后，Crepe 默认菜单排版过松（`h6` padding 14px + line-height 20px、
+  `li` 同样、`.menu-groups` max-height 420px），「高级」组末尾的「嵌入笔记」被滚动条遮住。
+- 问题二：用户反馈「靠上的话顶部看不到 + 行间距还是有点宽」。
+- **⚠️ CSS 覆盖位置的关键教训**：首次把覆盖写进 `src/style.css`**未生效**。原因是 vite 把
+  `import '@milkdown/crepe/theme/common/style.css'` 提取到 **MarkdownVisualEditor 独立 css chunk**，
+  该 chunk 经 ES module 在运行时注入 `<style>` 到 head **末尾**，位置比 `<link>` 加载的 `main.css`
+  **更晚**，导致 Crepe 默认规则反而覆盖了 `main.css` 里的定制。**正确做法**：把覆盖写进
+  **同一个引入组件的 `<style>` 块**（本例 `MarkdownVisualEditor.vue` 末尾，不加 scoped）——
+  vite 会把 `@import` 内容并入该 chunk **最前**、`<style>` 块并入**末尾**，规则顺序正确。已在产物
+  `MarkdownVisualEditor-*.css` 中按字节偏移验证（Crepe 默认在前、定制在后）。
+- 最终规则（`.milkdown .milkdown-slash-menu ...`）：
+  `.menu-groups{max-height:min(50vh,420px);padding:0 12px 6px}`、
+  `.menu-group h6{padding:4px 10px 2px;line-height:14px;font-size:11px}`、
+  `.menu-group li{padding:6px 10px;min-width:180px;gap:10px;line-height:16px}`。
+
+**验证**：`type-check` ✅、`npm test` 213/213 ✅、`npm run build` ✅、打包 arm64 ✅
+（`release/mac-arm64/心悦笔记.app`，asar 内确认含 `xynote-embed` / `buildMenu` / 紧凑规则）。
+
+**仍未决**（spec 原「未决」剩余项）：
+- 「嵌入整篇正文」仍为固定摘要（2 行），需要**展开交互**时另议。
+- 卡片操作入口（去嵌入 / 在源文件打开 / 复制嵌入引用）尚未做。

@@ -151,6 +151,13 @@ import { dispatchOpenNote } from '../utils/note-open-events'
 // 关系图谱仅在展开时用到 d3-force，改为异步组件避免把布局库打进主 chunk。
 const NoteGraphPanel = defineAsyncComponent(() => import('./NoteGraphPanel.vue'))
 
+// slash「/」菜单里「嵌入笔记」项的图标（Material Symbols note_add，与工具栏「嵌入笔记」同语义）。
+const EMBED_SLASH_ICON = `
+  <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="currentColor">
+    <path d="M14 3H6C4.9 3 4 3.9 4 5V19C4 20.1 4.9 21 6 21H18C19.1 21 20 20.1 20 19V9L14 3ZM16 17H13V20H11V17H8V15H11V12H13V15H16V17ZM13 10V4.5L18.5 10H13Z" />
+  </svg>
+`
+
 interface Props {
   value: string
   documentId?: string
@@ -1848,6 +1855,23 @@ async function createEditor(): Promise<void> {
         },
         advancedGroup: {
           label: '高级', image: { label: '图片' }, codeBlock: { label: '代码块' }, table: { label: '表格' }, math: { label: '公式' }
+        },
+        // 在 slash「/」命令菜单里追加「嵌入笔记」项（Obsidian 式快捷插入；选择器复用既有 NoteLinkPicker）
+        buildMenu: (builder) => {
+          const adv = builder.getGroup('advanced')
+          adv?.addItem('xynote-embed', {
+            label: '嵌入笔记',
+            icon: EMBED_SLASH_ICON,
+            onRun: () => {
+              if (props.readonly) {
+                showFeedback('只读模式下无法插入笔记嵌入')
+                return
+              }
+              // 只弹出笔记选择器，不动编辑器文本（保留 `/xxx`）；选完由 insertNoteEmbed 清块后插入卡片，
+              // 中途取消则 `/xxx` 原样保留（slash hide 不清选区，ProseMirror selection 仍锚定在原块）。
+              openNoteEmbedPicker()
+            }
+          })
         }
       },
       [Crepe.Feature.LinkTooltip]: { inputPlaceholder: '粘贴链接地址…' },
@@ -2093,3 +2117,27 @@ onBeforeUnmount(() => {
   if (currentEditor) void currentEditor.destroy()
 })
 </script>
+
+<!--
+  Crepe BlockEdit 默认 menu 排版过松（h6 padding 14+20line、li 同样、max-height 420px），
+  在「高级」组末尾追加「嵌入笔记」时被滚动条遮。这些规则必须放在 @milkdown/crepe 样式
+  之后才能覆盖，所以写在组件 <style> 里（vite 会把 @import 与这里的规则合并到同一
+  MarkdownVisualEditor.css chunk，@import 在前、我们的规则在后）。
+-->
+<style>
+.milkdown .milkdown-slash-menu .menu-groups {
+  max-height: min(50vh, 420px);
+  padding: 0 12px 6px;
+}
+.milkdown .milkdown-slash-menu .menu-groups .menu-group h6 {
+  padding: 4px 10px 2px;
+  line-height: 14px;
+  font-size: 11px;
+}
+.milkdown .milkdown-slash-menu .menu-groups .menu-group li {
+  padding: 6px 10px;
+  min-width: 180px;
+  gap: 10px;
+  line-height: 16px;
+}
+</style>
