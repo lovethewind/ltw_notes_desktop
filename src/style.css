@@ -609,9 +609,6 @@ body.markdown-editor-focus-mode .milkdown-editor-shell.is-focus-mode { position:
 .folder-dialog p.general-settings-message { margin: 10px 0 0; color: #c94c59; font-weight: 650; }
 .folder-dialog .general-settings-actions { margin-top: 14px; }
 .data-transfer-dialog { width: min(570px, calc(100vw - 40px)); }
-.sidebar-graph-toggle { display: flex; align-items: center; gap: 7px; width: calc(100% - 24px); margin: 8px 12px 0; height: 36px; padding: 0 12px; border: 1px solid #dfe7f1; border-radius: 9px; background: #f8fbff; color: #47709f; cursor: pointer; font-size: 12px; font-weight: 600; }
-.sidebar-graph-toggle svg { width: 16px; height: 16px; }
-.sidebar-graph-toggle:hover { border-color: var(--blue); background: #edf5ff; color: var(--blue); }
 .global-graph-backdrop { z-index: 230; }
 .folder-dialog .data-transfer-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 4px; }
 .folder-dialog .data-transfer-grid > button { height: auto; min-height: 72px; display: flex; align-items: center; gap: 12px; border: 1px solid #dfe7f1; padding: 12px 14px; background: #f8fbff; color: #33445d; text-align: left; transition: border-color .14s ease, background .14s ease, transform .14s ease, box-shadow .14s ease; }
@@ -1156,8 +1153,6 @@ button:focus-visible { outline: 3px solid rgba(47,128,237,.22); outline-offset: 
   .folder-dialog .general-setting-switch { background: #40536a; }
   .folder-dialog .general-setting-switch.active { background: #4389df; }
   .folder-dialog .general-setting-select { border-color: #35506f; background: #172941; color: #e5effc; }
-  .sidebar-graph-toggle { border-color: #2c405b; background: #14253c; color: #9fc8fa; }
-  .sidebar-graph-toggle:hover { border-color: #5795df; background: #203753; color: #9fc8fa; }
   :scope { --global-graph-bg: #101d30; --global-graph-border: #2a3c56; --global-graph-header: #14253c; }
   .folder-dialog .data-transfer-grid > button { border-color: #2c405b; background: #14253c; color: #d5e1f0; }
   .folder-dialog .data-transfer-grid > button:hover, .folder-dialog .data-transfer-grid > button:focus-visible { border-color: #416b99; background: #1b304c; }

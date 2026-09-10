@@ -3523,11 +3523,6 @@ onBeforeUnmount(() => {
         </section>
         </div>
 
-        <button class="sidebar-graph-toggle" type="button" @click="globalGraphVisible = true">
-          <Icon icon="material-symbols:hub-rounded" />
-          全局知识图谱
-        </button>
-
         <footer class="sidebar-footer">
           <div><span class="status-light"></span>离线可用</div>
           <span>{{ workspace.pendingCount }} 项待同步</span>
