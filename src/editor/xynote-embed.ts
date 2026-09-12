@@ -15,6 +15,7 @@
 import { $nodeSchema, $remark, $view } from '@milkdown/kit/utils'
 import { h, render } from 'vue'
 import NoteEmbedCard from '../components/NoteEmbedCard.vue'
+import { dispatchEmbedCardMenu } from '../utils/note-open-events'
 
 /** 嵌入的 HTML 标记前缀：`<div data-xynote-embed="note:<id>">` */
 export const EMBED_TAG = 'data-xynote-embed'
@@ -147,16 +148,29 @@ export const noteEmbedNodeSchema = $nodeSchema('xynoteEmbed', () => ({
 }))
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
-export const noteEmbedView = $view(noteEmbedNodeSchema.node, () => (node: any) => {
+export const noteEmbedView = $view(noteEmbedNodeSchema.node, () => (node: any, _view: any, getPos: () => number | undefined) => {
   const container = document.createElement('div')
   container.className = 'xynote-embed-nodeview'
   // 卡片为只读展示块，自身不可编辑；由 Vue 内部点击逻辑负责跳转。
   container.setAttribute('contenteditable', 'false')
 
   const renderCard = (): void => {
+    const noteId = (node.attrs.noteId as string) || ''
+    const title = (node.attrs.title as string | null) ?? null
     render(h(NoteEmbedCard, {
-      noteId: (node.attrs.noteId as string) || '',
-      title: (node.attrs.title as string | null) ?? null
+      noteId,
+      title,
+      // 右键卡片：nodeView 补上节点位置（getPos），交给编辑器复用正文右键菜单弹卡片操作项。
+      onContextMenu: (payload: { x: number; y: number; available: boolean }) => {
+        dispatchEmbedCardMenu({
+          noteId,
+          title,
+          pos: getPos() ?? -1,
+          x: payload.x,
+          y: payload.y,
+          available: payload.available
+        })
+      }
     }), container)
   }
   renderCard()

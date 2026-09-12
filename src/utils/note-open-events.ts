@@ -28,3 +28,31 @@ export function dispatchOpenNote(noteId: string, newTab: boolean): void {
     detail: { noteId, newTab }
   }))
 }
+
+/**
+ * 嵌入卡片右键菜单事件名：由 NoteEmbedCard 的 nodeView（编辑器深处）发起，
+ * 交由 MarkdownVisualEditor 复用正文右键菜单组件弹出卡片专属操作项。
+ */
+export const EMBED_CARD_MENU_EVENT = 'xynote:embed-card-menu'
+
+/** 事件 payload：卡片目标笔记信息 + 节点位置（供「转换为链接 / 删除卡片」定位）+ 鼠标坐标。 */
+export interface EmbedCardMenuEventDetail {
+  noteId: string
+  title: string | null
+  /** 卡片节点在文档中的位置（ProseMirror NodeView getPos()），-1 表示不可用。 */
+  pos: number
+  x: number
+  y: number
+  /** 目标笔记是否可正常打开；不存在/已删除为 false（禁用打开类菜单项）。 */
+  available: boolean
+}
+
+/**
+ * 派发「嵌入卡片右键菜单」事件。
+ *
+ * :param detail: 卡片目标信息与鼠标坐标。
+ * :return: 无返回值。
+ */
+export function dispatchEmbedCardMenu(detail: EmbedCardMenuEventDetail): void {
+  window.dispatchEvent(new CustomEvent<EmbedCardMenuEventDetail>(EMBED_CARD_MENU_EVENT, { detail }))
+}

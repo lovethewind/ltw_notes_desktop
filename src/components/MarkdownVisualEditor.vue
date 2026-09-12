@@ -146,7 +146,7 @@ import EditorContextMenu from './EditorContextMenu.vue'
 import type { EditorContextMenuGroup } from './EditorContextMenu.vue'
 import BacklinksPanel from './BacklinksPanel.vue'
 import LinkSuggestPopover from './LinkSuggestPopover.vue'
-import { dispatchOpenNote } from '../utils/note-open-events'
+import { dispatchOpenNote, EMBED_CARD_MENU_EVENT, type EmbedCardMenuEventDetail } from '../utils/note-open-events'
 
 // 关系图谱仅在展开时用到 d3-force，改为异步组件避免把布局库打进主 chunk。
 const NoteGraphPanel = defineAsyncComponent(() => import('./NoteGraphPanel.vue'))
@@ -240,6 +240,13 @@ const editorContextMenu = ref({
   y: 0,
   groups: [] as EditorContextMenuGroup[]
 })
+/** 卡片右键菜单的当前目标（noteId/title/pos/available），菜单命令执行时读取；关闭菜单后清空。 */
+const embedContextTarget = ref<{
+  noteId: string
+  title: string | null
+  pos: number
+  available: boolean
+} | null>(null)
 let editor: Crepe | null = null
 let editorReady = false
 let destroyed = false
@@ -453,6 +460,34 @@ function buildEditorContextGroups(view: ProseMirrorView): EditorContextMenuGroup
 }
 
 /**
+ * 构造嵌入卡片右键菜单分组：打开 / 复制嵌入引用 + 转换为链接 / 删除卡片。
+ * 后两项需要写文档，故只读或预览态置灰；节点位置不可用（pos<0）时同样置灰。
+ *
+ * @return 供 EditorContextMenu 渲染的分组数组。
+ */
+function buildEmbedCardMenuGroups(): EditorContextMenuGroup[] {
+  const canEdit = !(props.readonly || previewMode.value)
+  const target = embedContextTarget.value
+  const hasNode = !!target && target.pos >= 0
+  // 目标笔记不存在/已删除时禁用打开类操作，仅保留结构操作（转换/删除）
+  const canOpen = !!target?.available
+  return [
+    {
+      items: [
+        menuItem('embedOpen', '打开笔记', { icon: 'material-symbols:open-in-new-rounded', disabled: !canOpen }),
+        menuItem('embedCopyRef', '复制嵌入引用', { icon: 'material-symbols:content-copy-rounded', disabled: !target })
+      ]
+    },
+    {
+      items: [
+        menuItem('embedUnwrap', '转换为链接', { icon: 'tabler:link', disabled: !canEdit || !hasNode }),
+        menuItem('embedDelete', '删除卡片', { icon: 'material-symbols:delete-outline-rounded', danger: true, disabled: !canEdit || !hasNode })
+      ]
+    }
+  ]
+}
+
+/**
  * 右键拦截：目标为正文（非图片）时，弹出正文编辑菜单。
  *
  * @param event: 原生 contextmenu 事件。
@@ -462,9 +497,11 @@ function handleEditorContextMenu(event: MouseEvent): void {
   if (!editor || !editorReady) return
   // 只读/预览态放行浏览器原生右键（文本仍可复制），仅编辑态弹自定义菜单
   if (props.readonly || previewMode.value) return
-  // 图片已有独立右键菜单（复制地址），跳过避免冲突
+  // 图片有独立右键菜单（复制地址）、嵌入卡片有卡片专属菜单，均跳过避免冲突。
+  // 卡片内部已 stopPropagation，此处按节点容器再兜底一次，防止宿主结构变化时菜单串台。
   const target = event.target instanceof Element ? event.target : null
   if (target?.closest('img')) return
+  if (target?.closest('.xynote-embed-nodeview')) return
   event.preventDefault()
   event.stopPropagation()
   // 在 editor context 内读取 view 状态后弹出菜单
@@ -480,6 +517,30 @@ function handleEditorContextMenu(event: MouseEvent): void {
 }
 
 /**
+ * 嵌入卡片右键（nodeView 经 CustomEvent 冒泡）→ 复用正文右键菜单组件弹出卡片专属操作项。
+ *
+ * :param event: 卡片派发的 CustomEvent（detail 见 EmbedCardMenuEventDetail）。
+ * :return: 无返回值。
+ */
+function handleEmbedCardMenu(event: Event): void {
+  const detail = (event as CustomEvent<EmbedCardMenuEventDetail>).detail
+  if (!detail || !editor || !editorReady) return
+  if (props.readonly || previewMode.value) return
+  embedContextTarget.value = {
+    noteId: detail.noteId,
+    title: detail.title,
+    pos: detail.pos,
+    available: detail.available
+  }
+  editorContextMenu.value = {
+    visible: true,
+    x: Math.min(detail.x, window.innerWidth - 16),
+    y: Math.min(detail.y, window.innerHeight - 16),
+    groups: buildEmbedCardMenuGroups()
+  }
+}
+
+/**
  * 执行正文右键菜单命令（按 action 分发）。
  *
  * @param action: 菜单项 action 标识。
@@ -488,6 +549,11 @@ function handleEditorContextMenu(event: MouseEvent): void {
 function runEditorContextCommand(action: string): void {
   closeEditorContextMenu()
   if (!editor || !editorReady) return
+  // 嵌入卡片菜单动作（目标来自 embedContextTarget，已在弹出菜单时记录）
+  if (action === 'embedOpen' || action === 'embedCopyRef' || action === 'embedUnwrap' || action === 'embedDelete') {
+    void runEmbedCardCommand(action)
+    return
+  }
   // 全选：只读/预览态也允许
   if (action === 'selectAll') {
     editor.editor.action((ctx) => {
@@ -545,6 +611,63 @@ function runEditorContextCommand(action: string): void {
   // 剪贴板类动作（复制/剪切/粘贴）
   if (action === 'copy' || action === 'cut' || action === 'paste') {
     void runClipboardAction(action)
+  }
+}
+
+/**
+ * 执行嵌入卡片右键菜单命令。
+ *
+ * :param action: embedOpen / embedCopyRef / embedUnwrap / embedDelete。
+ * :return: 异步完成后无返回值。
+ */
+async function runEmbedCardCommand(action: string): Promise<void> {
+  const target = embedContextTarget.value
+  embedContextTarget.value = null
+  if (!target || !editor || !editorReady) return
+  // 打开笔记：新标签页打开目标（与点击卡片一致）
+  if (action === 'embedOpen') {
+    dispatchOpenNote(target.noteId, true)
+    return
+  }
+  // 复制嵌入引用：复制 markdown 源码，粘回任意笔记仍是嵌入卡片
+  if (action === 'embedCopyRef') {
+    const titleAttr = target.title ? ` title="${target.title.replace(/"/g, '&quot;')}"` : ''
+    const ref = `<div data-xynote-embed="note:${target.noteId}"${titleAttr}></div>`
+    try {
+      await navigator.clipboard.writeText(ref)
+      showFeedback('已复制嵌入引用')
+    } catch {
+      showFeedback('复制失败，请检查剪贴板权限')
+    }
+    return
+  }
+  if (props.readonly || previewMode.value) return
+  if (target.pos < 0) return
+  // 删除卡片：删掉整个块节点
+  if (action === 'embedDelete') {
+    editor.editor.action((ctx) => {
+      const view = ctx.get(editorViewCtx)
+      const node = view.state.doc.nodeAt(target.pos)
+      if (!node || node.type.name !== 'xynoteEmbed') return
+      view.dispatch(view.state.tr.delete(target.pos, target.pos + node.nodeSize))
+    })
+    return
+  }
+  // 转换为链接：块节点换成含笔记链接的段落（查 serverId 生成线上地址，查不到回落本地）
+  if (action === 'embedUnwrap') {
+    const note = await window.notesDesktop.getNote(target.noteId).catch(() => null)
+    const href = buildNoteHref(target.noteId, note?.serverId ?? null)
+    const label = target.title || note?.title || '笔记链接'
+    editor.editor.action((ctx) => {
+      const view = ctx.get(editorViewCtx)
+      const node = view.state.doc.nodeAt(target.pos)
+      if (!node || node.type.name !== 'xynoteEmbed') return
+      const { schema } = view.state
+      const linkMark = schema.marks.link
+      const textNode = schema.text(label, linkMark ? [linkMark.create({ href })] : [])
+      const paragraph = schema.nodes.paragraph.create(null, textNode)
+      view.dispatch(view.state.tr.replaceWith(target.pos, target.pos + node.nodeSize, paragraph))
+    })
   }
 }
 
@@ -2068,6 +2191,8 @@ onMounted(() => {
   document.addEventListener('pointerdown', closeEditorContextMenu)
   editorScrollRef.value?.addEventListener('scroll', closeImageContextMenu, { passive: true })
   editorScrollRef.value?.addEventListener('scroll', closeEditorContextMenu, { passive: true })
+  // 卡片右键：由 nodeView 深处的 CustomEvent 冒泡至此，复用右键菜单组件弹出卡片操作项
+  window.addEventListener(EMBED_CARD_MENU_EVENT, handleEmbedCardMenu)
   void createEditor()
 })
 onBeforeUnmount(() => {
@@ -2088,6 +2213,7 @@ onBeforeUnmount(() => {
   document.removeEventListener('pointerdown', closeEditorContextMenu)
   editorScrollRef.value?.removeEventListener('scroll', closeImageContextMenu)
   editorScrollRef.value?.removeEventListener('scroll', closeEditorContextMenu)
+  window.removeEventListener(EMBED_CARD_MENU_EVENT, handleEmbedCardMenu)
   readonlyObserver?.disconnect()
   readonlyObserver = null
   jsonFormatObserver?.disconnect()

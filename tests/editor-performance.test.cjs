@@ -393,7 +393,7 @@ test("笔记右键菜单可复制并响应应用深链接", () => {
   assert.match(preloadSource, /note-link:open-local/)
   // 编辑器内部链接点击改为「新标签页打开」：经 note-open-events 总线派发，而非 IPC 原地切换。
   assert.match(editorSource, /dispatchOpenNote\(noteId, true\)/)
-  assert.match(editorSource, /import \{ dispatchOpenNote \} from '\.\.\/utils\/note-open-events'/)
+  assert.match(editorSource, /import \{[^}]*\bdispatchOpenNote\b[^}]*\} from '\.\.\/utils\/note-open-events'/)
 })
 
 test("退出账号只清除认证并保留当前用户档案", () => {
@@ -407,4 +407,50 @@ test("退出账号只清除认证并保留当前用户档案", () => {
   assert.match(clearSettingsBlock, /accountId: syncSettings\.accountId/)
   assert.match(clearSettingsBlock, /accountLabel: syncSettings\.accountLabel/)
   assert.doesNotMatch(clearSettingsBlock, /accountId: ""/)
+})
+
+test("嵌入卡片右键菜单链路接线完整", () => {
+  const eventsSource = readFileSync(resolve(projectRoot, "src/utils/note-open-events.ts"), "utf8")
+  const cardSource = readFileSync(resolve(projectRoot, "src/components/NoteEmbedCard.vue"), "utf8")
+  const embedSource = readFileSync(resolve(projectRoot, "src/editor/xynote-embed.ts"), "utf8")
+  const editorSource = readFileSync(
+    resolve(projectRoot, "src/components/MarkdownVisualEditor.vue"),
+    "utf8"
+  )
+
+  // 1) 事件总线：命名常量 + 派发函数 + pos 载荷
+  assert.match(eventsSource, /export const EMBED_CARD_MENU_EVENT = 'xynote:embed-card-menu'/)
+  assert.match(eventsSource, /export function dispatchEmbedCardMenu\(detail: EmbedCardMenuEventDetail\)/)
+  assert.match(eventsSource, /pos: number/)
+
+  // 2) 卡片：右键绑定到 onContextMenu；必须阻止冒泡，否则正文右键菜单会覆盖卡片菜单
+  assert.match(cardSource, /@contextmenu="onContextMenu"/)
+  assert.match(cardSource, /event\.preventDefault\(\)/)
+  assert.match(cardSource, /event\.stopPropagation\(\)/)
+  // 加载中不弹菜单；缺失/已删除态照常弹（可执行删除卡片），用 available 标记可否打开
+  assert.match(cardSource, /if \(loading\.value\) return/)
+  assert.match(cardSource, /available: !missing\.value && !deleted\.value/)
+
+  // 3) nodeView：用 getPos 补节点位置后派发
+  assert.match(embedSource, /import \{ dispatchEmbedCardMenu \} from '\.\.\/utils\/note-open-events'/)
+  assert.match(embedSource, /pos: getPos\(\) \?\? -1/)
+  assert.match(embedSource, /available: payload\.available/)
+  assert.match(embedSource, /onContextMenu/)
+
+  // 4) 编辑器：监听/卸载对称 + 分组构造 + 四个命令
+  assert.match(editorSource, /window\.addEventListener\(EMBED_CARD_MENU_EVENT, handleEmbedCardMenu\)/)
+  assert.match(editorSource, /window\.removeEventListener\(EMBED_CARD_MENU_EVENT, handleEmbedCardMenu\)/)
+  assert.match(editorSource, /function buildEmbedCardMenuGroups\(\)/)
+  assert.match(editorSource, /menuItem\('embedOpen', '打开笔记', \{[^}]*disabled: !canOpen \}\)/)
+  assert.match(editorSource, /menuItem\('embedCopyRef', '复制嵌入引用'/)
+  // 正文右键菜单兜底跳过卡片节点，避免卡片与正文菜单串台
+  assert.match(editorSource, /target\?\.closest\('\.xynote-embed-nodeview'\)/)
+  assert.match(editorSource, /menuItem\('embedUnwrap', '转换为链接'/)
+  assert.match(editorSource, /menuItem\('embedDelete', '删除卡片'/)
+  assert.match(editorSource, /async function runEmbedCardCommand\(action: string\)/)
+  // 转换为链接：查 serverId 生成真实线上地址（与插入链接一致）
+  assert.match(editorSource, /buildNoteHref\(target\.noteId, note\?\.serverId \?\? null\)/)
+  // 删除卡片：定位到卡片节点后整块删除
+  assert.match(editorSource, /node\.type\.name !== 'xynoteEmbed'/)
+  assert.match(editorSource, /tr\.delete\(target\.pos, target\.pos \+ node\.nodeSize\)/)
 })

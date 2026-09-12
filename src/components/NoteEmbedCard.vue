@@ -1,5 +1,5 @@
 <template>
-  <div class="note-embed-card" :class="{ 'is-deleted': deleted, 'is-loading': loading }" role="button" tabindex="0" @click="open" @keydown.enter="open" @keydown.space.prevent="open">
+  <div class="note-embed-card" :class="{ 'is-deleted': deleted, 'is-loading': loading }" role="button" tabindex="0" @click="open" @keydown.enter="open" @keydown.space.prevent="open" @contextmenu="onContextMenu">
     <template v-if="loading">
       <Icon class="note-embed-card__icon note-embed-card__icon--spin" icon="material-symbols:progress-activity-rounded" />
       <span class="note-embed-card__title note-embed-card__title--placeholder">正在加载笔记…</span>
@@ -38,6 +38,13 @@ import { dispatchOpenNote } from '../utils/note-open-events'
 const props = withDefaults(defineProps<{ noteId: string; title?: string | null }>(), {
   title: null
 })
+
+/**
+ * 卡片向宿主（nodeView）冒泡的交互事件。
+ * - context-menu：右键卡片，由宿主补上节点位置后转交编辑器弹出卡片专属菜单；
+ *   available 表示目标笔记是否可正常打开（不存在/已删除为 false，菜单据此禁用打开类操作）。
+ */
+const emit = defineEmits<{ (e: 'context-menu', payload: { x: number; y: number; available: boolean }): void }>()
 
 const loading = ref(true)
 const deleted = ref(false)
@@ -105,6 +112,29 @@ function open(): void {
   if (loading.value || missing.value || deleted.value) return
   // 点击卡片 → 在新标签页打开目标笔记，保留当前阅读上下文（由 App.vue 路由到 openNoteInNewTab）。
   dispatchOpenNote(props.noteId, true)
+}
+
+/**
+ * 右键卡片：阻止浏览器原生菜单，把坐标冒泡给宿主 nodeView（由其补节点位置后转交编辑器）。
+ *
+ * 关键：必须 stopPropagation。ProseMirror nodeView 的 stopEvent 只让 PM 自身忽略事件，
+ * 管不住挂在编辑器根节点上的原生 contextmenu 监听；不拦冒泡时正文右键菜单会随后弹出并覆盖卡片菜单。
+ *
+ * :param event: 原生 contextmenu 事件。
+ * :return: 无返回值。
+ */
+function onContextMenu(event: MouseEvent): void {
+  // 卡片区域内一律吞掉右键，避免冒泡到编辑器根节点
+  event.preventDefault()
+  event.stopPropagation()
+  // 加载中尚未确定目标，不弹菜单
+  if (loading.value) return
+  // 缺失/已删除态照常弹菜单：仍可执行「删除卡片」等结构操作
+  emit('context-menu', {
+    x: event.clientX,
+    y: event.clientY,
+    available: !missing.value && !deleted.value
+  })
 }
 
 watch(() => props.noteId, loadCard)

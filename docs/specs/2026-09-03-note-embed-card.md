@@ -351,6 +351,20 @@ Cmd+O 空搜索本就直接用它渲染摘要，故同源同函数安全；搜�
 **验证**：`type-check` ✅、`npm test` 213/213 ✅、`npm run build` ✅、打包 arm64 ✅
 （`release/mac-arm64/心悦笔记.app`，asar 内确认含 `xynote-embed` / `buildMenu` / 紧凑规则）。
 
+**卡片操作入口（2026-09-10 实施，2026-09-11 修缺陷）**：
+- 实现方式：右键卡片 → 复用 `EditorContextMenu.vue` 弹出卡片专属四项：打开笔记 / 复制嵌入引用 /
+  转换为链接 / 删除卡片。链路为 `NoteEmbedCard（Vue）→ emit context-menu → nodeView 补 getPos()
+  → window CustomEvent（`EMBED_CARD_MENU_EVENT`）→ MarkdownVisualEditor 弹菜单`。
+- **⚠️ 缺陷与根因（2026-09-11）**：用户实测右键卡片弹出的是**编辑器正文菜单**而非卡片菜单。
+  根因是 `NoteEmbedCard.onContextMenu` 只调了 `preventDefault()`、**漏了 `stopPropagation()`**：
+  ProseMirror nodeView 的 `stopEvent: () => true` 只让 PM 自身忽略事件，**管不住挂在编辑器根节点上的
+  原生 `contextmenu` 监听**；事件继续冒泡 → `handleEditorContextMenu` 随后覆盖 `editorContextMenu`
+  的 `groups`，卡片菜单在同一帧被正文菜单顶掉。
+- 修复：① 卡片内 `preventDefault + stopPropagation` 一律吞掉右键；② `handleEditorContextMenu` 增加
+  `target.closest('.xynote-embed-nodeview')` 兜底跳过；③ 顺带让缺失/已删除卡片也能右键（可执行
+  「删除卡片」），新增 `available` 载荷字段控制「打开笔记」是否禁用。
+- 附带健壮性：`EditorContextMenu.vue` 用 `ResizeObserver` 跟随真实尺寸重测，并把
+  `max-height` 放宽到 `calc(100vh - 16px)`，避免长菜单在小窗口被裁。
+
 **仍未决**（spec 原「未决」剩余项）：
 - 「嵌入整篇正文」仍为固定摘要（2 行），需要**展开交互**时另议。
-- 卡片操作入口（去嵌入 / 在源文件打开 / 复制嵌入引用）尚未做。

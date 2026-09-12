@@ -36,7 +36,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed, ref, watch, nextTick } from 'vue'
+import { computed, onBeforeUnmount, ref, watch, nextTick } from 'vue'
 import { Icon } from '@iconify/vue'
 
 export interface EditorContextMenuItem {
@@ -78,19 +78,44 @@ const menuStyle = computed(() => {
   return { left: `${left}px`, top: `${top}px`, minWidth: `${width}px` }
 })
 
+/** 测量菜单真实尺寸（供翻转计算）；数值未变则跳过，避免无谓重渲染。 */
+function measure(): void {
+  const el = menuRef.value
+  if (!el) return
+  const width = el.offsetWidth
+  const height = el.offsetHeight
+  if (width === menuSize.value.width && height === menuSize.value.height) return
+  menuSize.value = { width, height }
+}
+
+/** 监听菜单尺寸变化（字体/图标延迟加载、分组切换都会改变高度），否则翻转位置会基于过期尺寸算错。 */
+let resizeObserver: ResizeObserver | null = null
+
 /** 每次打开后测量实际宽高用于翻转计算；等下一帧避免布局抖动。 */
 watch(
   () => props.visible,
   async (open) => {
-    if (!open) return
+    if (!open) {
+      resizeObserver?.disconnect()
+      resizeObserver = null
+      return
+    }
     await nextTick()
     await nextTick()
+    measure()
     const el = menuRef.value
-    if (el) {
-      menuSize.value = { width: el.offsetWidth, height: el.offsetHeight }
+    if (el && typeof ResizeObserver !== 'undefined') {
+      resizeObserver?.disconnect()
+      resizeObserver = new ResizeObserver(() => measure())
+      resizeObserver.observe(el)
     }
   }
 )
+
+onBeforeUnmount(() => {
+  resizeObserver?.disconnect()
+  resizeObserver = null
+})
 </script>
 
 <style>
@@ -105,6 +130,9 @@ watch(
   position: fixed;
   z-index: 91;
   width: auto;
+  /* 纵向可用满视口（上下各留 8px），配合 JS 翻转保证菜单永远完整落在窗口内 */
+  max-height: calc(100vh - 16px);
+  overscroll-behavior: contain;
 }
 .editor-context-menu .editor-context-menu__icon {
   flex: 0 0 auto;
