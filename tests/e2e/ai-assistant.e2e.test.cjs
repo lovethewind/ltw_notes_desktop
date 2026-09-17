@@ -10,9 +10,14 @@ const { _electron: electron } = require('playwright')
 const projectRoot = path.resolve(__dirname, '../..')
 
 /** 后台启动隔离的真实 Electron 应用，避免测试读写用户笔记和 AI 设置。 */
+// 受限沙箱（如无 GUI 权限的容器）里 Chromium 子进程无法初始化自身 sandbox，主进程会以
+// "GPU process isn't usable" 崩溃退出。需要时用该环境变量注入 --no-sandbox / --disable-gpu
+// 一类的开关；不设置时行为与原来完全一致。
+const extraLaunchArgs = (process.env.XINYUE_E2E_ELECTRON_ARGS || '').split(/\s+/).filter(Boolean)
+
 async function launchApplication(userDataPath) {
   const electronApplication = await electron.launch({
-    args: [projectRoot],
+    args: [...extraLaunchArgs, projectRoot],
     cwd: projectRoot,
     env: {
       ...process.env,
