@@ -1179,6 +1179,138 @@ test("反向链接识别桌面内部链接的旧版与新版格式", () => {
   })
 })
 
+test("出链只返回本篇显式引用且未删除的笔记", () => {
+  withRepository((repository) => {
+    const source = repository.createNote(null)
+    const target = repository.createNote(null)
+    const referencedByTarget = repository.createNote(null)
+
+    repository.updateNote(target.id, {
+      content: `反向 [来源](https://xinyue-note.local/${referencedByTarget.id})`
+    })
+    repository.updateNote(source.id, {
+      content: `出链 [目标](https://xinyue-note.local/${target.id})`
+    })
+
+    // 方向必须相反：source 的出链是 target，而不是引用 source 的那些笔记。
+    assert.deepEqual(repository.getNoteOutlinks(source.id).map((item) => item.id), [target.id])
+    assert.deepEqual(repository.getNoteOutlinks(target.id).map((item) => item.id), [referencedByTarget.id])
+    // 入边与出边互不串台。
+    assert.deepEqual(repository.getBacklinks(target.id).map((item) => item.id), [source.id])
+
+    // 目标被删除后不应再出现在出链里。
+    repository.setNoteDeleted(target.id, true)
+    assert.ok(!repository.getNoteOutlinks(source.id).some((item) => item.id === target.id))
+  })
+})
+
+test("笔记嵌入卡片与普通链接一样计入引用关系", () => {
+  withRepository((repository) => {
+    const source = repository.createNote(null)
+    const embedded = repository.createNote(null)
+
+    // 嵌入卡片以 <div data-xynote-embed="note:{noteId}"> 落库，语义上同样是「本篇引用了目标」。
+    repository.updateNote(source.id, {
+      content: `<div data-xynote-embed="note:${embedded.id}" title="目标"></div>`
+    })
+
+    assert.deepEqual(repository.getNoteOutlinks(source.id).map((item) => item.id), [embedded.id])
+    assert.deepEqual(repository.getBacklinks(embedded.id).map((item) => item.id), [source.id])
+    // 嵌入与链接混排时同一个目标只算一条边（Set 去重）。
+    repository.updateNote(source.id, {
+      content: [
+        `<div data-xynote-embed="note:${embedded.id}"></div>`,
+        `链接 [目标](https://xinyue-note.local/${embedded.id})`
+      ].join("\n\n")
+    })
+    assert.deepEqual(repository.getNoteOutlinks(source.id).map((item) => item.id), [embedded.id])
+  })
+})
+
+test("嵌入自身或嵌入不存在、已删除的笔记都不产生关系边", () => {
+  withRepository((repository) => {
+    const source = repository.createNote(null)
+    const gone = repository.createNote(null)
+    repository.setNoteDeleted(gone.id, true)
+
+    repository.updateNote(source.id, {
+      content: [
+        `<div data-xynote-embed="note:${source.id}"></div>`,
+        `<div data-xynote-embed="note:${gone.id}"></div>`,
+        '<div data-xynote-embed="note:not-a-real-id"></div>'
+      ].join("\n\n")
+    })
+
+    assert.deepEqual(repository.getNoteOutlinks(source.id), [])
+    assert.deepEqual(repository.getBacklinks(gone.id), [])
+    assert.equal(repository.getNoteGraph(source.id, 2).links.length, 0)
+  })
+})
+
+test("同步快照落库后会重建引用关系，含快照内互相引用", () => {
+  withRepository((repository) => {
+    const now = new Date().toISOString()
+    // 顺序刻意安排为 [B, A, C]：A 用嵌入卡片引用**排在前面**的 B（已落库），
+    // 用线上链接引用**排在后面**的 C（尚未落库）。
+    // 若在循环里逐条落库就即时刷新，A 处理时 C 还不存在 → 这条边必丢；
+    // 只有「整批落库后统一刷新」才能两条都建上。
+    const remoteNote = (clientId, serverId, title, content) => ({
+      clientId,
+      serverId,
+      folderClientId: null,
+      title,
+      content,
+      isPinned: false,
+      isDeleted: false,
+      deletedTime: null,
+      deletedByFolderClientId: null,
+      tagClientIds: [],
+      createdAt: now,
+      updatedAt: now
+    })
+    const snapshotNotes = (aContent) => [
+      remoteNote("remote-b", "7002", "远端 B", "远端 B 正文"),
+      remoteNote(
+        "remote-a",
+        "7001",
+        "远端 A",
+        aContent
+      ),
+      remoteNote("remote-c", "7003", "远端 C", "远端 C 正文")
+    ]
+
+    repository.applySyncResult({
+      snapshot: {
+        folders: [],
+        tags: [],
+        notes: snapshotNotes(
+          [
+            '<div data-xynote-embed="note:remote-b"></div>',
+            "[链接](https://lovethewind.cn/notes/7003)"
+          ].join("\n\n")
+        )
+      }
+    })
+
+    // 出边两条都要在（嵌入 B + 链接 C），顺序不保证故排序后比较。
+    assert.deepEqual(
+      repository.getNoteOutlinks("remote-a").map((item) => item.id).sort(),
+      ["remote-b", "remote-c"]
+    )
+    assert.deepEqual(repository.getBacklinks("remote-b").map((item) => item.id), ["remote-a"])
+    assert.deepEqual(repository.getBacklinks("remote-c").map((item) => item.id), ["remote-a"])
+
+    // 再次同步时 A 的正文改为不再引用任何笔记，旧边必须被清掉而不是残留。
+    repository.applySyncResult({
+      snapshot: { folders: [], tags: [], notes: snapshotNotes("已取消引用") }
+    })
+
+    assert.deepEqual(repository.getNoteOutlinks("remote-a"), [])
+    assert.deepEqual(repository.getBacklinks("remote-b"), [])
+    assert.deepEqual(repository.getBacklinks("remote-c"), [])
+  })
+})
+
 test("局部图谱按中心笔记双向展开并防环", () => {
   withRepository((repository) => {
     const center = repository.createNote(null)

@@ -1963,7 +1963,7 @@ function registerIpcHandlers() {
       getNote: (noteId) => repository.getNoteForEditing(noteId),
       searchNotes: (keyword, options) => repository.searchNotes(keyword, options),
       getBacklinks: (noteId) => repository.getBacklinks(noteId),
-      getMentions: (noteId) => repository.getNoteMentions(noteId),
+      getOutlinks: (noteId) => repository.getNoteOutlinks(noteId),
       getNoteGraph: (noteId, maxDepth) => repository.getNoteGraph(noteId, maxDepth),
       getGlobalGraph: (maxNodes) => repository.getGlobalGraph(maxNodes),
       openNoteLink: (noteId) => {

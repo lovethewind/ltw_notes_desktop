@@ -38,20 +38,18 @@ export interface OfflineNote {
   tags: NoteTag[]
 }
 
+/**
+ * 关系列表中的一行笔记概要。
+ *
+ * 入边（谁引用了本篇）与出边（本篇引用了谁）共用此结构，两者数据同源于 note_links 表，
+ * 仅方向不同，因此不区分类型。
+ */
 export interface BacklinkNote {
   id: string
   title: string
   folderId: string | null
   isDeleted: boolean
   updatedAt: string
-}
-
-export interface MentionNote {
-  id: string
-  title: string
-  folderId: string | null
-  updatedAt: string
-  excerpt: string
 }
 
 export interface GraphNode {
@@ -394,10 +392,10 @@ export interface NotesDesktopApi {
   }): Promise<AiAssistantAnswer>
   /** 打开指定笔记。 */
   openNoteLink(noteId: string): Promise<boolean>
-  /** 查询引用了指定笔记的本地笔记列表。 */
+  /** 查询引用了指定笔记的本地笔记列表（入边）。 */
   getNoteBacklinks(noteId: string): Promise<BacklinkNote[]>
-  /** 查询正文提及了指定笔记标题、但未显式链接的本地笔记列表。 */
-  getNoteMentions(noteId: string): Promise<MentionNote[]>
+  /** 查询指定笔记显式引用了的本地笔记列表（出边）。 */
+  getNoteOutlinks(noteId: string): Promise<BacklinkNote[]>
   /** 以指定笔记为中心查询局部引用图谱。 */
   getNoteGraph(noteId: string, maxDepth?: number): Promise<NoteGraph>
   /** 查询全库双链关系图谱。 */

@@ -977,9 +977,13 @@ function createRepository(database) {
   /**
    * 从笔记正文解析其引用的本地笔记 ID 集合。
    *
-   * 同时支持两种链接来源：
+   * 同时支持三种引用来源：
    * 1. 桌面端内部链接：https://xinyue-note.local/{noteId}（旧格式 xinyue-notes://note/{noteId} 仍兼容）
    * 2. 网页版笔记链接：{后端域名}/notes/{serverId} 或 /articles/{serverId}，需通过 server_id 回落到本地笔记。
+   * 3. 笔记嵌入卡片：`<div data-xynote-embed="note:{noteId}">`，noteId 为本地笔记 ID。
+   *
+   * 新增来源时必须同步递增 rebuildAllNoteLinks 的 `note_links_version`，
+   * 否则老库里的关系表不会重算、会一直缺这一来源。
    *
    * @param {string} noteId 当前笔记 ID。
    * @param {string} content 笔记正文。
@@ -1015,10 +1019,33 @@ function createRepository(database) {
     const findLocalByServerId = database.prepare(
       "SELECT id FROM notes WHERE server_id = ? AND is_deleted = 0"
     )
+    const findLocalById = database.prepare("SELECT id FROM notes WHERE id = ? AND is_deleted = 0")
     const webLinkPattern = /\/(?:notes|articles)\/(\d+)/g
     while ((match = webLinkPattern.exec(content)) !== null) {
       const local = findLocalByServerId.get(match[1])
       if (local && local.id !== noteId) targetIds.add(local.id)
+    }
+    // 笔记嵌入卡片：`<div data-xynote-embed="note:{noteId}">`（见 src/editor/xynote-embed.ts）。
+    // 嵌入在语义上同样是「本篇引用了目标」，必须与普通链接一样写进 note_links，
+    // 否则右侧「关系」列表与图谱会漏掉嵌入关系（历史实现只解析 URL 形式，故漏统计）。
+    const embedPattern = /data-xynote-embed=["']note:([^"']+)["']/g
+    while ((match = embedPattern.exec(content)) !== null) {
+      const raw = match[1]
+      let targetId = raw
+      try {
+        targetId = decodeURIComponent(raw)
+      } catch {
+        targetId = raw
+      }
+      if (!targetId || targetId === noteId) continue
+      // 正常情况下就是本地笔记 ID；跨设备同步回来的嵌入可能带的是对端库里的 ID，
+      // 此时按 server_id 回落一次，仍未命中说明目标笔记在本机不存在，直接丢弃。
+      if (!findLocalById.get(targetId)) {
+        const local = findLocalByServerId.get(targetId)
+        if (!local) continue
+        targetId = local.id
+      }
+      if (targetId !== noteId) targetIds.add(targetId)
     }
     return targetIds
   }
@@ -1026,8 +1053,19 @@ function createRepository(database) {
   /**
    * 根据笔记正文重新计算其指向的内部笔记链接引用关系。
    *
+   * ⚠️ 约定：**任何写入 `notes.content` 的路径都必须紧接着调用本函数**，
+   * 并把「实际落库的那份正文」传进来（例如 `validateNoteContent` / `localizeImageAssetReferences`
+   * 处理后的字符串，而非处理前的原始值）。漏掉就会出现「正文已更新、关系表还是旧的」，
+   * 表现为「关系」面板与图谱数据陈旧。
+   * 已接入的写入点：duplicateNote / createQuickNote / updateNote /
+   * restoreNoteHistory / applySyncResult / resolveNoteConflict(local) /
+   * importMarkdownDocuments / importBackup。
+   * （createNote 建的是空正文笔记，无需调用。）
+   *
+   * 本函数自身开事务，可安全嵌套在其它 `database.transaction` 内（better-sqlite3 走 savepoint）。
+   *
    * @param {string} noteId 当前笔记 ID。
-   * @param {string} content 笔记正文。
+   * @param {string} content 笔记正文（落库后的最终值）。
    * @returns {void}
    */
   function refreshNoteLinks(noteId, content) {
@@ -1044,7 +1082,11 @@ function createRepository(database) {
   }
 
   /**
-   * 为所有未删除的笔记重建一次引用关系，仅在旧数据库首次升级时触发。
+   * 为所有未删除的笔记重建一次引用关系，仅在解析规则升级时触发。
+   *
+   * 版本号语义：`note_links_version` 记录的**不是**表结构版本，而是
+   * `resolveNoteLinkTargetIds` 的解析规则版本 —— 规则一变，旧库里的关系就是错的，
+   * 必须整表重建一次。当前版本 2（新增「笔记嵌入」来源）。
    *
    * :return: 无返回值。
    */
@@ -1052,7 +1094,7 @@ function createRepository(database) {
     const version = database.prepare(
       "SELECT value FROM sync_state WHERE key = 'note_links_version'"
     ).get()?.value
-    if (version === "1") return
+    if (version === "2") return
     const rows = database.prepare("SELECT id, content FROM notes WHERE is_deleted = 0").all()
     const insertLink = database.prepare(
       "INSERT OR IGNORE INTO note_links(source_note_id, target_note_id) VALUES (?, ?)"
@@ -1065,7 +1107,7 @@ function createRepository(database) {
         }
       }
       database.prepare(`
-        INSERT INTO sync_state(key, value) VALUES ('note_links_version', '1')
+        INSERT INTO sync_state(key, value) VALUES ('note_links_version', '2')
         ON CONFLICT(key) DO UPDATE SET value = excluded.value
       `).run()
     })
@@ -1095,52 +1137,30 @@ function createRepository(database) {
     }))
   }
 
-  // 提及计算的过滤配置：标题过短或命中通用停用词则不参与，且限制返回条数。
-  const MENTION_MIN_TITLE_LENGTH = 2
-  const MENTION_LIMIT = 12
-  const MENTION_STOP_WORDS = new Set([
-    "流程", "测试", "笔记", "文档", "模板", "面试题", "日报", "周报", "会议",
-    "记录", "清单", "待办", "目录", "大纲", "说明", "指南", "教程", "公告", "日志",
-    "todo", "todolist"
-  ])
-
   /**
-   * 查询正文中提及了指定笔记标题、但未显式链接到它的本地笔记。
+   * 查询指定笔记显式引用了的本地笔记（出边）。
    *
-   * @param {string} noteId 目标笔记 ID。
-   * @returns {Array<{ id: string, title: string, folderId: string | null, updatedAt: string, excerpt: string }>} 提及来源列表。
+   * 与 getBacklinks 方向相反：一个回答“谁引用了我”，一个回答“我引用了谁”。
+   * 同样只读 note_links 表（显式链接），不做标题字符串匹配。已删除笔记不参与。
+   *
+   * @param {string} noteId 源笔记 ID。
+   * @returns {Array<{ id: string, title: string, folderId: string | null, isDeleted: boolean, updatedAt: string }>} 被引用笔记列表。
    */
-  function getNoteMentions(noteId) {
-    const target = database.prepare("SELECT id, title FROM notes WHERE id = ?").get(noteId)
-    if (!target) return []
-    const title = String(target.title || "").trim()
-    const strippedTitle = title.replace(/\s+/g, "").toLowerCase()
-    if (!strippedTitle) return []
-    if (strippedTitle.length < MENTION_MIN_TITLE_LENGTH) return []
-    if (MENTION_STOP_WORDS.has(strippedTitle)) return []
-    const linked = new Set(
-      database.prepare("SELECT source_note_id FROM note_links WHERE target_note_id = ?")
-        .all(noteId)
-        .map((row) => row.source_note_id)
-    )
-    const escaped = title.replace(/[\\%_]/g, (char) => `\\${char}`)
-    const rows = database.prepare(`
-      SELECT id, title, folder_id AS folderId, content, updated_at AS updatedAt
-      FROM notes
-      WHERE is_deleted = 0 AND id != ? AND content LIKE ? ESCAPE '\\'
-      ORDER BY updated_at DESC
-      LIMIT 40
-    `).all(noteId, `%${escaped}%`)
-    return rows
-      .filter((row) => !linked.has(row.id))
-      .slice(0, MENTION_LIMIT)
-      .map((row) => ({
-        id: row.id,
-        title: row.title || "（无标题）",
-        folderId: row.folderId,
-        updatedAt: row.updatedAt,
-        excerpt: buildMentionExcerpt(row.content, title)
-      }))
+  function getNoteOutlinks(noteId) {
+    return database.prepare(`
+      SELECT n.id AS id, n.title AS title, n.folder_id AS folderId,
+             n.is_deleted AS isDeleted, n.updated_at AS updatedAt
+      FROM note_links l
+      JOIN notes n ON n.id = l.target_note_id
+      WHERE l.source_note_id = ? AND n.is_deleted = 0
+      ORDER BY n.updated_at DESC
+    `).all(noteId).map((row) => ({
+      id: row.id,
+      title: row.title || "（无标题）",
+      folderId: row.folderId,
+      isDeleted: Boolean(row.isDeleted),
+      updatedAt: row.updatedAt
+    }))
   }
 
   /**
@@ -1259,31 +1279,6 @@ function createRepository(database) {
     return { nodes, links }
   }
 
-  /**
-   * 生成提及上下文片段，围绕标题首次出现处截取前后文本。
-   *
-   * @param {string} content 笔记正文。
-   * @param {string} title 当前笔记标题（作为提及词）。
-   * @returns {string} 上下文片段。
-   */
-  function buildMentionExcerpt(content, title) {
-    const text = String(content || "").replace(/\s+/g, " ").trim()
-    if (!text || !title) return ""
-    const index = text.indexOf(title)
-    const radius = 34
-    let start
-    let end
-    if (index === -1) {
-      start = 0
-      end = Math.min(text.length, 80)
-    } else {
-      start = Math.max(0, index - radius)
-      end = Math.min(text.length, index + title.length + radius)
-    }
-    const raw = text.slice(start, end).trim()
-    return `${start > 0 ? "…" : ""}${raw}${end < text.length ? "…" : ""}`
-  }
-
   /** 返回仍待处理且原笔记存在的同步冲突。 */
   function listNoteConflicts() {
     return database.prepare(`
@@ -1349,6 +1344,7 @@ function createRepository(database) {
 
     if (strategy === "local") {
       createHistoryIfNeeded(original, true)
+      const mergedContent = validateNoteContent(conflict.content)
       database.prepare(`
         UPDATE notes
         SET folder_id = ?, title = ?, content = ?, is_pinned = ?, is_deleted = ?,
@@ -1357,7 +1353,7 @@ function createRepository(database) {
       `).run(
         conflict.folder_id,
         String(conflict.title || "").replace(/（冲突副本）$/, "").slice(0, 100) || "无标题笔记",
-        validateNoteContent(conflict.content),
+        mergedContent,
         conflict.is_pinned,
         conflict.is_deleted,
         conflict.deleted_at,
@@ -1365,6 +1361,8 @@ function createRepository(database) {
         nowIso(),
         original.id
       )
+      // 副本正文整体覆盖了原笔记，引用关系必须按新正文重算；两个版本的链接可能完全不同。
+      refreshNoteLinks(original.id, mergedContent)
       replaceNoteTags(original.id, selectTagsForNote.all(conflictNoteId).map((tag) => tag.name))
       enqueue("note", original.id, "upsert", getNote(original.id))
     } else {
@@ -1899,6 +1897,7 @@ function createRepository(database) {
       }
       const id = randomUUID()
       const timestamp = nowIso()
+      const importedContent = validateNoteContent(document.content)
       database.prepare(`
         INSERT INTO notes(
           id, folder_id, title, content, created_at, updated_at, dirty
@@ -1907,10 +1906,13 @@ function createRepository(database) {
         id,
         documentFolderId,
         String(document.title || "无标题笔记").trim().slice(0, 100) || "无标题笔记",
-        validateNoteContent(document.content),
+        importedContent,
         timestamp,
         timestamp
       )
+      // 导入的 Markdown 里可能带线上笔记链接（/{notes|articles}/{serverId} 形式），
+      // 不刷新的话这些关系不会进 note_links。
+      refreshNoteLinks(id, importedContent)
       replaceNoteTags(id, Array.isArray(document.tagNames) ? document.tagNames : [])
       const note = getNote(id)
       enqueue("note", id, "upsert", note)
@@ -1973,6 +1975,7 @@ function createRepository(database) {
       const id = randomUUID()
       const createdAt = Number.isFinite(Date.parse(note.createdAt)) ? note.createdAt : timestamp
       const updatedAt = Number.isFinite(Date.parse(note.updatedAt)) ? note.updatedAt : timestamp
+      const importedContent = validateNoteContent(note.content)
       database.prepare(`
         INSERT INTO notes(
           id, folder_id, title, content, is_pinned, created_at, updated_at, dirty
@@ -1981,11 +1984,14 @@ function createRepository(database) {
         id,
         folderIds.get(note.folderId) || rootFolder.id,
         String(note.title || "无标题笔记").trim().slice(0, 100) || "无标题笔记",
-        validateNoteContent(note.content),
+        importedContent,
         Number(Boolean(note.isPinned)),
         createdAt,
         updatedAt
       )
+      // 备份正文里的线上笔记链接（/{notes|articles}/{serverId}）需要在这里建立关系；
+      // 指向旧库本地 ID 的链接会因导入后换 ID 而解析不到，属预期（导入即复制为新副本）。
+      refreshNoteLinks(id, importedContent)
       const tagNames = Array.isArray(note.tags)
         ? note.tags.map((tag) => String(tag.name || "").trim()).filter(Boolean)
         : []
@@ -2264,6 +2270,12 @@ function createRepository(database) {
     }
 
     const noteLocalIds = new Map()
+    /**
+     * 本次快照落库的笔记（[本地 id, 落库正文]）。
+     * 必须等**整批**笔记都写完再统一重算引用关系：快照内两篇笔记互相引用时，
+     * 被引用方可能排在后面尚未插入，逐条即时刷新会漏掉这类边。
+     */
+    const syncedNoteContents = []
     for (const remote of snapshot.notes || []) {
       if (pendingMutationIds.get("note")?.has(remote.clientId)) {
         const pendingLocal = database.prepare(`
@@ -2276,6 +2288,9 @@ function createRepository(database) {
         SELECT id FROM notes WHERE server_id = ? OR id = ? LIMIT 1
       `).get(String(remote.serverId), remote.clientId)
       const localId = local?.id || remote.clientId
+      // 远端正文里的图片/附件地址需本地化后再落库；关系表也必须用这同一份字符串，
+      // 保证「库里存的正文」与「解析引用关系用的正文」完全一致。
+      const localizedContent = localizeImageAssetReferences(remote.content)
       if (!local) {
         database.prepare(`
           INSERT INTO notes(
@@ -2288,7 +2303,7 @@ function createRepository(database) {
           String(remote.serverId),
           folderLocalIds.get(remote.folderClientId) || null,
           remote.title,
-          localizeImageAssetReferences(remote.content),
+          localizedContent,
           Number(remote.isPinned),
           Number(remote.isDeleted),
           remote.deletedTime,
@@ -2308,7 +2323,7 @@ function createRepository(database) {
           String(remote.serverId),
           folderLocalIds.get(remote.folderClientId) || null,
           remote.title,
-          localizeImageAssetReferences(remote.content),
+          localizedContent,
           Number(remote.isPinned),
           Number(remote.isDeleted),
           remote.deletedTime,
@@ -2318,6 +2333,8 @@ function createRepository(database) {
           localId
         )
       }
+      // 正文先记账，等整批笔记落库完毕后统一重算引用关系（见 syncedNoteContents 注释）。
+      syncedNoteContents.push([localId, localizedContent])
       noteLocalIds.set(remote.clientId, localId)
       database.prepare("DELETE FROM note_tags WHERE note_id = ?").run(localId)
       for (const tagClientId of remote.tagClientIds || []) {
@@ -2327,6 +2344,12 @@ function createRepository(database) {
             .run(localId, tagId)
         }
       }
+    }
+
+    // 整批笔记落库完毕，统一重算引用关系：网页端新增/删除的链接与嵌入卡片要同步反映到
+    // 本地 note_links，否则「关系」面板与图谱会一直停在旧数据上，直到本地编辑一次。
+    for (const [syncedNoteId, syncedContent] of syncedNoteContents) {
+      refreshNoteLinks(syncedNoteId, syncedContent)
     }
 
     if (hasHistorySnapshot) {
@@ -2429,7 +2452,7 @@ function createRepository(database) {
     createQuickNote,
     updateNote,
     getBacklinks,
-    getNoteMentions,
+    getNoteOutlinks,
     getNoteGraph,
     getGlobalGraph,
     bulkUpdateNotes,
