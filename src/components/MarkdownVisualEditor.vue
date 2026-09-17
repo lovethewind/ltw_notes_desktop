@@ -48,42 +48,73 @@
       v-if="props.showOutline && outlineOpen"
       id="markdown-outline-panel"
       class="markdown-outline"
-      aria-label="Markdown 大纲"
+      aria-label="笔记侧栏"
     >
+      <!--
+        两个视图页签切换，当前页签独占侧栏剩余高度。
+        旧结构是三块竖排堆在同一个滚动流里，图谱画布只能拿到写死的 280px 并被挤在末尾。
+      -->
       <header class="markdown-outline__header">
-        <h2>大纲</h2>
-        <button type="button" class="markdown-outline__close" aria-label="关闭大纲" @click="toggleOutline">
+        <div class="markdown-outline__tabs" role="tablist" aria-label="侧栏视图">
+          <button
+            v-for="tab in OUTLINE_TABS"
+            :key="tab.id"
+            type="button"
+            role="tab"
+            :aria-selected="outlineTab === tab.id"
+            :class="['markdown-outline__tab', { 'is-active': outlineTab === tab.id }]"
+            @click="outlineTab = tab.id"
+          >
+            <Icon :icon="tab.icon" />
+            <span>{{ tab.label }}</span>
+          </button>
+        </div>
+        <button type="button" class="markdown-outline__close" aria-label="关闭侧栏" @click="toggleOutline">
           <Icon icon="material-symbols:close-rounded" />
         </button>
       </header>
-      <nav v-if="outlineItems.length" class="markdown-outline__list" aria-label="文档标题">
-        <button
-          v-for="item in outlineItems"
-          :key="`${item.index}-${item.text}`"
-          type="button"
-          class="markdown-outline-item"
-          :class="{ 'is-active': item.index === activeOutlineIndex }"
-          :style="{ '--outline-level': item.level }"
-          @click="scrollToOutline(item.index)"
-        >
-          {{ item.text }}
-        </button>
-      </nav>
-      <p v-else class="markdown-outline__empty">暂无大纲</p>
-      <section class="markdown-backlinks-section">
-        <button type="button" class="markdown-backlinks-section__toggle" @click="toggleBacklinks">
-          <Icon icon="material-symbols:link-rounded" />
-          <span>反向链接{{ backlinksOpen ? '' : ' · 点击展开' }}</span>
-        </button>
-        <BacklinksPanel v-if="backlinksOpen" :note-id="props.documentId" />
-      </section>
-      <section class="markdown-backlinks-section">
-        <button type="button" class="markdown-backlinks-section__toggle" @click="toggleNoteGraph">
-          <Icon icon="material-symbols:hub-rounded" />
-          <span>关系图谱{{ noteGraphOpen ? '' : ' · 点击展开' }}</span>
-        </button>
-        <NoteGraphPanel v-if="noteGraphOpen" :note-id="props.documentId" />
-      </section>
+      <div class="markdown-outline__body">
+        <template v-if="outlineTab === 'outline'">
+          <nav v-if="outlineItems.length" class="markdown-outline__list" aria-label="文档标题">
+            <button
+              v-for="item in outlineItems"
+              :key="`${item.index}-${item.text}`"
+              type="button"
+              class="markdown-outline-item"
+              :class="{ 'is-active': item.index === activeOutlineIndex }"
+              :style="{ '--outline-level': item.level }"
+              @click="scrollToOutline(item.index)"
+            >
+              {{ item.text }}
+            </button>
+          </nav>
+          <p v-else class="markdown-outline__empty">暂无大纲</p>
+        </template>
+        <!--
+          「关系」页签：顶部二级切换（列表 / 图谱），下方视图区独占剩余高度。
+          列表自带滚动、图谱自带尺寸自适应，所以这里用 flex 撑满，而不是让 body 去滚。
+        -->
+        <div v-else class="relationship-panel">
+          <div class="relationship-panel__switch" role="tablist" aria-label="关系视图">
+            <button
+              v-for="view in RELATIONSHIP_VIEWS"
+              :key="view.id"
+              type="button"
+              role="tab"
+              :aria-selected="relationshipView === view.id"
+              :class="['relationship-panel__switch-btn', { 'is-active': relationshipView === view.id }]"
+              @click="relationshipView = view.id"
+            >
+              <Icon :icon="view.icon" />
+              <span>{{ view.label }}</span>
+            </button>
+          </div>
+          <div class="relationship-panel__view">
+            <BacklinksPanel v-if="relationshipView === 'list'" :note-id="props.documentId" />
+            <NoteGraphPanel v-else :note-id="props.documentId" />
+          </div>
+        </div>
+      </div>
     </aside>
     <NoteLinkPicker
       :visible="noteLinkPickerVisible"
@@ -215,8 +246,31 @@ const editorScrollRef = ref<HTMLDivElement | null>(null)
 const attachmentInputRef = ref<HTMLInputElement | null>(null)
 const noteLinkPickerVisible = ref(false)
 const noteEmbedPickerVisible = ref(false)
-const backlinksOpen = ref(false)
-const noteGraphOpen = ref(false)
+/**
+ * 右侧栏的视图页签。同一时刻只显示一个、当前页签独占侧栏剩余高度，
+ * 取代旧版「三块竖排 + 单一滚动流」的堆叠方式（那会让关系图谱只能拿到写死的高度并被挤在末尾）。
+ *
+ * 「关系」页签内部再分「列表 / 图谱」两种画法：两者同源于 note_links，只是呈现粒度不同，
+ * 侧栏仅 270px 宽放不下同屏并列，故做成页签内的二级切换。
+ */
+const OUTLINE_TABS = [
+  { id: 'outline', label: '大纲', icon: 'material-symbols:toc-rounded' },
+  { id: 'relationship', label: '关系', icon: 'material-symbols:hub-rounded' }
+] as const
+
+type OutlineTabId = (typeof OUTLINE_TABS)[number]['id']
+
+/** 「关系」页签内的二级视图：列表看明细，图谱看结构。 */
+type RelationshipViewId = 'list' | 'graph'
+
+/** 关系页签内的二级切换项，窄侧栏里直接平铺两个按钮（下拉会多一次交互）。 */
+const RELATIONSHIP_VIEWS = [
+  { id: 'list', label: '列表', icon: 'material-symbols:format-list-bulleted-rounded' },
+  { id: 'graph', label: '图谱', icon: 'material-symbols:hub-rounded' }
+] as const
+
+const outlineTab = ref<OutlineTabId>('outline')
+const relationshipView = ref<RelationshipViewId>('list')
 const linkSuggestVisible = ref(false)
 const linkSuggestItems = ref<OfflineNote[]>([])
 const linkSuggestIndex = ref(0)
@@ -965,24 +1019,6 @@ function syncOutlineToggle(): void {
   button.setAttribute('aria-label', outlineOpen.value ? '收起大纲' : '展开大纲')
   button.dataset.label = '大纲'
   button.classList.toggle('active', outlineOpen.value)
-}
-
-/**
- * 切换反向链接面板的显示状态。
- *
- * :return: 无返回值。
- */
-function toggleBacklinks(): void {
-  backlinksOpen.value = !backlinksOpen.value
-}
-
-/**
- * 切换关系图谱面板的显示状态。
- *
- * :return: 无返回值。
- */
-function toggleNoteGraph(): void {
-  noteGraphOpen.value = !noteGraphOpen.value
 }
 
 /**

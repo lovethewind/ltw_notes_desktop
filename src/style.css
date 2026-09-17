@@ -530,9 +530,22 @@ body.is-link-modifier-active .milkdown-editor-root a[href] { cursor: pointer; }
 .markdown-toolbar-menu__item::after { content: attr(data-label); }
 .markdown-toolbar-menu__item svg { width: 17px; height: 17px; color: var(--blue); }
 .markdown-toolbar-menu__item:hover, .markdown-toolbar-menu__item:focus-visible, .markdown-toolbar-menu__item.active { background: #edf5ff; color: var(--blue); }
-.markdown-outline { min-width: 0; min-height: 0; overflow-y: auto; border-left: 1px solid var(--line); background: rgba(249,252,255,.8); }
-.markdown-outline__header { position: sticky; top: 0; z-index: 2; height: 54px; display: flex; align-items: center; justify-content: space-between; padding: 0 14px; border-bottom: 1px solid #e8eef5; background: rgba(249,252,255,.94); backdrop-filter: blur(14px); }
-.markdown-outline__header h2 { margin: 0; color: #53657c; font-size: 16px; }
+.markdown-outline { min-width: 0; min-height: 0; display: flex; flex-direction: column; overflow: hidden; border-left: 1px solid var(--line); background: rgba(249,252,255,.8); }
+.markdown-outline__header { flex: none; height: 54px; display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 0 10px 0 12px; border-bottom: 1px solid #e8eef5; background: rgba(249,252,255,.94); }
+.markdown-outline__tabs { display: inline-flex; gap: 2px; padding: 2px; border-radius: 9px; background: rgba(24,39,63,.05); }
+.markdown-outline__tab { display: inline-flex; align-items: center; gap: 4px; padding: 4px 9px; border: 0; border-radius: 7px; background: transparent; color: #718096; cursor: pointer; font-size: 12px; font-weight: 500; line-height: 18px; }
+.markdown-outline__tab svg { width: 15px; height: 15px; }
+.markdown-outline__tab:hover { color: #315f96; }
+.markdown-outline__tab.is-active { background: #fff; color: var(--blue); box-shadow: 0 1px 3px rgba(31,54,84,.12); }
+.markdown-outline__body { flex: 1; min-height: 0; display: flex; flex-direction: column; overflow-y: auto; }
+/* 关系页签：顶部二级切换（列表 / 图谱），下方视图区独占剩余高度。 */
+.relationship-panel { flex: 1; min-height: 0; display: flex; flex-direction: column; }
+.relationship-panel__switch { flex: none; align-self: flex-start; display: inline-flex; gap: 2px; margin: 8px 10px 2px; padding: 2px; border-radius: 9px; background: rgba(24,39,63,.05); }
+.relationship-panel__switch-btn { display: inline-flex; align-items: center; gap: 4px; padding: 3px 10px; border: 0; border-radius: 7px; background: transparent; color: #718096; cursor: pointer; font-size: 12px; font-weight: 500; line-height: 18px; }
+.relationship-panel__switch-btn svg { width: 14px; height: 14px; }
+.relationship-panel__switch-btn:hover { color: #315f96; }
+.relationship-panel__switch-btn.is-active { background: #fff; color: var(--blue); box-shadow: 0 1px 3px rgba(31,54,84,.12); }
+.relationship-panel__view { flex: 1; min-height: 0; display: flex; flex-direction: column; overflow-y: auto; }
 .markdown-outline__close { width: 28px; height: 28px; display: grid; place-items: center; border: 0; border-radius: 8px; background: transparent; color: #8795a8; cursor: pointer; }
 .markdown-outline__close:hover { background: #eaf3ff; color: var(--blue); }
 .markdown-outline__list { display: grid; gap: 3px; padding: 10px 8px 24px; }
@@ -540,10 +553,6 @@ body.is-link-modifier-active .milkdown-editor-root a[href] { cursor: pointer; }
 .markdown-outline-item:hover { background: #edf5ff; color: #315f96; }
 .markdown-outline-item.is-active { background: #e1efff; color: var(--blue); font-weight: 750; }
 .markdown-outline__empty { padding: 24px 12px; color: #98a5b5; font-size: 13px; text-align: center; }
-.markdown-backlinks-section { border-top: 1px solid var(--line, #e8eef5); padding-top: 6px; }
-.markdown-backlinks-section__toggle { width: 100%; display: flex; align-items: center; gap: 6px; padding: 8px 12px; border: 0; background: transparent; color: var(--muted, #78869b); cursor: pointer; font-size: 13px; font-weight: 600; text-align: left; }
-.markdown-backlinks-section__toggle svg { width: 16px; height: 16px; color: var(--blue, #2f80ed); }
-.markdown-backlinks-section__toggle:hover { color: var(--blue, #2f80ed); }
 .milkdown-editor-shell.is-toolbar-hidden .milkdown-top-bar { display: none; }
 .milkdown-editor-shell:is(.is-preview, .is-readonly) .milkdown-block-handle,
 .milkdown-editor-shell:is(.is-preview, .is-readonly) .milkdown-table-block .handle,
@@ -987,7 +996,7 @@ button:focus-visible { outline: 3px solid rgba(47,128,237,.22); outline-offset: 
   .milkdown-editor-root .milkdown .milkdown-top-bar .top-bar-item { flex-basis: 38px; }
   .milkdown-editor-root .milkdown .milkdown-top-bar .top-bar-divider { margin-inline: 4px; }
   .milkdown-editor-shell.has-outline { grid-template-columns: minmax(0, 1fr); }
-  .markdown-outline { position: absolute; z-index: 30; top: 58px; right: 0; bottom: 0; display: block; width: min(270px, calc(100% - 28px)); border-top: 1px solid var(--line); box-shadow: -18px 12px 40px rgba(31,54,84,.14); }
+  .markdown-outline { position: absolute; z-index: 30; top: 58px; right: 0; bottom: 0; display: flex; width: min(270px, calc(100% - 28px)); border-top: 1px solid var(--line); box-shadow: -18px 12px 40px rgba(31,54,84,.14); }
 }
 
 @media (min-width: 1600px) {
@@ -1135,7 +1144,14 @@ button:focus-visible { outline: 3px solid rgba(47,128,237,.22); outline-offset: 
   .markdown-toolbar-menu__item:hover, .markdown-toolbar-menu__item:focus-visible, .markdown-toolbar-menu__item.active { background: #203753; color: #79aff3; }
   .markdown-outline { border-color: #283b56; background: #101d30; }
   .markdown-outline__header { border-color: #283b56; background: rgba(17,31,52,.96); }
-  .markdown-outline__header h2 { color: #b8c6d9; }
+  .markdown-outline__tabs { background: rgba(255,255,255,.06); }
+  .markdown-outline__tab { color: #92a4ba; }
+  .markdown-outline__tab:hover { color: #c9d9ed; }
+  .markdown-outline__tab.is-active { background: #203d61; color: #79aff3; box-shadow: none; }
+  .relationship-panel__switch { background: rgba(255,255,255,.06); }
+  .relationship-panel__switch-btn { color: #92a4ba; }
+  .relationship-panel__switch-btn:hover { color: #c9d9ed; }
+  .relationship-panel__switch-btn.is-active { background: #203d61; color: #79aff3; box-shadow: none; }
   .markdown-outline-item { color: #92a4ba; }
   .markdown-outline-item:hover { background: #1b304b; color: #c9d9ed; }
   .markdown-outline-item.is-active { background: #203d61; color: #79aff3; }

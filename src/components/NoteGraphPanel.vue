@@ -76,6 +76,7 @@ import {
 import { Icon } from '@iconify/vue'
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import type { NoteGraph } from '../types'
+import { dispatchOpenNote } from '../utils/note-open-events'
 
 const props = defineProps<{ noteId?: string }>()
 
@@ -93,6 +94,8 @@ const positionedNodes = ref<GraphNodeDatum[]>([])
 const linkLines = ref<Array<{ sourceX: number, sourceY: number, targetX: number, targetY: number }>>([])
 let simulation: ReturnType<typeof forceSimulation<GraphNodeDatum>> | undefined
 let resizeObserver: ResizeObserver | undefined
+/** 上次观测到的容器高度，用于判断高度是否真的变化（宽度侧直接与 canvasWidth 比对）。 */
+let lastRootHeight = 0
 const canvasWidth = ref(0)
 const canvasHeight = ref(280)
 
@@ -159,18 +162,31 @@ function setDepth(next: number): void {
   void loadGraph()
 }
 
+/**
+ * 打开图谱节点对应的笔记。
+ *
+ * 固定走「新标签页打开」：图谱是探索式浏览，点一个节点往往还要回来接着看别的邻居，
+ * 原地切换会让图谱跟着跳到目标笔记、刚看出的结构就没了。
+ * 不用 IPC `openNoteLink`：那条链路是原地切换，且仍被深链 / 站内链接复用，语义不动。
+ *
+ * :param noteId: 目标笔记 ID。
+ * :return: 无返回值。
+ */
 function openNote(noteId: string): void {
-  void window.notesDesktop.openNoteLink(noteId).catch(() => {})
+  dispatchOpenNote(noteId, true)
 }
 
 /** 基于当前节点/边运行力导向布局，并把坐标回写到 SVG。 */
 function runSimulation(): void {
   const svg = svgRef.value
   if (!svg) return
-  // 以容器真实宽度作为坐标空间，viewBox 与显示 1:1，保证中心节点视觉居中。
-  const width = canvasWidth.value || svg.clientWidth || 320
-  const height = canvasHeight.value || 280
+  // 以画布真实尺寸作为坐标空间，viewBox 与显示区 1:1，保证中心节点视觉居中。
+  // 高度必须现测：侧栏页签下画布是 flex 撑满的，沿用 280 初值会让 viewBox 与显示区不匹配（图形被缩放/偏移）。
+  const rect = svg.getBoundingClientRect()
+  const width = Math.round(rect.width) || canvasWidth.value || 320
+  const height = Math.round(rect.height) || canvasHeight.value || 280
   if (width !== canvasWidth.value) canvasWidth.value = width
+  if (height !== canvasHeight.value) canvasHeight.value = height
   const nodes: GraphNodeDatum[] = graph.value.nodes.map((node) => ({
     id: node.id,
     title: node.title,
@@ -225,13 +241,22 @@ onMounted(() => {
   const root = rootRef.value
   if (!root) return
   canvasWidth.value = root.clientWidth || 0
+  lastRootHeight = root.clientHeight || 0
   resizeObserver = new ResizeObserver((entries) => {
     const entry = entries[0]
     const nextWidth = entry?.contentRect.width ?? 0
+    const nextHeight = entry?.contentRect.height ?? 0
+    let sizeChanged = false
     if (nextWidth && Math.abs(nextWidth - canvasWidth.value) > 1) {
       canvasWidth.value = nextWidth
-      if (svgRef.value) runSimulation()
+      sizeChanged = true
     }
+    // 画布现在是撑满容器的，高度变化同样要重跑布局（旧版只跟宽度，高度永远停在 280）。
+    if (nextHeight && Math.abs(nextHeight - lastRootHeight) > 1) {
+      lastRootHeight = nextHeight
+      sizeChanged = true
+    }
+    if (sizeChanged && svgRef.value) runSimulation()
   })
   resizeObserver.observe(root)
 })
@@ -248,6 +273,7 @@ onBeforeUnmount(() => {
 .note-graph {
   display: flex;
   flex-direction: column;
+  flex: 1;
   min-height: 0;
 }
 
@@ -288,9 +314,11 @@ onBeforeUnmount(() => {
   color: #fff;
 }
 
+/* 高度交给容器：侧栏页签下画布要撑满剩余空间（旧版固定 280px 是因为它被塞在滚动流末尾） */
 .note-graph__canvas {
   width: 100%;
-  height: 280px;
+  flex: 1;
+  min-height: 220px;
   cursor: default;
 }
 

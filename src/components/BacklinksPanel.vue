@@ -1,13 +1,13 @@
 <template>
   <div v-if="hasItems" class="backlinks-list">
-    <template v-if="links.length">
+    <template v-for="group in groups" :key="group.key">
       <h3 class="backlinks-group__title">
-        <Icon icon="material-symbols:link-rounded" />
-        链接引用<span class="backlinks-badge">{{ links.length }}</span>
+        <Icon :icon="group.icon" />
+        {{ group.label }}<span class="backlinks-badge">{{ group.notes.length }}</span>
       </h3>
       <button
-        v-for="note in links"
-        :key="`link-${note.id}`"
+        v-for="note in group.notes"
+        :key="`${group.key}-${note.id}`"
         type="button"
         class="backlinks-item"
         @click="openNote(note.id)"
@@ -24,56 +24,36 @@
         <Icon class="backlinks-item__arrow" icon="material-symbols:arrow-forward-rounded" />
       </button>
     </template>
-
-    <template v-if="mentions.length">
-      <h3 class="backlinks-group__title">
-        <Icon icon="material-symbols:chat-rounded" />
-        提及<span class="backlinks-badge">{{ mentions.length }}</span>
-      </h3>
-      <button
-        v-for="note in mentions"
-        :key="`mention-${note.id}`"
-        type="button"
-        class="backlinks-item backlinks-item--mention"
-        @click="openNote(note.id)"
-      >
-        <span class="backlinks-item__title">{{ note.title || '（无标题）' }}</span>
-        <span class="backlinks-item__meta">
-          <span v-if="folderName(note.folderId)" class="backlinks-item__meta-text">
-            <Icon icon="material-symbols:folder-outline-rounded" />{{ folderName(note.folderId) }}
-          </span>
-          <span class="backlinks-item__meta-text">
-            <Icon icon="material-symbols:schedule-rounded" />{{ formatDate(note.updatedAt) }}
-          </span>
-        </span>
-        <p class="backlinks-item__excerpt">
-          <template v-for="(segment, index) in highlightSegments(note.excerpt, note.title)" :key="index">
-            <mark v-if="segment.hit">{{ segment.text }}</mark>
-            <template v-else>{{ segment.text }}</template>
-          </template>
-        </p>
-        <Icon class="backlinks-item__arrow" icon="material-symbols:arrow-forward-rounded" />
-      </button>
-    </template>
   </div>
   <div v-else class="backlinks-empty">
     <Icon class="backlinks-empty__icon" icon="material-symbols:link-off-rounded" />
-    <p>还没有笔记引用或提及此笔记</p>
-    <span>在其它笔记里插入链接，或提到它的标题即可关联到这里</span>
+    <p>还没有关联笔记</p>
+    <span>在其它笔记里链接到本篇，或在本篇里插入指向别处的链接</span>
   </div>
 </template>
 
 <script setup lang="ts">
 import { computed, ref, watch } from 'vue'
 import { Icon } from '@iconify/vue'
-import type { BacklinkNote, MentionNote, NoteFolder } from '../types'
+import type { BacklinkNote, NoteFolder } from '../types'
+import { dispatchOpenNote } from '../utils/note-open-events'
 
 const props = defineProps<{ noteId?: string }>()
+/** 入边：正文里显式链接到本篇的笔记。 */
 const links = ref<BacklinkNote[]>([])
-const mentions = ref<MentionNote[]>([])
+/** 出边：本篇正文里显式链接出去的笔记。 */
+const outlinks = ref<BacklinkNote[]>([])
 const folders = ref<NoteFolder[]>([])
 
-const hasItems = computed(() => links.value.length > 0 || mentions.value.length > 0)
+/**
+ * 关系分组清单。方向靠标题与图标区分，空分组不渲染（避免出现「0 条」的空壳分组）。
+ */
+const groups = computed(() => [
+  { key: 'in', label: '引用了本篇', icon: 'material-symbols:call-received-rounded', notes: links.value },
+  { key: 'out', label: '本篇引用', icon: 'material-symbols:call-made-rounded', notes: outlinks.value }
+].filter((group) => group.notes.length > 0))
+
+const hasItems = computed(() => links.value.length > 0 || outlinks.value.length > 0)
 
 async function loadContext(): Promise<void> {
   try {
@@ -88,15 +68,15 @@ watch(
   () => props.noteId,
   async (id) => {
     links.value = []
-    mentions.value = []
+    outlinks.value = []
     if (!id) return
     await loadContext()
-    const [linkResult, mentionResult] = await Promise.allSettled([
+    const [inResult, outResult] = await Promise.allSettled([
       window.notesDesktop.getNoteBacklinks(id),
-      window.notesDesktop.getNoteMentions(id)
+      window.notesDesktop.getNoteOutlinks(id)
     ])
-    if (linkResult.status === 'fulfilled') links.value = linkResult.value
-    if (mentionResult.status === 'fulfilled') mentions.value = mentionResult.value
+    if (inResult.status === 'fulfilled') links.value = inResult.value
+    if (outResult.status === 'fulfilled') outlinks.value = outResult.value
   },
   { immediate: true }
 )
@@ -112,23 +92,18 @@ function formatDate(value: string): string {
   return match ? match[0].replace(/-/g, '.') : ''
 }
 
-function highlightSegments(text: string, keyword: string): Array<{ text: string, hit: boolean }> {
-  if (!text || !keyword) return []
-  const segments: Array<{ text: string, hit: boolean }> = []
-  let rest = text
-  let index = rest.indexOf(keyword)
-  while (index !== -1) {
-    if (index > 0) segments.push({ text: rest.slice(0, index), hit: false })
-    segments.push({ text: rest.slice(index, index + keyword.length), hit: true })
-    rest = rest.slice(index + keyword.length)
-    index = rest.indexOf(keyword)
-  }
-  if (rest) segments.push({ text: rest, hit: false })
-  return segments
-}
-
+/**
+ * 打开列表项对应的笔记。
+ *
+ * 固定走「新标签页打开」：关系列表是旁路查阅场景——点进去看被关联的那篇，看完还要
+ * 回到当前这篇继续读，原地切换会把阅读上下文顶掉（与嵌入卡片、正文内部链接一致）。
+ * 不用 IPC `openNoteLink`：那条链路是原地切换，且仍被深链 / 站内链接复用，语义不动。
+ *
+ * :param noteId: 目标笔记 ID。
+ * :return: 无返回值。
+ */
 function openNote(noteId: string): void {
-  void window.notesDesktop.openNoteLink(noteId).catch(() => {})
+  dispatchOpenNote(noteId, true)
 }
 </script>
 
@@ -222,28 +197,10 @@ function openNote(noteId: string): void {
   height: 12px;
 }
 
-.backlinks-item__excerpt {
-  grid-column: 1 / -1;
-  margin: 2px 0 0;
-  color: #8a97a8;
-  font-size: 11px;
-  line-height: 17px;
-  overflow: hidden;
-  display: -webkit-box;
-  -webkit-line-clamp: 2;
-  -webkit-box-orient: vertical;
-}
-
-.backlinks-item__excerpt mark {
-  background: #ffe9a8;
-  color: inherit;
-  border-radius: 3px;
-  padding: 0 1px;
-}
-
+/* 箭头跨满标题 + 元信息两行，垂直居中（-1 跟随实际行数，避免留出空行）。 */
 .backlinks-item__arrow {
   grid-column: 2;
-  grid-row: 1 / span 3;
+  grid-row: 1 / -1;
   align-self: center;
   width: 16px;
   height: 16px;

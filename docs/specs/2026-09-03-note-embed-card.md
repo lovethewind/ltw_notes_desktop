@@ -1,6 +1,6 @@
 # 笔记嵌入卡片（Note Embed Block / Card）
 
-> 状态：已实施（T2 ~ T2I 全部落地；剩余「展开整篇 / 卡片操作入口」见文末未决）
+> 状态：已实施（T2 ~ T2J 全部落地；仅剩「网页端同批支持」见文末未决）
 > 日期：2026-09-03（末次更新 2026-09-10）
 > 领域：编辑器（MarkdownVisualEditor / Crepe）+ 渲染层新组件
 > 分级：L3（跨模块、涉及编辑器 schema 扩展、影响 markdown 往返 / 导出 / 同步一致性）
@@ -366,5 +366,135 @@ Cmd+O 空搜索本就直接用它渲染摘要，故同源同函数安全；搜�
 - 附带健壮性：`EditorContextMenu.vue` 用 `ResizeObserver` 跟随真实尺寸重测，并把
   `max-height` 放宽到 `calc(100vh - 16px)`，避免长菜单在小窗口被裁。
 
+---
+
+## T2J 落地记录（2026-09-12）：嵌入卡片「展开全文」
+
+需求：卡片此前只显示 160 字 / 2 行摘要（`stripMarkdown(content).slice(0,160)` + CSS
+`-webkit-line-clamp:2`），等于只是个「路标」。用户确认走**方案 1 · 展开交互**（而非
+把标题改成直接渲染整篇正文的 Obsidian 式做法），理由是改动只落在卡片组件内、
+风险最低，同时解决「想瞄一眼对方正文」的高频场景。
+
+改动（**只动 `src/components/NoteEmbedCard.vue`，未碰 schema / 序列化 / 同步 / IPC**）：
+- **状态**：新增 `rawContent`（`getNote` 返回的正文原文）、`plainText`（去记号纯文本）、
+  `expanded`、`fullHtml`；`canExpand = plainText.length > 160`（即摘要确有截断时才给按钮）。
+- **懒渲染**：只在**首次展开**时 `renderNoteBody()` 把 markdown 解析成 HTML，避免文档里每张
+  卡片在加载阶段都做一次解析。`loadCard()` 里对称重置这四个状态。
+- **渲染链**：`DOMPurify.sanitize(marked.parse(prepared, { async:false }))`，与
+  `useAppUpdate.ts` / `AiAssistantPanel.vue` 同一套既有做法，不引入新依赖。
+- **递归防护**：渲染前先摘掉被嵌笔记内部的 `<div data-xynote-embed=...>` HTML，替换为单行占位
+  `<p data-xynote-embed-placeholder>此处原有一张嵌入卡片，请到原笔记中查看</p>`。否则 A 嵌 B、
+  B 嵌 A 会互相展开成环（`stripMarkdown` 当初不解析 embed HTML 同理）。用带 `data-` 标记的 `<p>`
+  而非 markdown 引用块：引用块 = `blockquote(margin 8px)` 套 `p(margin 8px)`，高度叠双且样式
+  无法单独收敛。`DOMPurify` 默认 `ALLOW_DATA_ATTR = true`（仅 `SAFE_FOR_TEMPLATES` 时为 false，
+  本项目未启用），标记能稳定穿过 sanitize，供样式精准命中。
+- **布局**：卡片根节点由 `display:flex` 改为 `flex-wrap:wrap`，展开区 `flex-basis:100%` 整行
+  折到卡片下方，避免改动既有头部（body + arrow）结构。
+- **交互隔离**（关键）：
+  - 切换按钮与展开区都是 `@click.stop` / `@keydown.stop`。卡片根节点带 `@click="open"` 与
+    `@keydown.space.prevent="open"`，不拦住冒泡则「展开」会顺带跳转到目标笔记。
+  - 展开区内点击**不触发**卡片跳转（便于选中文本 / 滚动），但会拦截 `<a>` 并 `preventDefault`，
+    改走 `window.notesDesktop.openExternalLink(href)` —— 该 IPC 已能识别站内 `/notes/{id}`
+    链接并转成**应用内打开**（`main.cjs:900`），外链走系统浏览器，避免渲染进程被默认导航带走。
+- **样式**：展开区 `max-height:min(52vh,420px)` + `overflow:auto` + `overscroll-behavior:contain`，
+  `user-select:text` 覆盖根节点的 `user-select:none`。`v-html` 内容不受 scoped 约束，
+  全部子元素样式用 `:deep()` 命中（标题/列表/代码块/引用/表格/图片/分隔线）。
+
+**已知限制**：展开区里的站内笔记链接走 `openExternalLink` 会**新开一个标签页**打开，而不是
+复用当前编辑器实例（缺 serverId → 本地 noteId 的反查）。摘要卡本身点击仍是原有行为。
+
+**验证**：`type-check` ✅、`npm test` **215/215** ✅、`npm run build` ✅、打包 arm64 ✅
+（asar 内按原始字节确认含 `note-embed-card__expand-hint` / `点击卡片展开全文` / `aria-expanded`；
+上述文案与类名后续有两次调整，当前特征串以 `data-xynote-embed-placeholder` / `请到原笔记中查看` 为准）。
+
+**⚠️ 缺陷与修复（2026-09-12，用户实测）**：展开区里**拖不动选字——一拖整张卡片跟着动，文字复制不了**。
+
+根因（读 `node_modules/prosemirror-view/dist/index.js` 实证，非猜测）：
+- `viewdesc:1319` → `if (node.type.spec.draggable) dom.draggable = true;`
+  本节点 schema 写的是 `draggable: true`，于是卡片 DOM 变成了**浏览器原生拖拽源**。
+- 更关键的一环：`initInput` 的守卫 `eventBelongsToView()`（`:3116`，定义 `:3154-3163`）会沿
+  事件目标向上找 `pmViewDesc.stopEvent`；卡片 nodeView 的 `stopEvent: () => true` 使它对**卡片内
+  所有事件**返回 false → **PM 自己的 `dragstart` 处理器永远不会执行**。
+- 两者叠加的后果：这个 `draggable: true` 只会触发浏览器原生 DOM 拖拽，既不写 `view.dragging`
+  切片（**拖了也移不动节点**，等于白拖），又抢走鼠标拖选 → 正文文字永远选不中、复制不了。
+
+修复：
+1. **主修复** `xynote-embed.ts`：节点 schema `draggable: true` → `draggable: false`。卡片 DOM 不再
+   带 `draggable`，标题 / 摘要 / 展开正文全部恢复可选可复制。移动卡片改用 Crepe BlockHandle。
+2. **兜底** `NoteEmbedCard.vue`：卡片根与展开区都加 `draggable="false"`，展开区再加
+   `@dragstart.prevent.stop`。原因：PM `selectNode()` 在节点被选中时会**重新给容器加回**
+   `draggable = true`（`viewdesc:1496`，无 contentDOM 且 spec 非 draggable 时成立），需要展开区
+   自己兜住那一次拖拽，保证「拖动 == 选文字」。
+   副作用：展开区内不能再把选中的文字/图片拖到外部应用——属有意取舍（选字复制优先级更高）。
+
+**交互调整（2026-09-12，用户实测后定稿）**：卡片原本「点哪都跳转」，展开后滚动 / 选字时极易误触打开笔记。
+现改为主次分离：
+
+| 目标 | 动作 |
+|---|---|
+| 卡片主体（标题 / 摘要 / 底部状态栏） | **展开 / 收起全文**（`onCardClick` → `canExpand ? toggleExpanded() : open()`） |
+| 右侧箭头按钮（`note-embed-card__open`，`aria-label="打开笔记"`） | **打开笔记**（新标签页） |
+| 展开区内 | 不冒泡、不跳转（点链接仍走 `openExternalLink`） |
+| 底部提示（hover 淡入） | **不可点**，文案「点击卡片展开全文 / 点击卡片收起」 |
+
+无可展开内容的卡片（短笔记 / 加载中 / 不可用）没有展开语义，主体点击退回「打开笔记」，
+避免出现点哪儿都没反应。箭头由装饰性 `Icon` 升级为 `<button>`（`padding:4px` + 负 margin 抵消，
+热区约 26×26px，视觉位置不变），带 hover / `:focus-visible` 反馈。
+
+**展开提示降级（同日）**：底部原本是 `<button class="note-embed-card__toggle">`，与主体点击功能重复。
+但直接删掉会丢失「可展开」的可发现性（右侧箭头语义是「打开笔记」，看不出与展开有关），
+故**降级为不可点的 `<span class="note-embed-card__expand-hint" aria-hidden="true">`**：
+保留 `▾ 展开全文 / ▴ 收起` 文案与图标作为提示，不再拦点击（点在文字上由卡片主体接管，行为一致），
+卡片 hover 时同步变蓝。`aria-expanded` 随之从该按钮移到**卡片根节点**（`role="button"`，
+用 `canExpand ? expanded : undefined` 控制，不可展开的卡片不输出该属性）——卡片根才是展开的触发者。
+
+**提示改为 hover 淡入（同日，用户二次反馈）**：把提示静态常驻会让人以为「**只有这行小字能点**」。
+故改为 `opacity: 0` 常隐、悬停卡片头部（`.note-embed-card__body:hover`）或键盘聚焦
+（`:focus-visible`）时淡入，文案改为引导性的 **「点击卡片展开全文 / 点击卡片收起」**，明确指向卡片本身。
+
+两个细节：**只绑 `__body` 不绑整卡** —— 展开区拦了冒泡、点它并不收起，在那里提示「点击卡片收起」会误导；
+用 `opacity` 而非 `display` 是为了保留占位，避免 hover 时 foot 行重排抖动。
+
+**嵌套卡片占位改版（同日，用户三次反馈）**：展开区里「此处原有一张嵌入卡片…」原先渲染成 markdown
+引用块，用户截图反馈**过高**。改为带 `data-xynote-embed-placeholder` 标记的单行 `<p>` + 专属样式
+（`padding:3px 10px` / `line-height:16px` / `margin-bottom:6px`，背景 `--surface`、字色 `--muted`、
+圆角 6px）：整块高度由约 38px 收到约 28px，且不再受 `.note-embed-card__full-inner :deep(p)` 的
+`margin:0 0 8px` 影响。文案同时改为面向读者的
+**「此处原有一张嵌入卡片，请到原笔记中查看」**——去掉「展开视图不递归渲染」这类实现措辞。
+
+---
+
 **仍未决**（spec 原「未决」剩余项）：
-- 「嵌入整篇正文」仍为固定摘要（2 行），需要**展开交互**时另议。
+- 网页端（Web 版）同批支持：目前桌面端先行，网页端把该 HTML 当普通 HTML 安全退化。
+
+---
+
+## T2L 落地记录（2026-09-17）：面板跳转统一「新标签页打开」
+
+用户要求「列表和图谱里的跳转都在新标签页打开」。此前这几处走的是 IPC `openNoteLink`
+（`note-link:open-local` → main 广播 → App.vue `openNoteFromLink` → `selectNote`，**原地切换、不建 tab**），
+与嵌入卡片 / 正文内部链接已采用的 `dispatchOpenNote(id, true)`（window CustomEvent → `openNoteInNewTab`）
+不一致。
+
+改动（3 个面板，各一行）：
+- `BacklinksPanel.vue`（关系列表，「引用了本篇 / 本篇引用」两组共用）、`NoteGraphPanel.vue`（侧栏当前笔记 N 跳）、
+  `GlobalGraphPanel.vue`（顶栏全库图谱弹层）：`window.notesDesktop.openNoteLink(id)` →
+  `dispatchOpenNote(id, true)`。
+- 全库图谱弹层**额外保留** `emit('close')`：切换标签后当前文档已变，弹层背后的图谱数据随之变化，
+  留着会看到一个与上下文不符的残留浮层。
+
+**有意不改 IPC `openNoteLink` 的语义**：`notifyOpenNoteLink` 还有两个非面板来源，都是「从应用外部进入」
+——`main.cjs:900` 的 `openExternalLink` 识别站内 `/notes/{id}` 链接转应用内打开，以及 `main.cjs:1863`
+的深链协议 `xynote://note/{id}` 回调。这两处原地打开是对的（用户从浏览器点回来期望落在那篇，而不是
+再叠一层标签），改语义会波及它们。故只换调用点，IPC / preload / 类型声明原样保留。
+
+理由：列表与图谱都是**旁路查阅**场景——点进去看被关联的那篇，看完还要回到当前这篇继续读；
+图谱更是探索式浏览，原地切换会让图谱跟着跳到目标笔记、刚看出的结构就没了。
+
+**验证**：`type-check` ✅、`npm test` **217/217** ✅（在「侧栏「关系」页签接线完整」test 内新增第 6 组断言：
+三个面板都必须引入 `dispatchOpenNote`、都以 `(noteId, true)` 打开、都不得再出现 `notesDesktop.openNoteLink`）、
+`build` ✅、打包 arm64 ✅。`dist` 内 `note-link:open-local` **已消失**（渲染层不再调用；主进程侧保留）。
+
+> 注：上文 T2C 记录的「普通内部链接未动，仍原地切换」只描述那一次改动的边界；
+> 正文内部链接随后也已改为 `dispatchOpenNote(noteId, true)`（`MarkdownVisualEditor.vue:383`）。
+

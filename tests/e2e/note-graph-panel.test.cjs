@@ -51,9 +51,11 @@ test('局部关系图谱展示邻接笔记并可跳转', { timeout: 90_000 }, as
     await page.locator('.navigation-panel .sidebar-note-main').filter({ hasText: '图谱中心' }).first().click()
     await page.waitForSelector('.milkdown-editor-root .ProseMirror')
 
-    // 打开侧栏并展开关系图谱。
-    const graphToggle = page.locator('.markdown-backlinks-section__toggle').filter({ hasText: '关系图谱' })
-    await graphToggle.click()
+    // 打开侧栏 → 「关系」页签 → 二级切换到「图谱」视图。
+    // 侧栏已是页签式（不再是「点击展开」折叠块），图谱是关系页签下的二级视图。
+    const relationshipTab = page.locator('.markdown-outline__tab').filter({ hasText: '关系' })
+    await relationshipTab.click()
+    await page.locator('.relationship-panel__switch-btn').filter({ hasText: '图谱' }).click()
     await page.waitForSelector('.note-graph__canvas')
     await page.waitForFunction(() => document.querySelectorAll('.note-graph__node').length >= 2, { timeout: 10_000 })
 

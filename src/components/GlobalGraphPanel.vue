@@ -75,6 +75,7 @@ import {
 import { Icon } from '@iconify/vue'
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import type { GlobalGraph } from '../types'
+import { dispatchOpenNote } from '../utils/note-open-events'
 
 const props = defineProps<{ maxNodes?: number }>()
 const emit = defineEmits<{ close: [] }>()
@@ -155,8 +156,18 @@ async function loadGraph(): Promise<void> {
   runSimulation()
 }
 
+/**
+ * 打开图谱节点对应的笔记。
+ *
+ * 固定走「新标签页打开」，与侧栏局部图谱、关系列表一致。
+ * 同时仍关闭弹层：切换标签后当前文档已变，弹层背后的图谱数据也跟着变了，
+ * 留着会看到一个与上下文不符的残留浮层。
+ *
+ * :param noteId: 目标笔记 ID。
+ * :return: 无返回值。
+ */
 function openNote(noteId: string): void {
-  void window.notesDesktop.openNoteLink(noteId).catch(() => {})
+  dispatchOpenNote(noteId, true)
   emit('close')
 }
 

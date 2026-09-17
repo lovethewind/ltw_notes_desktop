@@ -100,7 +100,13 @@ export const noteEmbedNodeSchema = $nodeSchema('xynoteEmbed', () => ({
   group: 'block',
   atom: false,
   selectable: true,
-  draggable: true,
+  // ⚠️ 必须 false。prosemirror-view 会按此字段给卡片 DOM 加原生 draggable
+  // （viewdesc: `if (node.type.spec.draggable) dom.draggable = true`），而 nodeView 的
+  // `stopEvent: () => true` 又让 PM 的 `eventBelongsToView` 对卡片内**所有**事件返回 false
+  // （initInput 的事件闸门），PM 自己的 dragstart 处理器因此永不执行 —— 于是这个 true 只会
+  // 触发浏览器原生 DOM 拖拽：既不写 `view.dragging` 切片（拖了也移不动节点），又会抢走鼠标
+  // 拖选，表现为「一拖动整张卡片跟着动、正文文字无法选中复制」。移动卡片请用 Crepe BlockHandle。
+  draggable: false,
   attrs: {
     noteId: { default: '' },
     title: { default: null as string | null }

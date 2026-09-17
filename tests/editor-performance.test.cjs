@@ -454,3 +454,140 @@ test("嵌入卡片右键菜单链路接线完整", () => {
   assert.match(editorSource, /node\.type\.name !== 'xynoteEmbed'/)
   assert.match(editorSource, /tr\.delete\(target\.pos, target\.pos \+ node\.nodeSize\)/)
 })
+
+test("嵌入卡片展开全文接线完整", () => {
+  const cardSource = readFileSync(resolve(projectRoot, "src/components/NoteEmbedCard.vue"), "utf8")
+  const embedSource = readFileSync(resolve(projectRoot, "src/editor/xynote-embed.ts"), "utf8")
+
+  // 1) 展开态是组件内部视图状态，不动文档；摘要仍在时截前 160 字
+  assert.match(cardSource, /const expanded = ref\(false\)/)
+  assert.match(cardSource, /const canExpand = computed\(\(\) => plainText\.value\.length > 160\)/)
+  assert.match(cardSource, /plainText\.value = stripMarkdown\(rawContent\.value\)/)
+  assert.match(cardSource, /excerpt\.value = plainText\.value\.slice\(0, 160\)/)
+  assert.match(cardSource, /rawContent\.value = target\.content \|\| ''/)
+
+  // 2) 懒渲染：首次展开才解析 markdown，避免每张卡片加载即解析
+  assert.match(cardSource, /if \(!expanded\.value && !fullHtml\.value\)/)
+  assert.match(cardSource, /fullHtml\.value = renderNoteBody\(rawContent\.value\)/)
+  assert.match(
+    cardSource,
+    /DOMPurify\.sanitize\(marked\.parse\(withoutNested, \{ async: false \}\)\)/
+  )
+  assert.match(cardSource, /import DOMPurify from 'dompurify'/)
+  assert.match(cardSource, /import \{ marked \} from 'marked'/)
+
+  // 3) 递归防护：展开视图里摘掉嵌套嵌入卡片 HTML，换成不可递归的**单行占位**（防 A↔B 成环）。
+  //    用带 data 标记的 <p> 而非 markdown 引用块——引用块的 blockquote(margin) 套 p(margin)
+  //    会叠出双倍高度，且样式无法单独收敛
+  assert.match(cardSource, /data-xynote-embed=/)
+  assert.match(cardSource, /data-xynote-embed-placeholder/)
+  assert.match(cardSource, /请到原笔记中查看/)
+  assert.doesNotMatch(cardSource, /> 此处原有一张嵌入卡片/)
+
+  // 4) 展开提示：已从按钮降级为不可点的纯提示文字（唯一展开入口是卡片主体），
+  //    aria-expanded 移到卡片根——它才是展开的触发者；旧按钮类名/绑定必须清除
+  assert.match(cardSource, /note-embed-card__expand-hint/)
+  assert.match(cardSource, /:aria-expanded="canExpand \? expanded : undefined"/)
+  assert.match(cardSource, /v-if="excerpt && !expanded"/)
+  assert.doesNotMatch(cardSource, /note-embed-card__toggle/)
+  assert.doesNotMatch(cardSource, /@click\.stop="toggleExpanded"/)
+
+  // 4b) 提示平时隐藏、hover 头部才淡入，且文案指向卡片本身
+  //     （静态摆一行小字会误导成「只有这行字能点」）
+  assert.match(cardSource, /点击卡片展开全文/)
+  assert.match(cardSource, /点击卡片收起/)
+  assert.match(cardSource, /\.note-embed-card__expand-hint \{[\s\S]{0,400}?opacity: 0;/)
+  assert.match(cardSource, /\.note-embed-card__body:hover \.note-embed-card__expand-hint/)
+
+  // 5) 交互分工：点卡片主体=展开/收起（默认动作，避免误触跳转），
+  //    只有点右侧箭头按钮才打开笔记；无可展开内容的卡片才由主体点击兜底跳转
+  assert.match(cardSource, /@click="onCardClick"/)
+  assert.match(cardSource, /@keydown\.enter="onCardClick"/)
+  assert.match(cardSource, /function onCardClick\(\): void \{/)
+  assert.match(cardSource, /if \(canExpand\.value\) \{\s*toggleExpanded\(\)/)
+  assert.match(cardSource, /@click\.stop="open"/)
+  assert.match(cardSource, /aria-label="打开笔记"/)
+
+  // 6) 展开区：点击不外泄触发卡片跳转；链接交给主进程打开（站内转应用内、外链走浏览器）
+  assert.match(cardSource, /@click\.stop="onFullClick"/)
+  assert.match(cardSource, /v-html="fullHtml"/)
+  assert.match(cardSource, /event\.target instanceof Element \? event\.target\.closest\('a'\) : null/)
+  assert.match(cardSource, /window\.notesDesktop\.openExternalLink\(href\)/)
+
+  // 7) 样式：整行折行 + 自身可滚可选中（scoped 下 v-html 需 :deep）
+  assert.match(cardSource, /flex-wrap: wrap/)
+  assert.match(cardSource, /max-height: min\(52vh, 420px\)/)
+  assert.match(cardSource, /user-select: text/)
+  assert.match(cardSource, /:deep\(p\)/)
+  // 占位必须是单行紧凑样式（padding 3px + line-height 16px），不能退回引用块的叠加高度
+  assert.match(cardSource, /:deep\(\[data-xynote-embed-placeholder\]\) \{[\s\S]{0,200}?line-height: 16px;/)
+
+  // 8) 拖选文字：节点 schema 必须 draggable:false（否则 PM 给卡片 DOM 加原生 draggable，
+  //    拖动会变成拖整张卡片、正文无法选中复制）；展开区再兜一层
+  assert.match(embedSource, /draggable: false/)
+  assert.doesNotMatch(embedSource, /draggable: true/)
+  assert.match(cardSource, /draggable="false"/)
+  assert.match(cardSource, /@dragstart\.prevent\.stop/)
+})
+
+test("侧栏「关系」页签接线完整且提及链路已移除", () => {
+  const editorSource = readFileSync(resolve(projectRoot, "src/components/MarkdownVisualEditor.vue"), "utf8")
+  const listSource = readFileSync(resolve(projectRoot, "src/components/BacklinksPanel.vue"), "utf8")
+  const styleSource = readFileSync(resolve(projectRoot, "src/style.css"), "utf8")
+  const ipcSource = readFileSync(resolve(projectRoot, "electron/ipc-handlers.cjs"), "utf8")
+  const preloadSource = readFileSync(resolve(projectRoot, "electron/preload.cjs"), "utf8")
+  const dbSource = readFileSync(resolve(projectRoot, "electron/database.cjs"), "utf8")
+
+  // 1) 顶层页签收敛为 2 个：大纲 / 关系（原来的「链接」「图谱」不再各自占一个页签）
+  const tabsBlock = editorSource.match(/const OUTLINE_TABS = \[[\s\S]*?\] as const/)?.[0]
+  assert.ok(tabsBlock, "应找到 OUTLINE_TABS 定义")
+  assert.match(tabsBlock, /label: '大纲'/)
+  assert.match(tabsBlock, /label: '关系'/)
+  assert.doesNotMatch(tabsBlock, /label: '链接'/)
+  assert.doesNotMatch(tabsBlock, /label: '图谱'/)
+
+  // 2) 关系页签内的二级切换：列表 / 图谱互斥挂载，视图区独占剩余高度
+  const viewsBlock = editorSource.match(/const RELATIONSHIP_VIEWS = \[[\s\S]*?\] as const/)?.[0]
+  assert.ok(viewsBlock, "应找到 RELATIONSHIP_VIEWS 定义")
+  assert.match(viewsBlock, /label: '列表'/)
+  assert.match(viewsBlock, /label: '图谱'/)
+  assert.match(editorSource, /const relationshipView = ref<RelationshipViewId>\('list'\)/)
+  assert.match(editorSource, /relationshipView = view\.id/)
+  assert.match(editorSource, /<BacklinksPanel v-if="relationshipView === 'list'"/)
+  assert.match(editorSource, /<NoteGraphPanel v-else/)
+  assert.match(styleSource, /\.relationship-panel__view \{ flex: 1; min-height: 0;/)
+
+  // 3) 列表视图：入边 + 出边两组，出边走新 IPC，提及相关代码必须清干净
+  assert.match(listSource, /window\.notesDesktop\.getNoteOutlinks\(id\)/)
+  assert.match(listSource, /label: '引用了本篇'/)
+  assert.match(listSource, /label: '本篇引用'/)
+  assert.doesNotMatch(listSource, /getNoteMentions|MentionNote|highlightSegments|backlinks-item--mention/)
+
+  // 4) 出边链路三层打通：database → ipc → preload（domain 绑定见 main.cjs）
+  assert.match(dbSource, /function getNoteOutlinks\(noteId\)/)
+  assert.match(dbSource, /WHERE l\.source_note_id = \? AND n\.is_deleted = 0/)
+  assert.match(ipcSource, /ipcMain\.handle\("note:outlinks"/)
+  assert.match(preloadSource, /getNoteOutlinks: \(noteId\) => ipcRenderer\.invoke\("note:outlinks", noteId\)/)
+  assert.match(
+    readFileSync(resolve(projectRoot, "electron/main.cjs"), "utf8"),
+    /getOutlinks: \(noteId\) => repository\.getNoteOutlinks\(noteId\)/
+  )
+
+  // 5) 提及链路整体退役：后端与桥接层都不应留下残留
+  assert.doesNotMatch(dbSource, /getNoteMentions|MENTION_STOP_WORDS|buildMentionExcerpt/)
+  assert.doesNotMatch(ipcSource, /note:mentions/)
+  assert.doesNotMatch(preloadSource, /getNoteMentions/)
+
+  // 6) 面板跳转一律「新标签页」：关系列表 / 侧栏图谱 / 全库图谱都走 dispatchOpenNote(id, true)。
+  //    不得回退到原地切换的 IPC openNoteLink——那条链路保留给深链协议与站内链接点击
+  //    （main.cjs 的 openExternalLink / xynote://note 回调），改动它会波及从应用外部进入的场景。
+  for (const name of ["BacklinksPanel", "NoteGraphPanel", "GlobalGraphPanel"]) {
+    const source = readFileSync(resolve(projectRoot, `src/components/${name}.vue`), "utf8")
+    assert.match(source, /import \{ dispatchOpenNote \} from '\.\.\/utils\/note-open-events'/, `${name} 应引入 dispatchOpenNote`)
+    assert.doesNotMatch(source, /notesDesktop\.openNoteLink/, `${name} 不应再用原地切换的 openNoteLink`)
+    assert.match(source, /dispatchOpenNote\(noteId, true\)/, `${name} 应以新标签页打开`)
+  }
+  // 全库图谱是弹层：新标签页打开后仍要收掉，避免留下与上下文不符的浮层
+  const globalGraphSource = readFileSync(resolve(projectRoot, "src/components/GlobalGraphPanel.vue"), "utf8")
+  assert.match(globalGraphSource, /emit\('close'\)/)
+})
