@@ -60,7 +60,8 @@ test('清理已删除标签时保留仍然有效的当前标签', async () => {
 test('笔记列表右键菜单提供在新标签页打开入口', () => {
   const appSource = readFileSync(resolve(projectRoot, 'src/App.vue'), 'utf8')
 
-  assert.match(appSource, /aria-label="已打开笔记"/)
+  // 标签栏现在同时承载笔记标签与外部文件标签，故 aria-label 改为「已打开的标签」。
+  assert.match(appSource, /aria-label="已打开的标签"/)
   assert.match(appSource, /openContextNoteInNewTab/)
   assert.match(appSource, />在新标签页打开</)
 })

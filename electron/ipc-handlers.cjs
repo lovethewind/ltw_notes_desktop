@@ -72,6 +72,18 @@ function registerQuickCaptureHandlers(ipcMain, domain) {
   ipcMain.handle("quick-capture:create", (_event, input) => domain.create(input || {}))
 }
 
+/** 外部 Markdown 文件读写：只做磁盘读写，不触碰本地数据库与同步链路。 */
+function registerLocalFileHandlers(ipcMain, domain) {
+  ipcMain.handle("local-file:pick", domain.pick)
+  ipcMain.handle("local-file:read", (_event, filePath) => domain.read(filePath))
+  ipcMain.handle("local-file:save", (_event, filePath, content) => domain.save(filePath, content))
+  ipcMain.handle("local-file:save-as", (_event, defaultName, content) => (
+    domain.saveAs(defaultName, content)
+  ))
+  // 剪贴板读取（富文本粘贴需要 text/html，渲染层拿不到）
+  ipcMain.handle("clipboard:read", () => domain.readClipboard())
+}
+
 function registerDataTransferHandlers(ipcMain, domain) {
   ipcMain.handle("data:export-note-markdown", (_event, noteId) => domain.exportNote(noteId))
   ipcMain.handle("data:export-all-markdown", domain.exportAll)
@@ -129,6 +141,7 @@ function registerIpcHandlers(ipcMain, domains) {
   registerNoteHandlers(ipcMain, domains.notes)
   registerFolderTagHandlers(ipcMain, domains.foldersAndTags)
   registerQuickCaptureHandlers(ipcMain, domains.quickCapture)
+  registerLocalFileHandlers(ipcMain, domains.localFiles)
   registerDataTransferHandlers(ipcMain, domains.dataTransfer)
   registerBackupHandlers(ipcMain, domains.backups)
   registerSyncHandlers(ipcMain, domains.sync)

@@ -359,6 +359,24 @@ export interface AiAssistantAnswer {
   sources: AiAssistantSource[]
 }
 
+/**
+ * 外部 Markdown 文件的内容快照。
+ *
+ * 与 OfflineNote 的区别：外部文件不落本地数据库、不参与云端同步，
+ * 文件本身即唯一真相来源，应用只负责「打开—编辑—写回」。
+ */
+export interface LocalMarkdownFile {
+  filePath: string
+  fileName: string
+  content: string
+  modifiedAt?: string
+}
+
+/** 打开/另存外部 Markdown 文件的结果。取消或失败时以 canceled 或抛错表达。 */
+export type LocalMarkdownFileResult =
+  | { canceled: true }
+  | (LocalMarkdownFile & { canceled: false })
+
 export interface NotesDesktopApi {
   listWorkspace(): Promise<WorkspaceData>
   getWorkspaceSession(): Promise<WorkspaceSession>
@@ -408,6 +426,29 @@ export interface NotesDesktopApi {
   onBeforeQuitSave(callback: (requestId: number) => void): () => void
   /** 将退出前保存结果回报给主进程。 */
   completeBeforeQuitSave(requestId: number, result: { ok: boolean, message?: string }): void
+  /** 弹出系统文件选择器并读取选中的外部 Markdown 文件。 */
+  pickMarkdownFile(): Promise<LocalMarkdownFileResult>
+  /** 按绝对路径读取外部 Markdown 文件（供拖拽入窗使用）。 */
+  readMarkdownFile(filePath: string): Promise<LocalMarkdownFile>
+  /** 将正文写回外部 Markdown 文件。 */
+  saveMarkdownFile(filePath: string, content: string): Promise<LocalMarkdownFile>
+  /** 将正文另存为新的 Markdown 文件。 */
+  saveMarkdownFileAs(defaultName: string, content: string): Promise<LocalMarkdownFileResult>
+  /**
+   * 读取系统剪贴板内容（富文本粘贴用）。
+   *
+   * `navigator.clipboard.readText()` 只能拿纯文本、拿不到 `text/html`，
+   * 故「粘贴（富文本）」经主进程 clipboard 模块取 HTML 表示。
+   */
+  readClipboard(): Promise<{ text: string, html: string }>
+  /** 读取拖入窗口的文件在磁盘上的绝对路径，取不到时为空串。 */
+  getDroppedFilePath(file: File): string
+  /** 监听菜单栏「打开 Markdown 文件…」。 */
+  onOpenLocalFile(callback: () => void): () => void
+  /** 监听菜单栏「保存」。 */
+  onSaveLocalFile(callback: () => void): () => void
+  /** 监听菜单栏「另存为…」。 */
+  onSaveLocalFileAs(callback: () => void): () => void
   saveAttachment(input: SaveAttachmentInput): Promise<AttachmentAsset>
   openAttachment(assetId: string): Promise<boolean>
   listAttachmentInventory(): Promise<AttachmentInventory>

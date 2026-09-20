@@ -151,6 +151,8 @@ import { commandsCtx, editorViewCtx } from '@milkdown/kit/core'
 import { historyProviderPlugin, redoCommand, undoCommand } from '@milkdown/kit/plugin/history'
 import { redoDepth, undoDepth } from '@milkdown/kit/prose/history'
 import type { Node as ProseMirrorNode } from '@milkdown/kit/prose/model'
+// 「粘贴（富文本）」需把剪贴板 HTML 解析成 Slice；「粘贴为 Markdown」用 markdownToSlice
+import { DOMParser as ProseMirrorDOMParser } from '@milkdown/kit/prose/model'
 import {
   paragraphSchema,
   headingSchema,
@@ -165,8 +167,9 @@ import {
 } from '@milkdown/kit/preset/commonmark'
 import { AllSelection, TextSelection } from '@milkdown/kit/prose/state'
 import { Decoration, DecorationSet, type EditorView as ProseMirrorView } from '@milkdown/kit/prose/view'
-import { replaceAll } from '@milkdown/kit/utils'
+import { markdownToSlice, replaceAll } from '@milkdown/kit/utils'
 import { installXynoteEmbedFeature } from '../editor/xynote-embed'
+import { installHardbreakFeature } from '../editor/xynote-hardbreak'
 import { Icon } from '@iconify/vue'
 import { defineAsyncComponent, h, nextTick, onBeforeUnmount, onMounted, ref, render, watch } from 'vue'
 import { extractMarkdownOutline, type MarkdownOutlineItem } from '../utils/markdown-outline'
@@ -205,6 +208,15 @@ interface Props {
    * xinyue-note.local 假域名（目标笔记未同步到云端时同样如此）。
    */
   webBaseUrl?: string
+  /**
+   * 是否启用笔记库专属能力（附件、插入笔记链接、嵌入笔记、图片上传到本地资产库）。
+   *
+   * 这些能力会把 xinyue-asset / xinyue-note.local 之类的应用私有地址写进正文，
+   * 只适合正文落库的笔记。外部 Markdown 文件曾靠它关掉这些入口，现在改由
+   * `MarkdownSourceEditor.vue` 承担（源码编辑，正文直接落回用户磁盘、零污染），
+   * 因此当前所有调用点都取默认值 true —— 保留该开关是给「纯文本笔记」这类未来场景。
+   */
+  noteLibraryEnabled?: boolean
 }
 
 interface OutlineCacheEntry {
@@ -234,7 +246,8 @@ const props = withDefaults(defineProps<Props>(), {
   scrollTop: 0,
   allNotes: () => [],
   folders: () => [],
-  webBaseUrl: ''
+  webBaseUrl: '',
+  noteLibraryEnabled: true
 })
 const emit = defineEmits<{
   (event: 'change', value: string, documentId: string): void
@@ -488,6 +501,8 @@ function buildEditorContextGroups(view: ProseMirrorView): EditorContextMenuGroup
         menuItem('cut', '剪切', { icon: 'material-symbols:content-cut-rounded', disabled: !canEdit || !hasSelection }),
         menuItem('copy', '复制', { icon: 'material-symbols:content-copy-rounded', disabled: !hasSelection }),
         menuItem('paste', '粘贴', { icon: 'material-symbols:content-paste-rounded', disabled: !canEdit }),
+        menuItem('pastePlain', '粘贴为纯文本', { icon: 'material-symbols:content-paste-off-rounded', disabled: !canEdit }),
+        menuItem('pasteMarkdown', '粘贴为 Markdown', { icon: 'material-symbols:markdown-rounded', disabled: !canEdit }),
         menuItem('selectAll', '全选', { icon: 'material-symbols:select-all-rounded' }),
         menuItem('delete', '删除', { icon: 'material-symbols:delete-outline-rounded', disabled: !canEdit || !hasSelection })
       ]
@@ -504,12 +519,14 @@ function buildEditorContextGroups(view: ProseMirrorView): EditorContextMenuGroup
         menuItem('codeBlock', '代码块', { icon: 'material-symbols:code-rounded', disabled: !canEdit })
       ]
     },
-    {
-      items: [
-        menuItem('insertLink', '插入笔记链接', { icon: 'tabler:link', disabled: !canEdit }),
-        menuItem('insertEmbed', '插入笔记嵌入', { icon: 'material-symbols:note-add-rounded', disabled: !canEdit })
-      ]
-    }
+    ...(props.noteLibraryEnabled
+      ? [{
+        items: [
+          menuItem('insertLink', '插入笔记链接', { icon: 'tabler:link', disabled: !canEdit }),
+          menuItem('insertEmbed', '插入笔记嵌入', { icon: 'material-symbols:note-add-rounded', disabled: !canEdit })
+        ]
+      }]
+      : [])
   ]
 }
 
@@ -617,9 +634,16 @@ function runEditorContextCommand(action: string): void {
     })
     return
   }
-  // 打开选择器类：依赖渲染层弹窗
-  if (action === 'insertLink') { openNoteLinkPicker(); return }
-  if (action === 'insertEmbed') { openNoteEmbedPicker(); return }
+  // 打开选择器类：依赖渲染层弹窗（外部文件模式下不提供笔记库入口）
+  if (action === 'insertLink' || action === 'insertEmbed') {
+    if (!props.noteLibraryEnabled) {
+      showFeedback('外部文件不支持插入笔记链接或嵌入')
+      return
+    }
+    if (action === 'insertLink') openNoteLinkPicker()
+    else openNoteEmbedPicker()
+    return
+  }
   // 撤销/重做/删除：简单命令
   if (action === 'undo' || action === 'redo' || action === 'delete') {
     editor.editor.action((ctx) => {
@@ -662,8 +686,8 @@ function runEditorContextCommand(action: string): void {
     })
     return
   }
-  // 剪贴板类动作（复制/剪切/粘贴）
-  if (action === 'copy' || action === 'cut' || action === 'paste') {
+  // 剪贴板类动作（复制/剪切/三种粘贴）
+  if (action === 'copy' || action === 'cut' || action === 'paste' || action === 'pastePlain' || action === 'pasteMarkdown') {
     void runClipboardAction(action)
   }
 }
@@ -732,6 +756,22 @@ async function runEmbedCardCommand(action: string): Promise<void> {
  * @param action: copy | cut | paste。
  * @return 异步完成后无返回值。
  */
+/**
+ * 剪贴板类动作（复制/剪切/三种粘贴方式）。
+ *
+ * 三种粘贴的区别：
+ * - `paste`：**富文本**。走编辑器原生 handlePaste，保留剪贴板里的
+ *   标题/列表/表格/图片等结构（不在此处拦截）。
+ * - `pastePlain`：**纯文本**。读剪贴板纯文本原样插入，不做任何 Markdown 解析。
+ * - `pasteMarkdown`：**Markdown**。读剪贴板文本按 Markdown 解析成富文本节点后插入，
+ *   与 `paste` 的差别是「以 Markdown 语法为准」而忽略剪贴板的 HTML 表示
+ *   （例如从代码编辑器复制的 `**粗体**` 会渲染成真正加粗，而非字面量）。
+ *
+ * 复制一律以纯文本写入；剪切=复制并删除选区。
+ *
+ * @param action: copy | cut | paste | pastePlain | pasteMarkdown。
+ * @return 异步完成后无返回值。
+ */
 async function runClipboardAction(action: string): Promise<void> {
   if (!editor) return
   await editor.editor.action(async (ctx) => {
@@ -745,8 +785,33 @@ async function runClipboardAction(action: string): Promise<void> {
         if (action === 'cut') view.dispatch(view.state.tr.deleteSelection())
         showFeedback('已复制')
       } else if (action === 'paste') {
+        // 富文本粘贴：读系统剪贴板的 HTML 表示（渲染层 navigator.clipboard 拿不到 text/html），
+        // 用 DOMParser 解析成 Slice 后插入，保留标题/列表/表格/加粗等结构。
+        const payload = await window.notesDesktop.readClipboard()
+        const html = payload?.html ?? ''
+        const text = payload?.text ?? ''
+        if (!html && !text) { showFeedback('剪贴板为空'); return }
+        if (html) {
+          const template = document.createElement('template')
+          template.innerHTML = html
+          const dom = template.content.cloneNode(true)
+          const slice = ProseMirrorDOMParser.fromSchema(view.state.schema).parseSlice(dom)
+          view.dispatch(view.state.tr.replaceSelection(slice))
+        } else {
+          // 剪贴板没有 HTML 表示（如从代码编辑器复制）→ 退化为纯文本插入
+          view.dispatch(view.state.tr.insertText(text))
+        }
+      } else if (action === 'pastePlain') {
+        // 纯文本粘贴：原样插入，不解析任何 Markdown 语法
         const text = await navigator.clipboard.readText()
+        if (!text) { showFeedback('剪贴板为空'); return }
         view.dispatch(view.state.tr.insertText(text))
+      } else if (action === 'pasteMarkdown') {
+        // Markdown 粘贴：按 Markdown 语法解析成富文本节点
+        const text = await navigator.clipboard.readText()
+        if (!text) { showFeedback('剪贴板为空'); return }
+        const slice = markdownToSlice(text)(ctx)
+        view.dispatch(view.state.tr.replaceSelection(slice))
       }
     } catch {
       showFeedback('剪贴板操作失败，请检查权限')
@@ -1114,6 +1179,11 @@ function scrollToOutline(index: number): void {
  * :return: 本地图片资源地址。
  */
 async function uploadImage(file: File): Promise<string> {
+  // 图片若走本地资产库，正文会被写入 xinyue-asset:// 私有地址；外部文件要原样落盘，不能带上。
+  if (!props.noteLibraryEnabled) {
+    showFeedback('外部文件不支持上传图片，请填写本地路径或网页地址')
+    throw new Error('外部文件不支持上传图片')
+  }
   const asset = await window.notesDesktop.saveImageAsset({
     fileName: file.name,
     mimeType: file.type,
@@ -1883,12 +1953,18 @@ function groupTopBarActions(actions: HTMLElement): void {
   const listMenu = createToolbarMenu({
     key: 'list', label: '列表', icon: 'material-symbols:format-list-bulleted-rounded'
   }, pickButtons(['无序列表', '有序列表', '任务列表']))
+  // 外部文件模式下不提供会写入应用私有地址的入口（附件/笔记链接/嵌入笔记）。
+  const noteLibraryActions = props.noteLibraryEnabled
+    ? [
+      createToolbarActionButton({ label: '附件', icon: 'tabler:paperclip', action: openAttachmentPicker }),
+      createToolbarActionButton({ label: '插入笔记链接', icon: 'tabler:link', action: openNoteLinkPicker }),
+      createToolbarActionButton({ label: '嵌入笔记', icon: 'material-symbols:note-add', action: openNoteEmbedPicker })
+    ]
+    : []
   const insertMenu = createToolbarMenu({
     key: 'insert', label: '插入', icon: 'material-symbols:add-box-outline-rounded'
   }, [
-    createToolbarActionButton({ label: '附件', icon: 'tabler:paperclip', action: openAttachmentPicker }),
-    createToolbarActionButton({ label: '插入笔记链接', icon: 'tabler:link', action: openNoteLinkPicker }),
-    createToolbarActionButton({ label: '嵌入笔记', icon: 'material-symbols:note-add', action: openNoteEmbedPicker }),
+    ...noteLibraryActions,
     ...pickButtons(['表格', '公式', '引用', '分隔线']),
     createToolbarActionButton({ label: '行内公式', icon: 'material-symbols:functions-rounded', action: toggleInlineFormula })
   ])
@@ -2017,6 +2093,7 @@ async function createEditor(): Promise<void> {
         },
         // 在 slash「/」命令菜单里追加「嵌入笔记」项（Obsidian 式快捷插入；选择器复用既有 NoteLinkPicker）
         buildMenu: (builder) => {
+          if (!props.noteLibraryEnabled) return
           const adv = builder.getGroup('advanced')
           adv?.addItem('xynote-embed', {
             label: '嵌入笔记',
@@ -2063,6 +2140,9 @@ async function createEditor(): Promise<void> {
   editor = crepe
   // T1 spike：注册笔记嵌入自定义节点（自包含、可回退，见 src/editor/xynote-embed.ts）
   crepe.addFeature(installXynoteEmbedFeature)
+  // 内联 <br> 保真：抢在 commonmark 内置 remarkPreserveEmptyLinePlugin 之前改写节点，
+  // 否则用户正文里的 <br> 会被当作「空行占位符」直接删除。见 src/editor/xynote-hardbreak.ts
+  crepe.addFeature(installHardbreakFeature)
   crepe.on((listener) => {
     listener.updated(() => {
       if (editorRootRef.value) syncHistoryActionButtons(editorRootRef.value)
@@ -2233,7 +2313,11 @@ onMounted(() => {
 })
 onBeforeUnmount(() => {
   const latestMarkdown = editor?.getMarkdown()
-  if (!props.readonly && latestMarkdown !== undefined && latestMarkdown !== props.value) {
+  // getMarkdown() 返回的是规范化后的 Markdown（会补尾部换行），与 props.value 严格比较
+  // 几乎永远不等 —— 仅「切换标签导致卸载」也会回吐一次假变更，触发一次多余的自动保存。
+  // 因此按语义比较（忽略尾部空白），只在正文真有变化时才回吐。
+  if (!props.readonly && latestMarkdown !== undefined
+    && latestMarkdown.trimEnd() !== String(props.value ?? '').trimEnd()) {
     emit('change', latestMarkdown, editorDocumentId)
   }
   destroyed = true

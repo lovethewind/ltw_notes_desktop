@@ -330,6 +330,14 @@ body.is-link-modifier-active .milkdown-editor-root a[href] { cursor: pointer; }
 .attachment-file-input { display: none; }
 .editor-title-row { display: flex; align-items: center; gap: 8px; }
 .title-input { order: 0; min-width: 180px; flex: 1 1 320px; width: auto; border: 0; outline: 0; padding: 0; background: transparent; color: #17253c; font-size: 22px; font-weight: 800; letter-spacing: -.03em; }
+/* 外部文件标签的标题不是可编辑输入框，只需把不换行省略补齐（其余沿用 .title-input）。 */
+.file-title { display: block; overflow: hidden; cursor: default; text-overflow: ellipsis; white-space: nowrap; }
+.file-properties-row { color: #8b98aa; font-size: 10px; }
+.file-properties-row .file-origin { flex: 0 0 auto; display: flex; align-items: center; gap: 6px; color: #2f8a6d; font-weight: 750; }
+.file-properties-row .file-origin svg { font-size: 15px; }
+.file-properties-row .file-path { min-width: 0; overflow: hidden; color: #93a2b4; text-overflow: ellipsis; white-space: nowrap; }
+.note-tab.file-tab .note-tab-main svg { color: #2f8a6d; }
+.note-tab.file-tab.active { box-shadow: inset 0 2px 0 var(--teal); color: #1f7a5f; }
 .editor-save-status { order: 2; flex: 0 0 auto; border: 0; border-radius: 999px; padding: 5px 9px; background: #eef3f8; color: #76869a; font-size: 9px; font-weight: 750; white-space: nowrap; }
 .editor-save-status.is-saving { background: #fff5dc; color: #9b721a; }
 .editor-save-status.is-saved { background: #e7f8f1; color: #23835c; }
@@ -340,6 +348,10 @@ body.is-link-modifier-active .milkdown-editor-root a[href] { cursor: pointer; }
 .editor-header-button svg { font-size: 15px; }
 .editor-header-button.is-history { width: 32px; padding: 0; justify-content: center; }
 .editor-header-button.is-history svg { font-size: 18px; }
+/* 外部文件标签没有自动保存，保存/另存为做成等宽图标按钮。 */
+.editor-header-button.is-file-save, .editor-header-button.is-save-as { width: 32px; padding: 0; justify-content: center; }
+.editor-header-button.is-file-save svg, .editor-header-button.is-save-as svg { font-size: 18px; }
+.editor-header-button.is-file-save:disabled { cursor: not-allowed; }
 .editor-header-button:hover, .editor-header-button:focus-visible { background: #edf5ff; color: var(--blue); }
 .editor-header-button:disabled { cursor: wait; opacity: .55; transform: none; }
 .editor-title-row > .properties-row { order: 1; min-width: 250px; flex: 0 1 390px; display: flex; align-items: center; gap: 8px; margin: 0 4px 0 0; }
@@ -1038,6 +1050,10 @@ button:focus-visible { outline: 3px solid rgba(47,128,237,.22); outline-offset: 
   .note-tab { color: #8fa1b8; }
   .note-tab.active { background: rgba(22,38,61,.96); color: #8dbdf8; }
   .note-tab.pinned { background: rgba(25,49,78,.94); color: #8dbdf8; }
+  .note-tab.file-tab .note-tab-main svg { color: #5fc39a; }
+  .note-tab.file-tab.active { color: #7fd8b4; }
+  .file-properties-row .file-origin { color: #5fc39a; }
+  .file-properties-row .file-path { color: #7b8ea6; }
   .note-tab-close { color: #71849c; }
   .note-tab-overflow-trigger { background: rgba(17,31,50,.96); color: #8fa1b8; }
   .note-tab-overflow-trigger:hover, .note-tab-overflow-trigger[aria-expanded="true"] { background: #1b304c; color: #8dbdf8; }

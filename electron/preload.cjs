@@ -1,4 +1,4 @@
-const { contextBridge, ipcRenderer } = require("electron")
+const { contextBridge, ipcRenderer, webUtils } = require("electron")
 
 contextBridge.exposeInMainWorld("notesDesktop", {
   listWorkspace: () => ipcRenderer.invoke("workspace:list"),
@@ -44,6 +44,65 @@ contextBridge.exposeInMainWorld("notesDesktop", {
   /** 将退出前保存结果回报给主进程。 */
   completeBeforeQuitSave: (requestId, result) => {
     ipcRenderer.send("app:before-quit-save-result", requestId, result)
+  },
+  /**
+   * 弹出系统文件选择器并读取选中的外部 Markdown 文件。
+   *
+   * 外部文件标签刻意不入库、不参与同步：文件本身即唯一真相来源。
+   *
+   * @returns {Promise<{ canceled: true } | { filePath: string, fileName: string, content: string }>}
+   */
+  pickMarkdownFile: () => ipcRenderer.invoke("local-file:pick"),
+  /** 按绝对路径读取外部 Markdown 文件（供拖拽入窗使用）。 */
+  readMarkdownFile: (filePath) => ipcRenderer.invoke("local-file:read", filePath),
+  /** 将正文写回外部 Markdown 文件。 */
+  saveMarkdownFile: (filePath, content) => ipcRenderer.invoke("local-file:save", filePath, content),
+  /** 将正文另存为新的 Markdown 文件。 */
+  saveMarkdownFileAs: (defaultName, content) => (
+    ipcRenderer.invoke("local-file:save-as", defaultName, content)
+  ),
+  /**
+   * 读取系统剪贴板内容（富文本粘贴用）。
+   *
+   * 渲染层的 `navigator.clipboard.readText()` 只能拿到纯文本，拿不到 `text/html`；
+   * 而「粘贴（富文本）」需要 HTML 表示，故走主进程 `clipboard` 模块。
+   *
+   * @returns {Promise<{ text: string, html: string }>} 纯文本与 HTML（无则空串）。
+   */
+  readClipboard: () => ipcRenderer.invoke("clipboard:read"),
+  /**
+   * 读取拖入窗口的文件在磁盘上的绝对路径。
+   *
+   * Electron 32 起 File.path 被移除，只能在 preload 里通过 webUtils 取路径；
+   * 取不到时返回空字符串，调用方应提示改用「打开 Markdown 文件…」。
+   *
+   * @param {File} file 拖拽事件携带的文件对象。
+   * @returns {string} 绝对路径，取不到时为空串。
+   */
+  getDroppedFilePath: (file) => {
+    try {
+      return webUtils.getPathForFile(file)
+    } catch {
+      return ""
+    }
+  },
+  /** 监听菜单栏「打开 Markdown 文件…」。 */
+  onOpenLocalFile: (callback) => {
+    const listener = () => callback()
+    ipcRenderer.on("local-file:open-request", listener)
+    return () => ipcRenderer.removeListener("local-file:open-request", listener)
+  },
+  /** 监听菜单栏「保存」（当前文档为笔记时由渲染层回落到笔记保存）。 */
+  onSaveLocalFile: (callback) => {
+    const listener = () => callback()
+    ipcRenderer.on("local-file:save-request", listener)
+    return () => ipcRenderer.removeListener("local-file:save-request", listener)
+  },
+  /** 监听菜单栏「另存为…」。 */
+  onSaveLocalFileAs: (callback) => {
+    const listener = () => callback()
+    ipcRenderer.on("local-file:save-as-request", listener)
+    return () => ipcRenderer.removeListener("local-file:save-as-request", listener)
   },
   saveAttachment: (input) => ipcRenderer.invoke("asset:save-attachment", input),
   openAttachment: (assetId) => ipcRenderer.invoke("asset:open", assetId),

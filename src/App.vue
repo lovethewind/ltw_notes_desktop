@@ -29,6 +29,11 @@ import type { QuickOpenSelection } from './components/QuickOpenDialog.vue'
 import SearchExcerpt from './components/SearchExcerpt.vue'
 import { matchesShortcut } from './utils/keyboard-shortcuts'
 import { OPEN_NOTE_EVENT, type OpenNoteEventDetail } from './utils/note-open-events'
+import {
+  dispatchOpenLocalFile,
+  OPEN_LOCAL_FILE_EVENT,
+  type OpenLocalFileEventDetail
+} from './utils/local-file-events'
 import { useAppUpdate } from './composables/useAppUpdate'
 import { useAttachmentManager } from './composables/useAttachmentManager'
 import { useDatabaseBackups } from './composables/useDatabaseBackups'
@@ -47,6 +52,7 @@ import type {
   SyncConnectionResult,
   SyncResultChange,
   SyncSettingsView,
+  LocalMarkdownFile,
   SyncStatus,
   ThemeMode,
   WorkspaceData
@@ -54,6 +60,8 @@ import type {
 
 // 编辑器与低频弹窗单独形成 chunk，避免应用启动时解析完整编辑器实现。
 const MarkdownVisualEditor = defineAsyncComponent(() => import('./components/MarkdownVisualEditor.vue'))
+// 外部文件走源码编辑器：富文本编辑器的 AST 往返会重排格式，只有源码模式能保证原样写回。
+const MarkdownSourceEditor = defineAsyncComponent(() => import('./components/MarkdownSourceEditor.vue'))
 const QuickOpenDialog = defineAsyncComponent(() => import('./components/QuickOpenDialog.vue'))
 const NoteHistoryDialog = defineAsyncComponent(() => import('./components/NoteHistoryDialog.vue'))
 const GeneralSettingsDialog = defineAsyncComponent(() => import('./components/GeneralSettingsDialog.vue'))
@@ -105,6 +113,20 @@ interface FolderDropPayload {
   position: 'before' | 'inside' | 'after'
 }
 
+/**
+ * 外部 Markdown 文件标签的状态。
+ *
+ * 与笔记标签的关键差别：文件不落本地数据库、不参与云端同步，
+ * 磁盘上的文件即唯一真相来源，因此不需要 revision / dirty 之类参与同步的字段。
+ */
+interface LocalFileDoc {
+  filePath: string
+  fileName: string
+  content: string
+  /** 最近一次落盘时的正文，用于判断是否有未保存修改。 */
+  savedContent: string
+}
+
 const workspace = reactive<WorkspaceData>({ folders: [], tags: [], notes: [], pendingCount: 0 })
 const activeFilter = reactive<ActiveFilter>({ kind: 'all', id: null })
 const activeNoteId = ref<string | null>(null)
@@ -129,6 +151,15 @@ const noteTabContextMenuElement = ref<HTMLElement | null>(null)
 const tabContextMenu = reactive({ visible: false, x: 0, y: 0, noteId: null as string | null })
 const draggedNoteTabId = ref<string | null>(null)
 const dragOverNoteTabId = ref<string | null>(null)
+/** 外部 Markdown 文件标签。与笔记标签共用同一条标签栏，但仅本地修改、不参与同步。 */
+const openFileDocs = ref<LocalFileDoc[]>([])
+const activeFilePath = ref<string | null>(null)
+const fileSaveState = ref<SaveState>('idle')
+const fileSavedAt = ref('')
+/** 保存互斥标志：菜单快捷键与渲染层按键可能同时触发同一次保存。 */
+let fileSaving = false
+/** 打开对话框互斥标志：避免菜单快捷键与渲染层按键各弹一次系统对话框。 */
+let pickingMarkdownFile = false
 const searchKeyword = ref('')
 const workspaceSearchNotes = ref<OfflineNote[]>([])
 const searchInput = ref<HTMLInputElement | null>(null)
@@ -361,6 +392,9 @@ let disposeCheckForUpdates: (() => void) | null = null
 let disposeOpenDataTransfer: (() => void) | null = null
 let disposeOpenGeneralSettings: (() => void) | null = null
 let disposeOpenSearch: (() => void) | null = null
+let disposeOpenLocalFile: (() => void) | null = null
+let disposeSaveLocalFile: (() => void) | null = null
+let disposeSaveLocalFileAs: (() => void) | null = null
 let disposeDatabaseBackupStatus: (() => void) | null = null
 let disposeSyncAuthResult: (() => void) | null = null
 let disposeSyncStatus: (() => void) | null = null
@@ -374,13 +408,38 @@ const activeNote = computed(() => workspace.notes.find((note) => note.id === act
 const openNoteTabs = computed<OfflineNote[]>(() => openNoteIds.value
   .map((noteId) => workspace.notes.find((note) => note.id === noteId && !note.isDeleted))
   .filter((note): note is OfflineNote => Boolean(note)))
+/** 文件标签固定 160px 宽（同 .note-tab），与笔记标签共用一条标签栏。 */
+const FILE_TAB_WIDTH = 160
+/** 当前激活的外部文件标签；同一时刻只渲染一个编辑器。 */
+const activeFileDoc = computed<LocalFileDoc | null>(() => (
+  openFileDocs.value.find((doc) => doc.filePath === activeFilePath.value) ?? null
+))
+/** 当前文件标签是否有尚未写回磁盘的修改。 */
+const activeFileDocDirty = computed(() => {
+  const doc = activeFileDoc.value
+  if (!doc) return false
+  return doc.content !== doc.savedContent
+})
+const fileSaveStatusLabel = computed(() => {
+  if (fileSaveState.value === 'saving') return '保存中…'
+  if (fileSaveState.value === 'error') return '保存失败'
+  if (activeFileDocDirty.value) return '未保存'
+  return fileSavedAt.value ? `已保存 · ${fileSavedAt.value}` : '已保存'
+})
+/** 文件保存状态徽标的语义色：保存中 / 有未保存修改 / 已与磁盘一致。 */
+const fileSaveBadgeState = computed(() => {
+  if (fileSaveState.value === 'saving') return 'saving'
+  return activeFileDocDirty.value ? 'idle' : 'saved'
+})
 const partitionedNoteTabs = computed(() => {
   if (!noteTabBarWidth.value) {
     return partitionNoteTabs(openNoteIds.value, activeTabNoteId.value, openNoteIds.value.length)
   }
-  const withoutOverflow = Math.max(1, Math.floor(noteTabBarWidth.value / 160))
+  // 文件标签与笔记标签共用同一条标签栏，先扣掉文件标签占用的宽度再排笔记标签。
+  const available = Math.max(0, noteTabBarWidth.value - openFileDocs.value.length * FILE_TAB_WIDTH)
+  const withoutOverflow = Math.max(1, Math.floor(available / 160))
   const maxVisible = openNoteIds.value.length > withoutOverflow
-    ? Math.max(1, Math.floor((noteTabBarWidth.value - 42) / 160))
+    ? Math.max(1, Math.floor((available - 42) / 160))
     : withoutOverflow
   return partitionNoteTabs(openNoteIds.value, activeTabNoteId.value, maxVisible)
 })
@@ -731,6 +790,9 @@ function scheduleWorkspaceSearch(rawKeyword: string): void {
 async function refreshWorkspace(): Promise<void> {
   const selectedId = activeNoteId.value
   applyWorkspace(await window.notesDesktop.listWorkspace())
+  // 当前激活的是外部文件标签：同步刷新只更新侧栏数据，绝不改变用户所在的文档。
+  // 下面的「载入草稿 / 兜底打开笔记」都是笔记激活态的语义，照原样跑会把文件标签顶掉。
+  const fileActive = Boolean(activeFileDoc.value)
   const refreshedNote = selectedId
     ? workspace.notes.find((note) => note.id === selectedId && !note.isDeleted)
     : undefined
@@ -741,13 +803,17 @@ async function refreshWorkspace(): Promise<void> {
     }
     pendingRemoteRefresh = false
     if (!doesDraftMatchNote(refreshedNote)) {
-      await loadNoteIntoDraft(refreshedNote)
+      // 草稿仍要跟上远端（否则切回笔记时 flushSave 会用旧草稿覆盖同步结果），
+      // 只是这一次不能顺带把外部文件标签切走。
+      await loadNoteIntoDraft(refreshedNote, { keepActiveFile: fileActive })
     }
     return
   }
   pendingRemoteRefresh = false
   // 空标签会话是用户明确关闭全部标签后的状态；同步刷新不能替用户重新打开笔记。
   if (!selectedId) return
+  // 文件标签下也不替用户打开别的笔记（原笔记可能刚被同步删除）。
+  if (fileActive) return
   const target = workspace.notes.find((note) => !note.isDeleted)
   if (target) await selectNote(target)
   else activeNoteId.value = null
@@ -791,7 +857,7 @@ function openQuickOpen(): void {
  * :return: 无返回值。
  */
 function openCurrentNoteFind(): void {
-  if (!activeNote.value) return
+  if (!activeNote.value && !activeFileDoc.value) return
   noteFindVisible.value = true
   void nextTick(() => {
     noteFindInput.value?.focus()
@@ -1304,9 +1370,14 @@ function doesDraftMatchNote(note: OfflineNote): boolean {
  * 把笔记内容载入编辑草稿，不触发保存。
  *
  * :param note: 待编辑笔记。
+ * :param options.keepActiveFile: 为真时只更新草稿，不把用户从外部文件标签切走
+ *   （同步刷新专用；用户主动切换笔记时一律退出文件激活态）。
  * :return: 草稿加载完成后的 Promise。
  */
-async function loadNoteIntoDraft(note: OfflineNote): Promise<void> {
+async function loadNoteIntoDraft(
+  note: OfflineNote,
+  options: { keepActiveFile?: boolean } = {}
+): Promise<void> {
   const resolvedNote = note.contentLoaded === false
     ? await window.notesDesktop.getNote(note.id)
     : note
@@ -1314,6 +1385,8 @@ async function loadNoteIntoDraft(note: OfflineNote): Promise<void> {
   if (resolvedNote !== note) replaceNote(resolvedNote)
   closePropertyPickers()
   draftReady = false
+  // 所有「展示某篇笔记」的路径都收敛到这里：切到笔记即让文件标签退出激活态。
+  if (!options.keepActiveFile) activeFilePath.value = null
   activeNoteId.value = resolvedNote.id
   draft.title = resolvedNote.title
   draft.content = resolvedNote.content
@@ -1344,6 +1417,8 @@ async function selectNote(note: OfflineNote): Promise<void> {
 
 /** 把当前编辑器的阅读位置提交给会话状态。 */
 function rememberCurrentNoteScrollPosition(): void {
+  // 文件标签下编辑器挂载的是外部文件，此时读到的滚动位置不属于任何笔记。
+  if (activeFileDoc.value) return
   if (!activeNoteId.value || !markdownEditorRef.value) return
   updateNoteScrollPosition(markdownEditorRef.value.getScrollTop(), activeNoteId.value)
 }
@@ -1445,6 +1520,243 @@ async function applyClosedNoteTabs(nextState: NoteTabsState): Promise<void> {
   }
   await flushSave()
   activeNoteId.value = null
+}
+
+/** 返回「时:分」形式的当前时间，用于文件保存状态提示。 */
+function currentClockLabel(): string {
+  return new Intl.DateTimeFormat('zh-CN', {
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: false
+  }).format(new Date())
+}
+
+/**
+ * 把外部 Markdown 文件放进标签栏并激活。
+ *
+ * 同一路径已在标签栏时只切换、不重读磁盘，避免覆盖用户尚未保存的修改。
+ *
+ * :param file: 主进程读到的文件内容快照。
+ * :return: 无返回值。
+ */
+function activateFileDoc(file: LocalMarkdownFile): void {
+  if (!openFileDocs.value.some((doc) => doc.filePath === file.filePath)) {
+    openFileDocs.value.push({
+      filePath: file.filePath,
+      fileName: file.fileName,
+      content: file.content,
+      savedContent: file.content
+    })
+  }
+  focusFileDoc(file.filePath)
+}
+
+/**
+ * 切换到已打开的文件标签。
+ *
+ * :param filePath: 目标文件绝对路径。
+ * :return: 无返回值。
+ */
+function focusFileDoc(filePath: string): void {
+  activeFilePath.value = filePath
+  fileSaveState.value = 'idle'
+  fileSavedAt.value = ''
+  noteTabOverflowVisible.value = false
+}
+
+/**
+ * 弹出系统文件选择器并打开外部 Markdown 文件。
+ *
+ * :return: 打开完成后的 Promise。
+ */
+async function openMarkdownFileFromDialog(): Promise<void> {
+  // 菜单快捷键与渲染层按键可能同时触发，加锁避免弹出两个系统对话框。
+  if (pickingMarkdownFile) return
+  pickingMarkdownFile = true
+  try {
+    const file = await window.notesDesktop.pickMarkdownFile()
+    if (!file || file.canceled) return
+    activateFileDoc(file)
+  } catch (error) {
+    actionError.value = error instanceof Error ? error.message : '打开文件失败'
+  } finally {
+    pickingMarkdownFile = false
+  }
+}
+
+/**
+ * 按绝对路径打开外部 Markdown 文件（拖拽入窗等场景）。
+ *
+ * :param filePath: 目标文件绝对路径。
+ * :return: 打开完成后的 Promise。
+ */
+async function openMarkdownFileByPath(filePath: string): Promise<void> {
+  if (!filePath) return
+  if (openFileDocs.value.some((doc) => doc.filePath === filePath)) {
+    focusFileDoc(filePath)
+    return
+  }
+  try {
+    activateFileDoc(await window.notesDesktop.readMarkdownFile(filePath))
+  } catch (error) {
+    actionError.value = error instanceof Error ? error.message : '打开文件失败'
+  }
+}
+
+/**
+ * 接收文件编辑器内容变化。
+ *
+ * :param value: 最新 Markdown 正文。
+ * :param documentId: 产生变化的文件路径。
+ * :return: 无返回值。
+ */
+function updateFileDocContent(value: string, documentId: string): void {
+  const doc = activeFileDoc.value
+  if (!doc || doc.filePath !== documentId) return
+  doc.content = value
+  if (fileSaveState.value === 'saved') fileSaveState.value = 'idle'
+}
+
+/**
+ * 把当前文件标签的正文写回磁盘。
+ *
+ * :return: 写入完成后的 Promise。
+ */
+async function saveActiveMarkdownFile(): Promise<void> {
+  const doc = activeFileDoc.value
+  if (!doc || fileSaving) return
+  if (doc.content === doc.savedContent) {
+    fileSaveState.value = 'idle'
+    return
+  }
+  fileSaving = true
+  fileSaveState.value = 'saving'
+  const content = doc.content
+  try {
+    await window.notesDesktop.saveMarkdownFile(doc.filePath, content)
+    doc.savedContent = content
+    fileSavedAt.value = currentClockLabel()
+    fileSaveState.value = 'saved'
+  } catch (error) {
+    fileSaveState.value = 'error'
+    actionError.value = error instanceof Error ? error.message : '保存文件失败'
+  } finally {
+    fileSaving = false
+  }
+}
+
+/**
+ * 把当前文件标签的正文另存为新文件，并让标签改为指向新路径。
+ *
+ * :return: 另存完成后的 Promise。
+ */
+async function saveActiveMarkdownFileAs(): Promise<void> {
+  const doc = activeFileDoc.value
+  if (!doc || fileSaving) return
+  fileSaving = true
+  fileSaveState.value = 'saving'
+  const content = doc.content
+  try {
+    const result = await window.notesDesktop.saveMarkdownFileAs(doc.fileName, content)
+    if (result.canceled) {
+      fileSaveState.value = 'idle'
+      return
+    }
+    doc.filePath = result.filePath
+    doc.fileName = result.fileName
+    doc.savedContent = content
+    activeFilePath.value = result.filePath
+    fileSavedAt.value = currentClockLabel()
+    fileSaveState.value = 'saved'
+  } catch (error) {
+    fileSaveState.value = 'error'
+    actionError.value = error instanceof Error ? error.message : '另存为失败'
+  } finally {
+    fileSaving = false
+  }
+}
+
+/**
+ * 关闭外部文件标签。
+ *
+ * 文件标签不参与同步，未保存的修改一旦关闭标签就无处可寻，因此必须先确认。
+ *
+ * :param filePath: 待关闭的文件绝对路径。
+ * :return: 关闭完成后的 Promise。
+ */
+async function closeFileDoc(filePath: string): Promise<void> {
+  const index = openFileDocs.value.findIndex((doc) => doc.filePath === filePath)
+  if (index < 0) return
+  const doc = openFileDocs.value[index]
+  if (doc.content !== doc.savedContent) {
+    const confirmed = await requestConfirmation(
+      '放弃未保存的修改？',
+      `“${doc.fileName}”的修改还没有写回磁盘，关闭标签后这些修改会丢失。`,
+      '放弃修改'
+    )
+    if (!confirmed) return
+  }
+  openFileDocs.value.splice(index, 1)
+  if (activeFilePath.value !== filePath) return
+  const next = openFileDocs.value[Math.min(index, openFileDocs.value.length - 1)]
+  if (next) {
+    focusFileDoc(next.filePath)
+    return
+  }
+  activeFilePath.value = null
+  fileSaveState.value = 'idle'
+  fileSavedAt.value = ''
+}
+
+/**
+ * 退出应用前把所有文件标签的未保存修改写回磁盘。
+ *
+ * 退出流程由主进程驱动，渲染层没有弹窗时机，因此这里直接落盘而不是询问：
+ * 丢改动的代价远大于「用户其实不想保存」。
+ *
+ * :return: 全部写回后的 Promise。
+ */
+async function saveOpenFileDocsBeforeQuit(): Promise<void> {
+  for (const doc of openFileDocs.value) {
+    if (doc.content === doc.savedContent) continue
+    const content = doc.content
+    await window.notesDesktop.saveMarkdownFile(doc.filePath, content)
+    doc.savedContent = content
+  }
+}
+
+/**
+ * 接管携带系统文件的拖拽悬停，阻止 Electron 默认的「拖文件即导航」行为。
+ *
+ * :param event: 拖拽事件。
+ * :return: 无返回值。
+ */
+function handleWindowFileDragOver(event: DragEvent): void {
+  if (!event.dataTransfer?.types.includes('Files')) return
+  event.preventDefault()
+  event.dataTransfer.dropEffect = 'copy'
+}
+
+/**
+ * 接收拖入窗口的 Markdown 文件并作为文件标签打开。
+ *
+ * :param event: 拖放事件。
+ * :return: 无返回值。
+ */
+function handleWindowFileDrop(event: DragEvent): void {
+  const files = event.dataTransfer?.files
+  if (!files?.length) return
+  event.preventDefault()
+  const filePath = window.notesDesktop.getDroppedFilePath(files[0])
+  if (!filePath) {
+    actionError.value = '无法读取拖入文件的路径，请改用「文件 → 打开 Markdown 文件…」'
+    return
+  }
+  if (!/\.(md|markdown|mdown|txt|text)$/i.test(filePath)) {
+    actionError.value = '只支持拖入 Markdown 或纯文本文件'
+    return
+  }
+  dispatchOpenLocalFile(filePath)
 }
 
 /**
@@ -1565,6 +1877,9 @@ function updateNoteTabBarWidth(entries: ResizeObserverEntry[]): void {
  */
 function updateDraftContent(value: string, documentId: string): void {
   if (documentId !== activeNoteId.value) return
+  // 外部文件标签激活时笔记编辑器已卸载，此处的变更只可能来自卸载回吐，
+  // 不是用户对这篇笔记的编辑 —— 放行会触发一次自动保存，把草稿写回并盖掉同步结果。
+  if (activeFileDoc.value) return
   draft.content = value
 }
 
@@ -1679,6 +1994,7 @@ async function waitForDraftSave(): Promise<void> {
 async function saveBeforeQuit(): Promise<void> {
   if (initialWorkspaceLoad) await initialWorkspaceLoad
   rememberCurrentNoteScrollPosition()
+  await saveOpenFileDocsBeforeQuit()
   if (!draftReady || !activeNoteId.value) {
     await flushWorkspaceSession()
     return
@@ -2750,6 +3066,12 @@ const handleWindowOpenNote = (event: Event): void => {
   if (detail) void handleOpenNoteEvent(detail)
 }
 
+/** window 级「按路径打开外部文件」事件监听器。 */
+const handleWindowOpenLocalFile = (event: Event): void => {
+  const detail = (event as CustomEvent<OpenLocalFileEventDetail>).detail
+  if (detail?.filePath) void openMarkdownFileByPath(detail.filePath)
+}
+
 /**
  * 执行标签右键菜单中的删除命令。
  *
@@ -2902,15 +3224,23 @@ function handleShortcut(event: KeyboardEvent): void {
     event.preventDefault()
     void createNote()
   }
+  // 「打开 Markdown 文件」用 ⇧⌘O：⌘O 已被「快速打开」占用（且该键可在设置里改），
+  // 这里保留同义分支，供菜单不可用的环境兜底。
+  if (event.key.toLocaleLowerCase() === 'o' && event.shiftKey) {
+    event.preventDefault()
+    void openMarkdownFileFromDialog()
+  }
+  // ⌘S 落在文件标签上时写回外部文件，落在笔记上时保持原来的立即落库语义。
   if (event.key.toLocaleLowerCase() === 's') {
     event.preventDefault()
-    void saveDraft()
+    if (activeFileDoc.value) void saveActiveMarkdownFile()
+    else void saveDraft()
   }
   if (event.key.toLocaleLowerCase() === 'k') {
     event.preventDefault()
     searchInput.value?.focus()
   }
-  if (event.key.toLocaleLowerCase() === 'f' && activeNote.value) {
+  if (event.key.toLocaleLowerCase() === 'f' && (activeNote.value || activeFileDoc.value)) {
     event.preventDefault()
     openCurrentNoteFind()
   }
@@ -3010,6 +3340,11 @@ watch(activeNoteId, () => {
   noteFindKeyword.value = ''
   Object.assign(noteFindResult, { count: 0, index: -1 })
 })
+watch(activeFilePath, () => {
+  closeCurrentNoteFind()
+  noteFindKeyword.value = ''
+  Object.assign(noteFindResult, { count: 0, index: -1 })
+})
 watch(activeNoteId, syncCurrentNoteTab)
 watch([openNoteIds, activeTabNoteId, pinnedNoteIds], scheduleWorkspaceSessionSave, { deep: true })
 watch(() => workspace.notes.map((note) => `${note.id}:${note.isDeleted}`).join('|'), () => {
@@ -3040,7 +3375,10 @@ onMounted(() => {
   window.addEventListener('keydown', handleShortcut)
   window.addEventListener('drop', finishResourceDrag)
   window.addEventListener('dragend', finishResourceDrag)
+  window.addEventListener('dragover', handleWindowFileDragOver)
+  window.addEventListener('drop', handleWindowFileDrop)
   window.addEventListener(OPEN_NOTE_EVENT, handleWindowOpenNote)
+  window.addEventListener(OPEN_LOCAL_FILE_EVENT, handleWindowOpenLocalFile)
   systemThemeMedia.addEventListener('change', handleSystemThemeChange)
   document.addEventListener('pointerover', showButtonTooltip)
   document.addEventListener('pointerout', hideButtonTooltip)
@@ -3062,6 +3400,13 @@ onMounted(() => {
   disposeOpenDataTransfer = window.notesDesktop.onOpenDataTransfer(openDataTransfer)
   disposeOpenGeneralSettings = window.notesDesktop.onOpenGeneralSettings(() => void openGeneralSettings())
   disposeOpenSearch = window.notesDesktop.onOpenSearch(handleSearchMenuCommand)
+  disposeOpenLocalFile = window.notesDesktop.onOpenLocalFile(() => void openMarkdownFileFromDialog())
+  disposeSaveLocalFile = window.notesDesktop.onSaveLocalFile(() => {
+    // 菜单「保存」是文档级操作：文件标签写回磁盘，笔记保持立即落库。
+    if (activeFileDoc.value) void saveActiveMarkdownFile()
+    else void saveDraft()
+  })
+  disposeSaveLocalFileAs = window.notesDesktop.onSaveLocalFileAs(() => void saveActiveMarkdownFileAs())
   disposeDatabaseBackupStatus = window.notesDesktop.onDatabaseBackupStatus((status) => {
     Object.assign(databaseBackupStatus, status)
   })
@@ -3092,7 +3437,10 @@ onBeforeUnmount(() => {
   window.removeEventListener('keydown', handleShortcut)
   window.removeEventListener('drop', finishResourceDrag)
   window.removeEventListener('dragend', finishResourceDrag)
+  window.removeEventListener('dragover', handleWindowFileDragOver)
+  window.removeEventListener('drop', handleWindowFileDrop)
   window.removeEventListener(OPEN_NOTE_EVENT, handleWindowOpenNote)
+  window.removeEventListener(OPEN_LOCAL_FILE_EVENT, handleWindowOpenLocalFile)
   finishResourceDrag()
   systemThemeMedia.removeEventListener('change', handleSystemThemeChange)
   document.removeEventListener('pointerover', showButtonTooltip)
@@ -3115,6 +3463,12 @@ onBeforeUnmount(() => {
   disposeOpenGeneralSettings = null
   disposeOpenSearch?.()
   disposeOpenSearch = null
+  disposeOpenLocalFile?.()
+  disposeOpenLocalFile = null
+  disposeSaveLocalFile?.()
+  disposeSaveLocalFile = null
+  disposeSaveLocalFileAs?.()
+  disposeSaveLocalFileAs = null
   disposeDatabaseBackupStatus?.()
   disposeDatabaseBackupStatus = null
   disposeSyncAuthResult?.()
@@ -3530,13 +3884,41 @@ onBeforeUnmount(() => {
       </aside>
 
       <section class="editor-panel">
-        <nav v-if="openNoteTabs.length" ref="noteTabBarElement" class="note-tab-bar" aria-label="已打开笔记" @click.stop>
+        <nav v-if="openNoteTabs.length || openFileDocs.length" ref="noteTabBarElement" class="note-tab-bar" aria-label="已打开的标签" @click.stop>
           <div class="note-tab-scroll">
+            <!-- 外部文件标签：排在笔记标签之前，用「未保存」圆点区分是否已写回磁盘。 -->
+            <div
+              v-for="doc in openFileDocs"
+              :key="doc.filePath"
+              :class="['note-tab', 'file-tab', { active: doc.filePath === activeFilePath }]"
+            >
+              <button
+                class="note-tab-main"
+                type="button"
+                :title="doc.filePath"
+                @click="focusFileDoc(doc.filePath)"
+              >
+                <Icon
+                  :icon="doc.content === doc.savedContent
+                    ? 'material-symbols:draft-outline'
+                    : 'material-symbols:draft'"
+                />
+                <span>{{ doc.fileName }}</span>
+              </button>
+              <button
+                class="note-tab-close"
+                type="button"
+                :aria-label="`关闭 ${doc.fileName}`"
+                @click.stop="closeFileDoc(doc.filePath)"
+              >
+                <Icon icon="material-symbols:close-rounded" />
+              </button>
+            </div>
             <div
               v-for="note in visibleNoteTabs"
               :key="note.id"
               :class="['note-tab', {
-                active: note.id === activeTabNoteId,
+                active: note.id === activeTabNoteId && !activeFilePath,
                 pinned: isNoteTabPinned(note.id),
                 dragging: note.id === draggedNoteTabId,
                 'drag-over': note.id === dragOverNoteTabId
@@ -3592,8 +3974,48 @@ onBeforeUnmount(() => {
             </div>
           </div>
         </nav>
-        <template v-if="activeNote">
-          <div class="editor-meta">
+        <template v-if="activeFileDoc || activeNote">
+          <div v-if="activeFileDoc" class="editor-meta">
+            <div class="editor-title-row">
+              <span class="title-input file-title" :title="activeFileDoc.filePath">{{ activeFileDoc.fileName }}</span>
+              <div class="properties-row file-properties-row">
+                <span class="file-origin"><Icon icon="material-symbols:draft-outline" />外部文件 · 仅本地修改不同步</span>
+                <span class="file-path" :title="activeFileDoc.filePath">{{ activeFileDoc.filePath }}</span>
+              </div>
+              <button
+                v-if="fileSaveState === 'error'"
+                class="editor-save-status is-error is-retry"
+                type="button"
+                aria-label="保存失败，点击重试"
+                @click="saveActiveMarkdownFile"
+              >
+                保存失败 · 重试
+              </button>
+              <span v-else :class="['editor-save-status', `is-${fileSaveBadgeState}`]" role="status">
+                {{ fileSaveStatusLabel }}
+              </span>
+              <button
+                class="editor-header-button is-save-as"
+                type="button"
+                aria-label="另存为"
+                title="另存为（⇧⌘S）"
+                @click="saveActiveMarkdownFileAs"
+              >
+                <Icon icon="material-symbols:save-as-rounded" />
+              </button>
+              <button
+                class="editor-header-button is-file-save"
+                type="button"
+                aria-label="保存到文件"
+                title="保存到文件（⌘S）"
+                :disabled="!activeFileDocDirty || fileSaveState === 'saving'"
+                @click="saveActiveMarkdownFile"
+              >
+                <Icon icon="material-symbols:save-rounded" />
+              </button>
+            </div>
+          </div>
+          <div v-else class="editor-meta">
             <div class="editor-title-row">
               <input v-model="draft.title" class="title-input" maxlength="100" aria-label="笔记标题" />
               <button
@@ -3701,7 +4123,22 @@ onBeforeUnmount(() => {
               <button type="button" aria-label="下一个匹配" @click="findInCurrentNote(1)"><Icon icon="tabler:chevron-down" /></button>
               <button type="button" aria-label="关闭查找" @click="closeCurrentNoteFind"><Icon icon="tabler:x" /></button>
             </div>
+            <!--
+              外部文件：用源码编辑器按原文编辑，保存时逐字符写回磁盘。
+              富文本编辑器会把正文拆成 AST 再序列化，`<br>` 会被抹掉、`*` 会被转义，
+              只改一个字就会重排整篇表格，因此文件标签不能走它。
+              key 取文件路径：每个标签一套独立的撤销栈，撤销不会串到另一个文件。
+            -->
+            <MarkdownSourceEditor
+              v-if="activeFileDoc"
+              :key="activeFileDoc.filePath"
+              ref="markdownEditorRef"
+              :document-id="activeFileDoc.filePath"
+              :value="activeFileDoc.content"
+              @change="updateFileDocContent"
+            />
             <MarkdownVisualEditor
+              v-else-if="activeNote"
               ref="markdownEditorRef"
               :document-id="activeNote.id"
               :scroll-top="noteScrollTops[activeNote.id] ?? 0"

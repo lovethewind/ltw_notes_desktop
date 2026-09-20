@@ -6,6 +6,7 @@ const Database = require("better-sqlite3")
 const {
   app,
   BrowserWindow,
+  clipboard,
   dialog,
   globalShortcut,
   ipcMain,
@@ -1565,6 +1566,105 @@ async function importFullBackup() {
 }
 
 /**
+ * 外部 Markdown 文件的大小上限。超过后不再读取，避免误开超大文件拖垮编辑器。
+ */
+const EXTERNAL_MARKDOWN_MAX_BYTES = 8 * 1024 * 1024
+
+/**
+ * 判断路径是否属于可编辑的纯文本/Markdown 文件。
+ *
+ * 读写外部文件时都要求命中该白名单：渲染层虽然受 contextIsolation 保护，
+ * 但主进程仍不应接受任意路径的读写请求。
+ *
+ * @param {string} filePath 待判断的路径。
+ * @returns {boolean} 扩展名属于 md/markdown/mdown/txt/text 时返回 true。
+ */
+function isMarkdownLikePath(filePath) {
+  return /\.(md|markdown|mdown|txt|text)$/i.test(String(filePath || ""))
+}
+
+/**
+ * 读取外部 Markdown 文件。
+ *
+ * 该链路刻意不入库、不参与同步：文件本身即唯一真相来源，应用只做「打开—编辑—写回」。
+ *
+ * @param {string} filePath 目标文件绝对路径。
+ * @returns {Promise<Record<string, any>>} 文件路径、名称与正文。
+ */
+async function readLocalMarkdownFile(filePath) {
+  const targetPath = String(filePath || "")
+  if (!targetPath) throw new Error("缺少文件路径")
+  if (!isMarkdownLikePath(targetPath)) throw new Error("只支持打开 Markdown 或纯文本文件")
+  const stat = await fs.promises.stat(targetPath)
+  if (!stat.isFile()) throw new Error("目标不是文件")
+  if (stat.size > EXTERNAL_MARKDOWN_MAX_BYTES) {
+    throw new Error(`文件超过 ${Math.round(EXTERNAL_MARKDOWN_MAX_BYTES / 1024 / 1024)} MB，暂不支持打开`)
+  }
+  const raw = await fs.promises.readFile(targetPath, "utf8")
+  return {
+    filePath: targetPath,
+    fileName: path.basename(targetPath),
+    // 去掉 UTF-8 BOM：它会在正文首行留下不可见字符，写回时还会被重复带上。
+    content: raw.charCodeAt(0) === 0xfeff ? raw.slice(1) : raw,
+    modifiedAt: stat.mtime.toISOString()
+  }
+}
+
+/**
+ * 弹出系统文件选择器并读取用户选中的 Markdown 文件。
+ *
+ * @returns {Promise<Record<string, any>>} 文件信息；用户取消时返回 { canceled: true }。
+ */
+async function pickLocalMarkdownFile() {
+  const result = await dialog.showOpenDialog(mainWindow, {
+    title: "打开 Markdown 文件",
+    properties: ["openFile"],
+    filters: [{ name: "Markdown", extensions: ["md", "markdown", "mdown", "txt", "text"] }]
+  })
+  if (result.canceled || !result.filePaths[0]) return { canceled: true }
+  return readLocalMarkdownFile(result.filePaths[0])
+}
+
+/**
+ * 将正文写回外部 Markdown 文件。
+ *
+ * @param {string} filePath 目标文件绝对路径。
+ * @param {string} content 最新正文。
+ * @returns {Promise<Record<string, any>>} 写入结果。
+ */
+async function saveLocalMarkdownFile(filePath, content) {
+  const targetPath = String(filePath || "")
+  if (!targetPath) throw new Error("缺少文件路径")
+  if (!isMarkdownLikePath(targetPath)) throw new Error("只支持写回 Markdown 或纯文本文件")
+  await fs.promises.writeFile(targetPath, String(content ?? ""), "utf8")
+  const stat = await fs.promises.stat(targetPath)
+  return {
+    canceled: false,
+    filePath: targetPath,
+    fileName: path.basename(targetPath),
+    modifiedAt: stat.mtime.toISOString()
+  }
+}
+
+/**
+ * 将正文另存为新的 Markdown 文件，并把后续保存指向新路径。
+ *
+ * @param {string} defaultName 默认文件名（通常沿用原文件名）。
+ * @param {string} content 待写入正文。
+ * @returns {Promise<Record<string, any>>} 写入结果；用户取消时返回 { canceled: true }。
+ */
+async function saveLocalMarkdownFileAs(defaultName, content) {
+  const suggested = path.basename(String(defaultName || "").trim() || "未命名.md")
+  const result = await dialog.showSaveDialog(mainWindow, {
+    title: "另存为 Markdown 文件",
+    defaultPath: isMarkdownLikePath(suggested) ? suggested : `${suggested}.md`,
+    filters: [{ name: "Markdown", extensions: ["md"] }]
+  })
+  if (result.canceled || !result.filePath) return { canceled: true }
+  return saveLocalMarkdownFile(result.filePath, content)
+}
+
+/**
  * 请求后端 JSON 接口并校验统一响应码。
  *
  * @param {string} url 接口地址。
@@ -2082,6 +2182,23 @@ function registerIpcHandlers() {
         return note
       }
     },
+    localFiles: {
+      pick: pickLocalMarkdownFile,
+      read: (filePath) => readLocalMarkdownFile(filePath),
+      save: (filePath, content) => saveLocalMarkdownFile(filePath, content),
+      saveAs: (defaultName, content) => saveLocalMarkdownFileAs(defaultName, content),
+      /**
+       * 读取系统剪贴板：渲染层 `navigator.clipboard.readText()` 拿不到 `text/html`，
+       * 而「粘贴（富文本）」需要 HTML 表示，故由主进程 clipboard 模块提供。
+       */
+      readClipboard: () => {
+        const formats = clipboard.availableFormats().map((f) => String(f).toLowerCase())
+        return {
+          text: clipboard.readText(),
+          html: formats.some((f) => f.startsWith("text/html")) ? clipboard.readHTML() : ""
+        }
+      }
+    },
     dataTransfer: {
       exportNote: exportNoteMarkdown,
       exportAll: exportAllMarkdown,
@@ -2152,6 +2269,28 @@ function installMenu() {
         { label: "全部显示", role: "unhide" },
         { type: "separator" },
         { label: "退出心悦笔记", role: "quit" }
+      ]
+    },
+    {
+      label: "文件",
+      submenu: [
+        {
+          // 刻意不用 CmdOrCtrl+O：「快速打开」的默认快捷键就是它，且由渲染层抢先消费。
+          label: "打开 Markdown 文件…",
+          accelerator: "CmdOrCtrl+Shift+O",
+          click: () => mainWindow?.webContents.send("local-file:open-request")
+        },
+        { type: "separator" },
+        {
+          label: "保存",
+          accelerator: "CmdOrCtrl+S",
+          click: () => mainWindow?.webContents.send("local-file:save-request")
+        },
+        {
+          label: "另存为…",
+          accelerator: "CmdOrCtrl+Shift+S",
+          click: () => mainWindow?.webContents.send("local-file:save-as-request")
+        }
       ]
     },
     {
