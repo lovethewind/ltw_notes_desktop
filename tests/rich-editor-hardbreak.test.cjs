@@ -67,8 +67,24 @@ test('硬换行节点：toMarkdown 回写 html `<br>`，而非 break 节点', ()
 test('编辑器接入硬换行 feature，与嵌入卡片 feature 并列', () => {
   const editorSource = readSource('src/components/MarkdownVisualEditor.vue')
 
-  assert.match(editorSource, /import \{ installHardbreakFeature \} from '\.\.\/editor\/xynote-hardbreak'/)
+  // 导入里除 installHardbreakFeature 外还带了节点名/单元格名常量（供 Shift+Enter 复用）
+  assert.match(editorSource, /import \{[^}]*installHardbreakFeature[^}]*\} from '\.\.\/editor\/xynote-hardbreak'/)
   assert.match(editorSource, /crepe\.addFeature\(installHardbreakFeature\)/)
+})
+
+test('表格单元格内 Shift+Enter 接管为自定义硬换行节点', () => {
+  const editorSource = readSource('src/components/MarkdownVisualEditor.vue')
+
+  // 背景：内置 hardbreakFilterPlugin 读 hardbreakFilterNodes（默认含 table）→ 单元格内 Shift+Enter 静默失效。
+  // 修复：在 handleSuggestKeydown 最前面按「选中区在单元格内」判断并改用 xynoteHardbreak 节点。
+  assert.match(editorSource, /function insertTableCellHardBreak/)
+  assert.match(editorSource, /event\.key !== 'Enter' \|\| !event\.shiftKey/)
+  assert.match(editorSource, /function isSelectionInTableCell/)
+  // 必须抢在内置 keymap 之前 —— 即挂在 handleSuggestKeydown 里且先于补全判断返回
+  assert.match(editorSource, /if \(insertTableCellHardBreak\(view as ProseMirrorView, event\)\) return true/)
+  // 节点类型取 schema 里的自定义节点，而非内置 hardbreak
+  assert.match(editorSource, /view\.state\.schema\.nodes\[HARDBREAK_NODE_NAME\]/)
+  assert.match(editorSource, /replaceSelectionWith\(type\.create\(\)\)/)
 })
 
 test('右键菜单提供三种粘贴方式，且只读态置灰', () => {

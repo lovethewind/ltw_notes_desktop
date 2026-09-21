@@ -175,6 +175,62 @@ test('富文本笔记：粘贴含 <br> 的表格后单元格内 <br> 保真', { 
   }
 })
 
+/**
+ * 表格单元格内 `Shift+Enter` 插硬换行 —— 回归。
+ *
+ * ## 背景
+ *
+ * Crepe 的 commonmark preset 注册了 `hardbreakFilterPlugin`
+ * （`@milkdown/preset-commonmark/lib/index.js:1984`），它读取 `hardbreakFilterNodes` ctx
+ * （默认 `["table", "code_block"]`）并**拒绝**在表格内插入 hardbreak，
+ * 所以内置 `Shift-Enter` 在单元格里**静默失效**（实测：按键后既不换行也不报错）。
+ *
+ * 修复见 `MarkdownVisualEditor.vue` 的 `insertTableCellHardBreak`：在表格内改用
+ * 本项目的 `xynoteHardbreak` 内联节点，它不经该过滤器，且序列化回写 `<br>`
+ * （内置 hardbreak 在单元格里会被 remark-stringify 压成空格）。
+ *
+ * ⚠️ 断言必须落在**落库正文**上，而不是只看 DOM：DOM 里能看到换行不代表存得住。
+ */
+test('富文本笔记：表格单元格内 Shift+Enter 插 <br> 且能落库', { timeout: 90_000 }, async () => {
+  const userDataPath = await fs.mkdtemp(path.join(os.tmpdir(), 'xinyue-cell-br-e2e-'))
+  let application
+
+  try {
+    application = await launchApplication(userDataPath)
+    const { page } = application
+    const noteId = await seedAndOpenNote(page, '单元格硬换行回归')
+    const editor = noteEditor(page)
+
+    const markdown = '| A | B |\n| --- | --- |\n| 前 | x |'
+    assert.ok(await writeClipboard(application.electronApplication, markdown), '剪贴板写入失败')
+    await pasteIntoEditor(page, editor)
+
+    // 光标落到首个单元格「前」之后，按 Shift+Enter 再输入 Z
+    const firstCell = page.locator('.milkdown-editor-root .ProseMirror table td p').first()
+    await firstCell.click()
+    await page.keyboard.press('End')
+    await page.keyboard.press('Shift+Enter')
+    await page.keyboard.type('Z')
+    await page.waitForTimeout(300)
+
+    const state = await readEditor(page)
+    assert.ok(state, '未找到富文本编辑器')
+    assert.equal(state.xynoteHardbreaks, 1, `单元格内应出现自定义硬换行节点，实际 DOM：${state.html}`)
+
+    // 等自动保存防抖后核对落库正文 —— 这才是「存得住」的证据
+    await page.waitForTimeout(3200)
+    const saved = await page.evaluate((id) => window.notesDesktop.getNote(id), noteId)
+    assert.match(
+      saved.content,
+      /前<br\s*\/?>Z/,
+      `单元格内硬换行应落库为 <br>，实际：${JSON.stringify(saved.content)}`
+    )
+  } finally {
+    if (application) await application.electronApplication.close().catch(() => {})
+    await fs.rm(userDataPath, { recursive: true, force: true })
+  }
+})
+
 test('富文本笔记：空段落占位符语义不回退', { timeout: 90_000 }, async () => {
   const userDataPath = await fs.mkdtemp(path.join(os.tmpdir(), 'xinyue-br-empty-e2e-'))
   let application

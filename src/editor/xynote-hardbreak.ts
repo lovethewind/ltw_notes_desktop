@@ -44,6 +44,12 @@ import { $nodeSchema } from '@milkdown/kit/utils'
 /** 本扩展专属的 mdast 节点类型，用于避开内置插件的 `html` 匹配。 */
 export const HARDBREAK_MDAST_TYPE = 'xynoteHardbreak'
 
+/** 本扩展节点在 ProseMirror schema 里的名字。 */
+export const HARDBREAK_NODE_NAME = 'xynoteHardbreak'
+
+/** 表格单元格节点名（`table_cell` 与表头 `table_header` 同等对待）。 */
+export const TABLE_CELL_NODE_NAMES = ['table_cell', 'table_header']
+
 /** 内置 `remarkPreserveEmptyLinePlugin` 会删除的 `<br>` 写法（trim 后精确匹配）。 */
 const BR_VALUES = ['<br />', '<br>', '<br >', '<br/>']
 
@@ -128,7 +134,7 @@ const hardbreakOrderPlugin = (ctx: any) => async () => {
  * 把节点降级成内置 hardbreak —— 于是段落里变 `\`+换行、表格里被压成空格，
  * 修复等于白做。提高 priority 后由属性选择器精确命中，稳定拿回本节点。
  */
-export const xynoteHardbreakSchema = $nodeSchema('xynoteHardbreak', () => ({
+export const xynoteHardbreakSchema = $nodeSchema(HARDBREAK_NODE_NAME, () => ({
   inline: true,
   group: 'inline',
   atom: true,

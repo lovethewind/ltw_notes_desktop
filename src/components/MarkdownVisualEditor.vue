@@ -169,7 +169,7 @@ import { AllSelection, TextSelection } from '@milkdown/kit/prose/state'
 import { Decoration, DecorationSet, type EditorView as ProseMirrorView } from '@milkdown/kit/prose/view'
 import { markdownToSlice, replaceAll } from '@milkdown/kit/utils'
 import { installXynoteEmbedFeature } from '../editor/xynote-embed'
-import { installHardbreakFeature } from '../editor/xynote-hardbreak'
+import { HARDBREAK_NODE_NAME, TABLE_CELL_NODE_NAMES, installHardbreakFeature } from '../editor/xynote-hardbreak'
 import { Icon } from '@iconify/vue'
 import { defineAsyncComponent, h, nextTick, onBeforeUnmount, onMounted, ref, render, watch } from 'vue'
 import { extractMarkdownOutline, type MarkdownOutlineItem } from '../utils/markdown-outline'
@@ -1432,13 +1432,66 @@ function closeLinkSuggest(): void {
 }
 
 /**
+ * 光标是否落在表格单元格内。
+ *
+ * 与源码编辑器 `MarkdownSourceEditor.vue` 的 `isInsideTableRow` 对称：
+ * 那里按「物理行是否以 `|` 开头」判断，这里按 ProseMirror 祖先节点判断。
+ *
+ * :param view: ProseMirror 视图。
+ * :return: 是 / 否。
+ */
+function isSelectionInTableCell(view: ProseMirrorView): boolean {
+  const { $from } = view.state.selection
+  for (let depth = $from.depth; depth > 0; depth -= 1) {
+    if (TABLE_CELL_NODE_NAMES.includes($from.node(depth).type.name)) return true
+  }
+  return false
+}
+
+/**
+ * 在表格单元格内用 `Shift+Enter` 插入硬换行（`<br>`）。
+ *
+ * ## 为什么需要这个 handler
+ *
+ * Crepe 的 commonmark preset 注册了 `hardbreakFilterPlugin`
+ * （`@milkdown/preset-commonmark/lib/index.js:1984`），它读取
+ * `hardbreakFilterNodes` ctx（默认值 `["table", "code_block"]`）并**拒绝**在表格内插入 hardbreak
+ * —— 所以内置 `Shift-Enter` 在单元格里静默失效（实测：按键后既不换行也不报错）。
+ *
+ * 这里改用本项目的 `xynoteHardbreak` 内联节点，它：
+ *  - 不经 `hardbreakFilterPlugin`（该插件只拦带 `hardbreak` meta 的事务）；
+ *  - 序列化时 `toMarkdown` 回写 html 节点 `<br>`（**实测表格单元格内逐字节往返**，
+ *    而内置 hardbreak 在单元格里会被 remark-stringify 压成空格）。
+ *
+ * :param view: ProseMirror 视图。
+ * :param event: 键盘事件。
+ * :return: 是否已处理（非表格内一律返回 false，交回默认行为）。
+ */
+function insertTableCellHardBreak(view: ProseMirrorView, event: KeyboardEvent): boolean {
+  if (props.readonly) return false
+  if (event.key !== 'Enter' || !event.shiftKey) return false
+  if (!isSelectionInTableCell(view)) return false
+  const type = view.state.schema.nodes[HARDBREAK_NODE_NAME]
+  if (!type) return false
+  event.preventDefault()
+  view.dispatch(
+    view.state.tr
+      .replaceSelectionWith(type.create())
+      .scrollIntoView()
+  )
+  return true
+}
+
+/**
  * 在存在补全时拦截方向键、回车与 Esc，避免编辑器默认行为。
  *
  * :param view: ProseMirror 视图。
  * :param event: 键盘事件。
  * :return: 是否已处理。
  */
-function handleSuggestKeydown(_view: unknown, event: KeyboardEvent): boolean {
+function handleSuggestKeydown(view: unknown, event: KeyboardEvent): boolean {
+  // 表格单元格内的 Shift+Enter：抢在内置 keymap（被 hardbreakFilterPlugin 拦掉）之前接管
+  if (insertTableCellHardBreak(view as ProseMirrorView, event)) return true
   if (!linkSuggestVisible.value || !linkSuggestItems.value.length) {
     if (event.key === 'Escape' && linkSuggestVisible.value) {
       event.preventDefault()
