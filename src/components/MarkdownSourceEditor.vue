@@ -10,10 +10,12 @@
  * 组件自身不写盘，只回传正文：`emit('change', value, documentId)`。
  */
 import { Icon } from '@iconify/vue'
+import DOMPurify from 'dompurify'
 import { defaultKeymap, history, historyKeymap, indentWithTab } from '@codemirror/commands'
 import { HighlightStyle, indentOnInput, syntaxHighlighting } from '@codemirror/language'
-import { markdown } from '@codemirror/lang-markdown'
+import { markdown, markdownLanguage } from '@codemirror/lang-markdown'
 import { EditorState, StateEffect, StateField, Transaction } from '@codemirror/state'
+import { renderPreviewMarkdown, resolvePreviewImageSource } from '../utils/markdown-preview'
 import {
   Decoration,
   drawSelection,
@@ -23,10 +25,11 @@ import {
   highlightActiveLineGutter,
   highlightSpecialChars,
   keymap,
+  type Command,
   lineNumbers
 } from '@codemirror/view'
 import { tags } from '@lezer/highlight'
-import { onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 
 interface Props {
   /** 文档标识（外部文件用绝对路径），随 change 事件一并回传。 */
@@ -49,7 +52,21 @@ const emit = defineEmits<{
 }>()
 
 const container = ref<HTMLElement | null>(null)
+const previewScroller = ref<HTMLElement | null>(null)
 let view: EditorView | null = null
+
+type EditorMode = 'source' | 'preview'
+
+/**
+ * 当前模式，默认源码。
+ *
+ * 外部文件的改动会原样写回磁盘，用户第一眼要看到的就是真正落盘的内容；预览只解决「看得懂」，
+ * 不承担编辑职责。偏好不持久化：每个文件标签各自独立，打开即回到源码。
+ */
+const mode = ref<EditorMode>('source')
+
+/** 源码模式下的滚动位置，切去预览再切回来时用它复位（隐藏期间量不到真实位置）。 */
+let sourceScrollTop = 0
 
 const setFindMatches = StateEffect.define<FindMatches | null>()
 
@@ -126,6 +143,81 @@ const sourceHighlight = HighlightStyle.define([
   { tag: [tags.processingInstruction, tags.contentSeparator, tags.labelName], color: 'var(--source-editor-marker)' }
 ])
 
+/**
+ * 预览正文。只读：唯一的数据来源是 props.value，渲染结果不回流到保存链路。
+ *
+ * 渲染规则（含表格单元格的块级处理）在 `src/utils/markdown-preview.ts`，那里有独立的行为测试。
+ *
+ * :return: 已清洗的 HTML 字符串。
+ */
+function resolvePreviewHtml(): string {
+  const parsed = new DOMParser().parseFromString(renderPreviewMarkdown(props.value), 'text/html')
+  for (const image of parsed.querySelectorAll('img')) {
+    const resolved = resolvePreviewImageSource(image.getAttribute('src') ?? '', props.documentId)
+    if (resolved) image.setAttribute('src', resolved)
+  }
+  return DOMPurify.sanitize(parsed.body.innerHTML)
+}
+
+const previewHtml = computed(() => (mode.value === 'preview' ? resolvePreviewHtml() : ''))
+
+/**
+ * 切换源码 / 预览。
+ *
+ * :param next: 目标模式。
+ * :return: 无返回值。
+ */
+function switchMode(next: EditorMode): void {
+  if (next === mode.value) return
+  if (next === 'preview') {
+    // 编辑器只是被收起，不销毁：光标、选区与撤销栈都留在原处。
+    sourceScrollTop = view?.scrollDOM.scrollTop ?? 0
+    mode.value = 'preview'
+    return
+  }
+  mode.value = 'source'
+  // 容器刚从 display:none 恢复，尺寸要等下一帧才量得出来，那时设滚动位置才生效。
+  void nextTick(() => {
+    requestAnimationFrame(() => {
+      if (view) view.scrollDOM.scrollTop = sourceScrollTop
+    })
+  })
+}
+
+/** 顶部栏说明：只描述当前模式在做什么，不暗示「文件只能这样打开」。 */
+const modeHint = computed(() => (mode.value === 'preview'
+  ? '只读渲染，仅用于查看，不会改动文件'
+  : '直接编辑原文，保存时原样写回'))
+
+/**
+ * 光标是否落在表格行里。
+ *
+ * 表格行按物理行切分，单元格内不存在「行尾」概念 —— 想在一格里换行，只有写 `<br>` 一条路
+ * （行尾两空格、直接回车都会把表格拆成两行）。所以这一行里给 `Shift+Enter` 一个专用语义。
+ */
+function isInsideTableRow(state: EditorState): boolean {
+  const line = state.doc.lineAt(state.selection.main.head)
+  return line.text.trimStart().startsWith('|')
+}
+
+/**
+ * 在光标处插入 `<br>`。
+ *
+ * 只在表格行内接管，其余位置返回 false 交回默认行为 —— 普通段落里 `Shift+Enter`
+ * 仍是换行（CommonMark 里那也是硬换行，用户不会觉得别扭）。
+ */
+const insertHardBreak: Command = (target) => {
+  if (!isInsideTableRow(target.state)) return false
+  const position = target.state.selection.main.head
+  target.dispatch(target.state.update({
+    changes: { from: position, insert: '<br>' },
+    selection: { anchor: position + 4 },
+    scrollIntoView: true,
+    userEvent: 'input'
+  }))
+  return true
+}
+
 /** 按正文内容创建一个全新的编辑器状态（含独立的撤销栈）。 */
 function createState(doc: string): EditorState {
   return EditorState.create({
@@ -140,12 +232,20 @@ function createState(doc: string): EditorState {
       dropCursor(),
       indentOnInput(),
       syntaxHighlighting(sourceHighlight),
-      markdown(),
+      // 用 GFM 而非默认的 CommonMark：外部文件里表格、任务列表、删除线很常见，
+      // CommonMark 下它们不进语法树，表格会整段退化成纯文本、连竖线都不着色。
+      markdown({ base: markdownLanguage }),
       EditorView.lineWrapping,
       EditorState.tabSize.of(2),
       // 这个编辑器同时服务 .md 与 .txt（打开对话框两者都收），所以标签用中性说法。
       EditorView.contentAttributes.of({ 'aria-label': '文件源码', spellcheck: 'false' }),
-      keymap.of([...defaultKeymap, ...historyKeymap, indentWithTab]),
+      // 放在 defaultKeymap 之前：Shift+Enter 默认是换行，这里在表格行内抢先接管。
+      keymap.of([
+        { key: 'Shift-Enter', run: insertHardBreak },
+        ...defaultKeymap,
+        ...historyKeymap,
+        indentWithTab
+      ]),
       EditorView.updateListener.of((update) => {
         if (!update.docChanged) return
         emit('change', update.state.doc.toString(), props.documentId)
@@ -179,6 +279,9 @@ function collectMatches(keyword: string): Array<{ from: number, to: number }> {
  */
 function findText(keyword: string, requestedIndex: number): { count: number, index: number } {
   if (!view) return { count: 0, index: -1 }
+  // 预览模式下 CodeMirror 是收起的，匹配高亮看不见 —— 先把用户带回源码模式再定位。
+  const returnedFromPreview = mode.value === 'preview'
+  if (returnedFromPreview) switchMode('source')
   const matches = collectMatches(keyword.trim())
   if (!matches.length) {
     view.dispatch({ effects: setFindMatches.of(null) })
@@ -189,8 +292,16 @@ function findText(keyword: string, requestedIndex: number): { count: number, ind
   view.dispatch({
     effects: setFindMatches.of({ matches, active: index }),
     selection: { anchor: match.from, head: match.to },
-    scrollIntoView: true
+    // 刚切回来时容器还没量出尺寸，这一帧的滚动定位会落空，留给下面补一次。
+    scrollIntoView: !returnedFromPreview
   })
+  if (returnedFromPreview) {
+    void nextTick(() => {
+      requestAnimationFrame(() => {
+        view?.dispatch({ selection: { anchor: match.from, head: match.to }, scrollIntoView: true })
+      })
+    })
+  }
   return { count: matches.length, index }
 }
 
@@ -199,8 +310,9 @@ function clearFindHighlight(): void {
   view?.dispatch({ effects: setFindMatches.of(null) })
 }
 
-/** 当前滚动位置，供「切换标签时记住阅读位置」类逻辑复用。 */
+/** 当前可见区域的滚动位置，供「切换标签时记住阅读位置」类逻辑复用。 */
 function getScrollTop(): number {
+  if (mode.value === 'preview') return previewScroller.value?.scrollTop ?? 0
   return view?.scrollDOM.scrollTop ?? 0
 }
 
@@ -238,13 +350,48 @@ watch(
 
 <template>
   <section class="markdown-source-editor">
-    <!-- 明确告诉用户当前不是所见即所得：这里的改动会原样落盘，软件不会重排任何格式。 -->
     <header class="markdown-source-editor__bar">
-      <Icon icon="material-symbols:code" />
-      <span class="markdown-source-editor__mode">源码模式</span>
-      <span class="markdown-source-editor__hint">直接编辑原文，保存时原样写回，不做格式重排</span>
+      <Icon :icon="mode === 'preview' ? 'material-symbols:visibility-outline' : 'material-symbols:code'" />
+      <span class="markdown-source-editor__mode">{{ mode === 'preview' ? '预览模式' : '源码模式' }}</span>
+      <span class="markdown-source-editor__hint">{{ modeHint }}</span>
+      <!--
+        两种模式看的是同一份正文：源码模式负责写盘，预览只读渲染。
+        来回切换不会改动文件，所以这里不需要「放弃/应用」之类的确认。
+      -->
+      <div class="markdown-source-editor__modes" role="group" aria-label="显示模式">
+        <button
+          type="button"
+          class="markdown-source-editor__mode-button"
+          :class="{ 'is-active': mode === 'source' }"
+          :aria-pressed="mode === 'source'"
+          @click="switchMode('source')"
+        >
+          源码
+        </button>
+        <button
+          type="button"
+          class="markdown-source-editor__mode-button"
+          :class="{ 'is-active': mode === 'preview' }"
+          :aria-pressed="mode === 'preview'"
+          @click="switchMode('preview')"
+        >
+          预览
+        </button>
+      </div>
     </header>
-    <div ref="container" class="markdown-source-editor__code"></div>
+    <!-- 切去预览时只是收起，不卸载：销毁会连光标、选区与撤销栈一起丢掉。 -->
+    <div
+      ref="container"
+      class="markdown-source-editor__code"
+      :class="{ 'is-collapsed': mode === 'preview' }"
+    ></div>
+    <!-- 预览只读渲染，数据只从 props.value 来，不回流保存链路。 -->
+    <div
+      v-if="mode === 'preview'"
+      ref="previewScroller"
+      class="markdown-source-editor__preview"
+      v-html="previewHtml"
+    ></div>
   </section>
 </template>
 
@@ -272,6 +419,9 @@ watch(
   --source-editor-marker: #93a3b8;
   --source-editor-find: rgba(255, 205, 92, .42);
   --source-editor-find-active: rgba(255, 158, 44, .62);
+  /* 预览用的两块色：面板底（代码块 / 表头 / 行内码）与分隔线（表格 / 引用 / 分割线）。 */
+  --source-editor-panel: rgba(240, 245, 252, .72);
+  --source-editor-rule: #e2eaf4;
   min-width: 0;
   min-height: 0;
   display: flex;
@@ -298,6 +448,8 @@ html[data-theme="dark"] .markdown-source-editor {
   --source-editor-marker: #6b7f97;
   --source-editor-find: rgba(214, 168, 62, .38);
   --source-editor-find-active: rgba(244, 152, 42, .55);
+  --source-editor-panel: rgba(12, 24, 42, .72);
+  --source-editor-rule: #223349;
 }
 
 .markdown-source-editor__bar {
@@ -318,6 +470,118 @@ html[data-theme="dark"] .markdown-source-editor {
 .markdown-source-editor__mode { color: #6f8299; letter-spacing: .12em; }
 .markdown-source-editor__hint { min-width: 0; flex: 1; overflow: hidden; color: #a9b5c5; font-weight: 500; letter-spacing: 0; text-overflow: ellipsis; white-space: nowrap; }
 .markdown-source-editor__code { min-height: 0; flex: 1; display: flex; }
+/* 切去预览时收起编辑器。用 display 而不是卸载：光标、选区、撤销栈都留在原处。 */
+.markdown-source-editor__code.is-collapsed { display: none; }
+
+/* 模式切换：按钮组固定在右侧，中间的说明文字先让位（窄窗口下按钮始终可点）。 */
+.markdown-source-editor__modes {
+  flex: 0 0 auto;
+  display: flex;
+  gap: 2px;
+  padding: 2px;
+  border-radius: 7px;
+  background: rgba(47, 128, 237, .07);
+}
+.markdown-source-editor__mode-button {
+  padding: 3px 9px;
+  border: 0;
+  border-radius: 5px;
+  background: none;
+  color: #7d8b9e;
+  font-family: inherit;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0;
+  cursor: pointer;
+}
+.markdown-source-editor__mode-button:hover { color: #4a7fc1; }
+.markdown-source-editor__mode-button.is-active { background: #fff; color: #2268c7; }
+html[data-theme="dark"] .markdown-source-editor__modes { background: rgba(120, 168, 235, .12); }
+html[data-theme="dark"] .markdown-source-editor__mode-button { color: #8496ad; }
+html[data-theme="dark"] .markdown-source-editor__mode-button:hover { color: #9dc3f2; }
+html[data-theme="dark"] .markdown-source-editor__mode-button.is-active { background: #1b2b42; color: #a9cdf7; }
+
+/* 预览区：只读渲染，自己滚动。v-html 的内容也命中这里（本组件样式刻意非 scoped）。 */
+.markdown-source-editor__preview {
+  min-height: 0;
+  flex: 1;
+  overflow: auto;
+  padding: 22px 26px 80px;
+  background: var(--source-editor-bg);
+  color: var(--source-editor-text);
+  font-size: 13.5px;
+  line-height: 1.75;
+  word-break: break-word;
+}
+.markdown-source-editor__preview > *:first-child { margin-top: 0; }
+.markdown-source-editor__preview > *:last-child { margin-bottom: 0; }
+.markdown-source-editor__preview h1,
+.markdown-source-editor__preview h2,
+.markdown-source-editor__preview h3,
+.markdown-source-editor__preview h4,
+.markdown-source-editor__preview h5,
+.markdown-source-editor__preview h6 {
+  margin: 20px 0 8px;
+  color: var(--source-editor-heading);
+  font-weight: 700;
+  line-height: 1.35;
+}
+.markdown-source-editor__preview h1 { font-size: 20px; }
+.markdown-source-editor__preview h2 { font-size: 17px; }
+.markdown-source-editor__preview h3 { font-size: 15px; }
+.markdown-source-editor__preview h4,
+.markdown-source-editor__preview h5,
+.markdown-source-editor__preview h6 { font-size: 13.5px; }
+.markdown-source-editor__preview p { margin: 0 0 10px; }
+.markdown-source-editor__preview ul,
+.markdown-source-editor__preview ol { margin: 0 0 10px; padding-left: 22px; }
+.markdown-source-editor__preview li { margin: 3px 0; }
+.markdown-source-editor__preview a { color: var(--source-editor-link); text-decoration: none; }
+.markdown-source-editor__preview a:hover { text-decoration: underline; }
+.markdown-source-editor__preview strong { color: var(--source-editor-strong); }
+.markdown-source-editor__preview code {
+  padding: 1px 5px;
+  border-radius: 4px;
+  background: var(--source-editor-panel);
+  color: var(--source-editor-code);
+  font-family: ui-monospace, "SFMono-Regular", Menlo, monospace;
+  font-size: 12px;
+}
+.markdown-source-editor__preview pre {
+  margin: 0 0 12px;
+  padding: 12px 14px;
+  border: 1px solid var(--source-editor-rule);
+  border-radius: 8px;
+  background: var(--source-editor-panel);
+  overflow-x: auto;
+}
+.markdown-source-editor__preview pre code { padding: 0; background: none; color: var(--source-editor-text); }
+.markdown-source-editor__preview blockquote {
+  margin: 0 0 12px;
+  padding: 2px 0 2px 12px;
+  border-left: 3px solid var(--source-editor-rule);
+  color: var(--source-editor-quote);
+}
+.markdown-source-editor__preview img { max-width: 100%; border-radius: 8px; }
+.markdown-source-editor__preview hr { margin: 18px 0; border: 0; border-top: 1px solid var(--source-editor-rule); }
+.markdown-source-editor__preview table {
+  width: 100%;
+  margin: 0 0 12px;
+  border-collapse: collapse;
+  font-size: 12.5px;
+}
+.markdown-source-editor__preview th,
+.markdown-source-editor__preview td {
+  padding: 6px 9px;
+  border: 1px solid var(--source-editor-rule);
+  text-align: left;
+  vertical-align: top;
+}
+.markdown-source-editor__preview th {
+  background: var(--source-editor-panel);
+  color: var(--source-editor-heading);
+  font-weight: 700;
+}
 
 html[data-theme="dark"] .markdown-source-editor__bar { border-color: #223349; color: #6d8098; }
 html[data-theme="dark"] .markdown-source-editor__mode { color: #8fa5bd; }

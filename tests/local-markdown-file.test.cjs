@@ -37,8 +37,22 @@ test('源码编辑器不引入任何 Markdown 解析/序列化实现', () => {
   assert.match(source, /from '@codemirror\/view'/)
   assert.match(source, /from '@codemirror\/lang-markdown'/)
   assert.doesNotMatch(source, /@milkdown/)
-  assert.doesNotMatch(source, /from 'marked'/)
   assert.doesNotMatch(source, /remark-/)
+
+  /*
+   * marked / DOMPurify 只允许服务「预览」这一个方向：把窗口里的 Markdown 渲染成只读 HTML。
+   * 保存方向（CodeMirror 文档 → emit('change')）必须继续走原文，逐字节写回磁盘。
+   * 这条不变量由 tests/markdown-preview-mode.test.cjs 更严格地守着；
+   * 这里只兜底：解析器不许出现在任何回传正文的代码行上。
+   */
+  const emitLines = source
+    .split('\n')
+    .filter((line) => line.includes("emit('change'"))
+    .filter((line) => !line.trim().startsWith('*') && !line.trim().startsWith('//'))
+  assert.ok(emitLines.length > 0)
+  for (const line of emitLines) {
+    assert.doesNotMatch(line, /marked|DOMPurify/, `回传正文的代码行不该经过 Markdown 解析器：${line.trim()}`)
+  }
 })
 
 test('源码编辑器把编辑器原文原样回传，不做规范化', () => {
