@@ -9,6 +9,7 @@ const {
   createPortableBackupArchive,
   createMarkdownDocument,
   createMarkdownZip,
+  extractLocalImageReferences,
   parsePortableBackupArchive,
   parseMarkdownDocument,
   sanitizeFileName
@@ -253,4 +254,69 @@ test("单篇Markdown导出不再内嵌Base64资源", () => {
 
   assert.match(functionSource, /expandAssetReferences/)
   assert.doesNotMatch(functionSource, /embedLocalImageData/)
+})
+
+test("单文件导入：只挑出本地相对路径图片，跳过网络图与锚点", () => {
+  const content = [
+    '# 标题',
+    '',
+    '![本地](./images/a.png)',
+    '![子目录](sub/b.jpg)',
+    '![带转义](images/%E4%B8%AD%E6%96%87.png)',
+    '![网络图](https://example.com/c.png)',
+    '![data](data:image/png;base64,AAAA)',
+    '![锚点](#section)',
+    '<img src="html-d.png" alt="HTML 写法">',
+    '<img src="https://example.com/e.png">',
+    ''
+  ].join('\n')
+
+  // 两边都排序：extractLocalImageReferences 的返回顺序取决于正则扫描次序，
+  // 这里只关心「收了哪些」，不关心次序（避免把实现细节写死进断言）。
+  assert.deepEqual(
+    extractLocalImageReferences(content).sort(),
+    ['html-d.png', 'images/a.png', 'images/中文.png', 'sub/b.jpg'].sort()
+  )
+})
+
+test("单文件导入：没有图片引用时返回空数组，不误收普通链接", () => {
+  const content = '[普通链接](https://example.com)\n\n正文没有图片\n'
+  assert.deepEqual(extractLocalImageReferences(content), [])
+})
+
+test("单文件导入入口：独立 IPC、不建来源文件夹、并搬移本地图片", () => {
+  const mainSource = readFileSync(resolve(__dirname, "../electron/main.cjs"), "utf8")
+  const preloadSource = readFileSync(resolve(__dirname, "../electron/preload.cjs"), "utf8")
+  const handlerSource = readFileSync(resolve(__dirname, "../electron/ipc-handlers.cjs"), "utf8")
+
+  // 主进程：单文件走独立函数，且以空来源名调用（= 不建来源文件夹）
+  assert.match(mainSource, /async function importSingleMarkdownFile\(folderId\)/)
+  assert.match(mainSource, /filters:\s*\[\{\s*name:\s*"Markdown 文件",\s*extensions:\s*\["md",\s*"markdown"\]\s*\}\]/)
+  assert.match(mainSource, /importSingleMarkdown:\s*importSingleMarkdownFile/)
+
+  // 单文件收集图片并做目录穿越防护
+  assert.match(mainSource, /async function collectSingleMarkdownDocument\(filePath\)/)
+  assert.match(mainSource, /extractLocalImageReferences\(document\.content\)/)
+  assert.match(mainSource, /absolutePath\.startsWith\(rootDirectory \+ path\.sep\)/)
+
+  // IPC 与 preload 三处都要有，缺一处就断链
+  assert.match(handlerSource, /"data:import-single-markdown"/)
+  assert.match(preloadSource, /importSingleMarkdown:\s*\(folderId\)\s*=>\s*ipcRenderer\.invoke\("data:import-single-markdown",\s*folderId\)/)
+})
+
+test("导入导出面板提供「单个 Markdown 文件」入口，且位置窗口按入口切换动作", () => {
+  const appSource = readFileSync(resolve(__dirname, "../src/App.vue"), "utf8")
+
+  // 面板里两个入口都要在，且各自带上正确的模式
+  assert.match(appSource, /导入 Markdown 文件夹或 ZIP/)
+  assert.match(appSource, /导入单个 Markdown 文件/)
+  assert.match(appSource, /openMarkdownImportTarget\('single'\)/)
+  assert.match(appSource, /openMarkdownImportTarget\('folder'\)/)
+
+  // 位置窗口按模式切换提示文案与确认按钮，避免点「单个文件」却看到文件夹的说法
+  assert.match(appSource, /markdownImportTargetMode === 'single' \? 'tabler:file-download' : 'tabler:folder-down'/)
+  assert.match(appSource, /@click="importSingleMarkdownNote"/)
+
+  // 渲染层必须真的调到新 IPC，否则 UI 是死的
+  assert.match(appSource, /window\.notesDesktop\.importSingleMarkdown\(targetFolderId\)/)
 })

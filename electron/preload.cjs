@@ -208,6 +208,7 @@ contextBridge.exposeInMainWorld("notesDesktop", {
   exportSelectedMarkdown: (noteIds) => ipcRenderer.invoke("data:export-selected-markdown", noteIds),
   exportFullBackup: () => ipcRenderer.invoke("data:export-backup"),
   importMarkdown: (folderId) => ipcRenderer.invoke("data:import-markdown", folderId),
+  importSingleMarkdown: (folderId) => ipcRenderer.invoke("data:import-single-markdown", folderId),
   importFullBackup: () => ipcRenderer.invoke("data:import-backup"),
   /**
    * 监听菜单栏打开导入导出窗口的请求。

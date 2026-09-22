@@ -90,6 +90,7 @@ function registerDataTransferHandlers(ipcMain, domain) {
   ipcMain.handle("data:export-selected-markdown", (_event, noteIds) => domain.exportSelected(noteIds))
   ipcMain.handle("data:export-backup", domain.exportBackup)
   ipcMain.handle("data:import-markdown", (_event, folderId) => domain.importMarkdown(folderId || null))
+  ipcMain.handle("data:import-single-markdown", (_event, folderId) => domain.importSingleMarkdown(folderId || null))
   ipcMain.handle("data:import-backup", domain.importBackup)
 }
 

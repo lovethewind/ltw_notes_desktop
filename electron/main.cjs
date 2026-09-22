@@ -23,6 +23,8 @@ const {
   createMarkdownDocument,
   createMarkdownZip,
   createPortableBackupArchive,
+  extractLocalImageReferences,
+  getMimeType,
   parsePortableBackupArchive,
   parseMarkdownDocument,
   sanitizeFileName
@@ -1504,6 +1506,81 @@ async function collectMarkdownDocuments(rootPath, currentPath = rootPath) {
 }
 
 /**
+ * 读取单个 Markdown 文件，并收集它引用的本地图片资源。
+ *
+ * 与文件夹导入的差别：单文件导入**不建来源文件夹**（一篇笔记而已，多套一层目录很啰嗦），
+ * 但**图片要一并搬进来** —— 这是它相对「复制粘贴正文」的主要价值：粘贴只带文字，
+ * 图片会全部断链。资源与正文同目录或在其子目录时才算命中。
+ *
+ * @param {string} filePath 选中的 Markdown 文件绝对路径。
+ * @returns {Promise<{ document: Record<string, any>, resourceCount: number }>} 文档与资源数量。
+ */
+async function collectSingleMarkdownDocument(filePath) {
+  const content = await fs.promises.readFile(filePath, "utf8")
+  const rootDirectory = path.dirname(filePath)
+  const document = {
+    ...parseMarkdownDocument(content, path.basename(filePath, path.extname(filePath))),
+    folderPath: []
+  }
+
+  // 只认正文里真正出现过的相对路径引用，避免把同目录无关文件一并打包。
+  const referenced = extractLocalImageReferences(document.content)
+  if (!referenced.length) return { document, resourceCount: 0 }
+
+  const resources = []
+  for (const relativePath of referenced) {
+    const absolutePath = path.resolve(rootDirectory, relativePath)
+    // 防目录穿越：只允许读取所选文件所在目录（含子目录）内的资源。
+    if (!absolutePath.startsWith(rootDirectory + path.sep)) continue
+    try {
+      const stats = await fs.promises.stat(absolutePath)
+      if (!stats.isFile()) continue
+      resources.push({
+        fileName: path.basename(absolutePath),
+        mimeType: getMimeType(absolutePath),
+        sourceUrl: relativePath,
+        data: await fs.promises.readFile(absolutePath)
+      })
+    } catch (error) {
+      if (error?.code !== "ENOENT") throw error
+    }
+  }
+  if (resources.length) document.resources = resources
+  return { document, resourceCount: resources.length }
+}
+
+/**
+ * 选择单个 Markdown 文件并导入指定文件夹。
+ *
+ * @param {string | null} folderId 目标文件夹 ID。
+ * @returns {Promise<Record<string, any>>} 导入结果。
+ */
+async function importSingleMarkdownFile(folderId) {
+  const result = await dialog.showOpenDialog(mainWindow, {
+    title: "导入 Markdown 文件",
+    properties: ["openFile"],
+    filters: [{ name: "Markdown 文件", extensions: ["md", "markdown"] }]
+  })
+  if (result.canceled || !result.filePaths[0]) return { canceled: true }
+  const filePath = result.filePaths[0]
+  const { document, resourceCount } = await collectSingleMarkdownDocument(filePath)
+  if (!String(document.content || "").trim()) throw new Error("所选文件没有可导入的内容")
+  await restoreMarkdownResources([document])
+  const imported = applyLocalMutation(() => repository.importMarkdownDocuments(
+    [document],
+    folderId,
+    ""
+  ))
+  mainWindow?.webContents.send("workspace:changed")
+  const resourceSuffix = resourceCount ? `，${resourceCount} 个图片资源` : ""
+  return {
+    canceled: false,
+    message: `已导入“${document.title}”${resourceSuffix}`,
+    ...imported
+  }
+}
+
+/**
  * 选择 Markdown 文件夹或 ZIP 压缩包并导入指定文件夹。
  *
  * @param {string | null} folderId 目标文件夹 ID。
@@ -2205,6 +2282,7 @@ function registerIpcHandlers() {
       exportSelected: exportSelectedMarkdown,
       exportBackup: exportFullBackup,
       importMarkdown: importMarkdownFiles,
+      importSingleMarkdown: importSingleMarkdownFile,
       importBackup: importFullBackup
     },
     backups: {

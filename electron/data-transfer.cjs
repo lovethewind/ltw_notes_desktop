@@ -35,6 +35,42 @@ function getMimeType(fileName) {
   return EXTENSION_MIME_TYPES.get(path.extname(String(fileName || "")).toLowerCase()) || "application/octet-stream"
 }
 
+/**
+ * 从 Markdown 正文里挑出**本地相对路径**的图片引用。
+ *
+ * 单文件导入靠它决定要一并搬运哪些图片。只收 `![]()` 里的相对路径：
+ *  - 带协议的（http/https/data/file）是网络图或绝对路径，不属于「搬进来」的范围；
+ *  - `#` 开头的是页内锚点，不是文件；
+ *  - 同时支持 `<img src="...">`，有些编辑器会写成 HTML。
+ *
+ * @param {unknown} content Markdown 正文。
+ * @returns {string[]} 去重后的相对路径（已去掉 `./` 前缀并解码 %20 一类转义）。
+ */
+function extractLocalImageReferences(content) {
+  const markdown = String(content || "")
+  const references = new Set()
+  const patterns = [
+    /!\[[^\]]*\]\(([^)\s]+)/g,
+    /<img\b[^>]*\bsrc=["']([^"']+)["']/gi
+  ]
+  for (const pattern of patterns) {
+    for (const match of markdown.matchAll(pattern)) {
+      const target = String(match[1] || "").trim()
+      if (!target) continue
+      if (/^[a-z][a-z0-9+.-]*:/i.test(target)) continue
+      if (target.startsWith("#") || target.startsWith("//")) continue
+      let decoded = target
+      try {
+        decoded = decodeURIComponent(target)
+      } catch {
+        // 非法转义就按原文处理，不因此丢掉这张图。
+      }
+      references.add(decoded.replace(/^\.\//, ""))
+    }
+  }
+  return [...references]
+}
+
 function assertSafeArchivePath(entryName) {
   const normalized = String(entryName || "").replace(/\\/g, "/")
   const pathParts = normalized.split("/").filter(Boolean)
@@ -359,6 +395,8 @@ module.exports = {
   createMarkdownDocument,
   createMarkdownZip,
   createPortableBackupArchive,
+  extractLocalImageReferences,
+  getMimeType,
   parsePortableBackupArchive,
   parseMarkdownDocument,
   sanitizeFileName

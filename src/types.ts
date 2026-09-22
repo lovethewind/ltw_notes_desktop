@@ -497,6 +497,8 @@ export interface NotesDesktopApi {
   exportSelectedMarkdown(noteIds: string[]): Promise<DataTransferResult>
   exportFullBackup(): Promise<DataTransferResult>
   importMarkdown(folderId: string | null): Promise<DataTransferResult>
+  /** 导入单个 Markdown 文件（含其引用的本地图片），不建来源文件夹。 */
+  importSingleMarkdown(folderId: string | null): Promise<DataTransferResult>
   importFullBackup(): Promise<DataTransferResult>
   /** 监听菜单栏打开导入导出窗口的请求。 */
   onOpenDataTransfer(callback: () => void): () => void

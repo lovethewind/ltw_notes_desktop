@@ -226,6 +226,13 @@ const databaseBackupStatus = reactive<DatabaseBackupStatus>({
 })
 const markdownImportTargetVisible = ref(false)
 const markdownImportTargetFolderId = ref<string | null>(null)
+/**
+ * 位置选择窗口当前服务的导入方式。
+ *
+ * 两种入口（单个文件 / 文件夹或 ZIP）共用同一个位置窗口，靠它决定底部按钮调哪个 IPC，
+ * 也决定文案 —— 免得用户点「单个文件」却看到「文件夹」的说法。
+ */
+const markdownImportTargetMode = ref<'single' | 'folder'>('folder')
 const duplicateNoteVisible = ref(false)
 const duplicateNoteBusy = ref(false)
 const duplicateNoteSource = ref<OfflineNote | null>(null)
@@ -1044,9 +1051,11 @@ async function exportCompleteBackup(): Promise<void> {
 /**
  * 打开 Markdown 导入位置选择窗口。
  *
+ * :param mode: 导入方式；'single' = 单个文件，'folder' = 文件夹或 ZIP。
  * :return: 无返回值。
  */
-function openMarkdownImportTarget(): void {
+function openMarkdownImportTarget(mode: 'single' | 'folder' = 'folder'): void {
+  markdownImportTargetMode.value = mode
   markdownImportTargetFolderId.value = null
   markdownImportTargetVisible.value = true
 }
@@ -1060,6 +1069,20 @@ async function importMarkdownNotes(): Promise<void> {
   const targetFolderId = markdownImportTargetFolderId.value
   markdownImportTargetVisible.value = false
   await runDataTransfer(() => window.notesDesktop.importMarkdown(targetFolderId), true)
+}
+
+/**
+ * 选择单个 Markdown 文件导入指定位置（连同它引用的本地图片）。
+ *
+ * 与「文件夹 / ZIP」共用同一个位置选择窗口，只是最后调用的 IPC 不同 ——
+ * 单文件不建来源文件夹，也不递归目录。
+ *
+ * :return: 操作完成后的 Promise。
+ */
+async function importSingleMarkdownNote(): Promise<void> {
+  const targetFolderId = markdownImportTargetFolderId.value
+  markdownImportTargetVisible.value = false
+  await runDataTransfer(() => window.notesDesktop.importSingleMarkdown(targetFolderId), true)
 }
 
 /**
@@ -4774,9 +4797,13 @@ onBeforeUnmount(() => {
         <h2>导入导出</h2>
         <p>完整备份用于本应用恢复；通用 Markdown 用于其他软件，资源文件随 ZIP 保存。</p>
         <div class="data-transfer-grid">
-          <button class="markdown-folder-import-action" type="button" :disabled="dataTransferBusy" @click="openMarkdownImportTarget">
+          <button class="markdown-folder-import-action" type="button" :disabled="dataTransferBusy" @click="openMarkdownImportTarget('folder')">
             <Icon icon="tabler:folder-down" />
             <span><strong>导入 Markdown 文件夹或 ZIP</strong><small>恢复 ZIP 内相对资源并保留目录层级</small></span>
+          </button>
+          <button class="markdown-file-import-action" type="button" :disabled="dataTransferBusy" @click="openMarkdownImportTarget('single')">
+            <Icon icon="tabler:file-download" />
+            <span><strong>导入单个 Markdown 文件</strong><small>连图片一起搬进来，不额外建文件夹</small></span>
           </button>
           <button type="button" :disabled="dataTransferBusy || !activeNote" @click="exportCurrentNoteMarkdown">
             <Icon icon="tabler:file-export" />
@@ -4873,9 +4900,10 @@ onBeforeUnmount(() => {
     <div v-if="markdownImportTargetVisible" class="dialog-backdrop import-target-backdrop" @click.self="markdownImportTargetVisible = false">
       <section class="folder-dialog import-target-dialog" role="dialog" aria-modal="true" aria-label="选择导入位置">
         <button class="dialog-close-button" type="button" aria-label="关闭导入位置窗口" @click="markdownImportTargetVisible = false"><Icon icon="tabler:x" /></button>
-        <div class="dialog-icon"><Icon icon="tabler:folder-down" /></div>
+        <div class="dialog-icon"><Icon :icon="markdownImportTargetMode === 'single' ? 'tabler:file-download' : 'tabler:folder-down'" /></div>
         <h2>选择导入位置</h2>
-        <p>来源同名文件夹已存在时会合并目录并新增笔记，不会覆盖原有笔记。</p>
+        <p v-if="markdownImportTargetMode === 'single'">单个文件导入不额外建文件夹，正文里引用的本地图片会一并搬进来。</p>
+        <p v-else>来源同名文件夹已存在时会合并目录并新增笔记，不会覆盖原有笔记。</p>
         <div class="import-target-list" role="listbox" aria-label="Markdown 导入位置">
           <button
             :class="['folder-picker-option', { selected: markdownImportTargetFolderId === null }]"
@@ -4901,7 +4929,18 @@ onBeforeUnmount(() => {
         </div>
         <div>
           <button type="button" @click="markdownImportTargetVisible = false">取消</button>
-          <button class="primary" type="button" @click="importMarkdownNotes">选择文件夹或 ZIP 压缩包</button>
+          <button
+            v-if="markdownImportTargetMode === 'single'"
+            class="primary"
+            type="button"
+            @click="importSingleMarkdownNote"
+          >选择 Markdown 文件</button>
+          <button
+            v-else
+            class="primary"
+            type="button"
+            @click="importMarkdownNotes"
+          >选择文件夹或 ZIP 压缩包</button>
         </div>
       </section>
     </div>
