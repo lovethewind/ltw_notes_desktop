@@ -210,6 +210,20 @@ test('字号接线：下拉面板与选项有独立样式，且选中项有打�
     '触发器不应显示 data-label 文案'
   )
 
+  // ⚠️ 触发器布局规则必须比通用 `.top-bar-item` 多一级特异性（用 `>`）。
+  // 两者同为 4 类时，声明更靠后的 `.top-bar-item`（flex-direction: column）会胜出，
+  // 触发器被压成竖排 + 内边距被 2px 覆盖 —— 09-23 用户截图反馈「菜单有点窄」的根因。
+  assert.match(
+    css,
+    /\.markdown-font-size-menu\s*>\s*\.markdown-font-size-menu__toggle\s*\{[^}]*flex-direction:\s*row/,
+    '触发器规则应带 `>` 提升特异性，否则会被 .top-bar-item 的 column 覆盖'
+  )
+  assert.match(
+    css,
+    /\.markdown-font-size-menu\s*>\s*\.markdown-font-size-menu__toggle\s*\{[^}]*height:\s*34px/,
+    '触发器高度应显式声明（通用 .top-bar-item 的 40px 会干扰）'
+  )
+
   // ⚠️ 选项文字必须是真实文本节点，不能靠 ::after { content: attr(data-label) }。
   // 伪元素内容不进 textContent —— 读屏与 e2e 都会读到空字符串（本轮真踩过）。
   assert.match(source, /option\.textContent\s*=\s*String\(size\)/, '选项应用真实文本节点渲染数值')

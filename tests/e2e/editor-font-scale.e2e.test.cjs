@@ -123,6 +123,39 @@ test('字号下拉：挂在「一级标题」之后，选中即改变正文字�
       `字号下拉应在「一级标题」右侧：标题右缘 ${placement.headingRight}，下拉左缘 ${placement.menuLeft}`
     )
 
+    // 触发器布局：数值与箭头必须**横排**。
+    // ⚠️ 通用 `.top-bar-item` 是 `flex-direction: column` 且特异性相同、声明更靠后，
+    // 字号下拉若不加一级特异性会被覆盖成竖排（09-23 用户截图反馈「菜单有点窄」即此）。
+    // 这条断言直接量计算样式，别只测源码字符串。
+    const toggleLayout = await page.evaluate(() => {
+      const toggle = document.querySelector('.markdown-font-size-menu__toggle')
+      if (!toggle) return null
+      const style = window.getComputedStyle(toggle)
+      const rect = toggle.getBoundingClientRect()
+      const value = toggle.querySelector('.markdown-font-size-menu__value')
+      const chevron = toggle.querySelector('.markdown-font-size-menu__chevron')
+      const valueRect = value?.getBoundingClientRect()
+      const chevronRect = chevron?.getBoundingClientRect()
+      return {
+        flexDirection: style.flexDirection,
+        width: Math.round(rect.width),
+        height: Math.round(rect.height),
+        valueCenterY: valueRect ? valueRect.top + valueRect.height / 2 : null,
+        chevronCenterY: chevronRect ? chevronRect.top + chevronRect.height / 2 : null
+      }
+    })
+    assert.ok(toggleLayout, '应能找到字号下拉触发器')
+    assert.equal(toggleLayout.flexDirection, 'row', '触发器应为横排（不被 .top-bar-item 的 column 覆盖）')
+    assert.ok(
+      toggleLayout.width >= 54,
+      `触发器不应被压得过窄，实际 ${toggleLayout.width}px`
+    )
+    // 横排的直接证据：数值与箭头垂直中心几乎重合（竖排时会差十几像素）。
+    assert.ok(
+      Math.abs(toggleLayout.valueCenterY - toggleLayout.chevronCenterY) <= 3,
+      `数值与箭头应水平对齐：数值中心 ${toggleLayout.valueCenterY}，箭头中心 ${toggleLayout.chevronCenterY}`
+    )
+
     const before = await readBodyFontSize(page)
     assert.ok(before && before > 0, `应能读到正文字号，实际 ${before}`)
     assert.equal(before, 15, '默认正文应为 15px')
