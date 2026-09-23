@@ -20,13 +20,14 @@
 /**
  * 可选字号档位（px）。
  *
- * 下限 13 保证再小也还能读，上限 20 避免正文比标题还大；
- * 默认档 15 对齐钉钉正文观感（Crepe 原始默认是 16）。
+ * 取值对齐钉钉文档的字号下拉（9/10/11/12/14/16/18/20/22），
+ * 但**额外补一个 15** —— 它是本项目正文的既有基准（Crepe 原始默认是 16），
+ * 标题与表格字号都以它为基准 `calc` 等比换算，少了 15 会让默认档无处安放。
  */
-export const FONT_SCALE_STEPS = [13, 14, 15, 16, 17, 18, 20] as const
+export const FONT_SCALE_STEPS = [9, 10, 11, 12, 14, 15, 16, 18, 20, 22] as const
 
 /** 默认档位下标，指向 15px。 */
-export const DEFAULT_FONT_SCALE_INDEX = 2
+export const DEFAULT_FONT_SCALE_INDEX = 5
 
 /** localStorage 键名。 */
 export const FONT_SCALE_STORAGE_KEY = 'notes-editor-font-size'
@@ -39,27 +40,28 @@ export function fontSizeAt(index: number): number {
   return FONT_SCALE_STEPS[index]
 }
 
-/** 档位是否还能朝 `delta` 方向移动（-1 缩小 / +1 放大）。 */
-export function canChangeFontSize(index: number, delta: number): boolean {
-  const next = index + delta
-  return Number.isInteger(next) && next >= 0 && next < FONT_SCALE_STEPS.length
-}
-
 /**
- * 计算新档位。
+ * 按字号反查档位下标（下拉选中态用）。
  *
- * :param index: 当前档位下标。
- * :param delta: -1 缩小 / +1 放大。
- * :return: 新档位下标；到边界时返回原值（调用方据此判断"未移动"）。
+ * 字号不在档位表里时回落到默认档 —— 历史上存过 13px/17px 这类旧档位的用户
+ * 不该看到「一个都没选中」的下拉。
+ *
+ * :param size: 字号（px）。
+ * :return: 档位下标。
  */
-export function nextFontScaleIndex(index: number, delta: number): number {
-  return canChangeFontSize(index, delta) ? index + delta : index
+export function indexOfFontSize(size: number): number {
+  const index = FONT_SCALE_STEPS.indexOf(size as (typeof FONT_SCALE_STEPS)[number])
+  return index === -1 ? DEFAULT_FONT_SCALE_INDEX : index
 }
 
 /**
  * 解析 localStorage 里存的值。
  *
- * 非数字、越界、负数一律回落到默认档 —— 历史脏数据不该让字号失控。
+ * ⚠️ **存的是字号（px）而不是档位下标**。存下标会在调整档位列表时静默串档：
+ * 旧列表里下标 2 是 15px，换成新列表后同一个 2 就变成了 11px —— 用户没动设置，
+ * 字号却自己变了。存字号则天然自解释，列表怎么改都不影响已存的值。
+ *
+ * 认不出的值（旧版下标、脏数据、负数）一律回落到默认档。
  *
  * :param stored: localStorage 取到的原始字符串（可能为 null）。
  * :return: 可用的档位下标。
@@ -67,8 +69,6 @@ export function nextFontScaleIndex(index: number, delta: number): number {
 export function parseStoredFontScale(stored: string | null): number {
   if (stored === null || stored === '') return DEFAULT_FONT_SCALE_INDEX
   const parsed = Number(stored)
-  if (!Number.isInteger(parsed) || parsed < 0 || parsed >= FONT_SCALE_STEPS.length) {
-    return DEFAULT_FONT_SCALE_INDEX
-  }
-  return parsed
+  if (!Number.isFinite(parsed)) return DEFAULT_FONT_SCALE_INDEX
+  return indexOfFontSize(parsed)
 }

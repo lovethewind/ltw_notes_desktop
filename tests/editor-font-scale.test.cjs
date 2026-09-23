@@ -33,11 +33,17 @@ test.before(async () => {
   )
 })
 
-test('字号档位：默认档是 15px，且档位单调递增', () => {
+test('字号档位：默认档是 15px，取值对齐钉钉，且档位单调递增', () => {
   const { FONT_SCALE_STEPS, DEFAULT_FONT_SCALE_INDEX } = scaleModule
   assert.equal(FONT_SCALE_STEPS[DEFAULT_FONT_SCALE_INDEX], 15, '默认正文应为 15px')
+  // 钉钉字号下拉的取值：9/10/11/12/14/16/18/20/22，本项目额外补 15 作为默认档。
+  assert.deepEqual(
+    [...FONT_SCALE_STEPS],
+    [9, 10, 11, 12, 14, 15, 16, 18, 20, 22],
+    '档位应取钉钉的列表并保留 15px 默认档'
+  )
   const sorted = [...FONT_SCALE_STEPS].sort((a, b) => a - b)
-  assert.deepEqual([...FONT_SCALE_STEPS], sorted, '档位必须单调递增，否则 A+/A- 方向会乱')
+  assert.deepEqual([...FONT_SCALE_STEPS], sorted, '档位必须单调递增，否则下拉顺序会乱')
 })
 
 test('字号档位：fontSizeAt 正常取档，越界一律回落默认档', () => {
@@ -56,40 +62,43 @@ test('字号档位：fontSizeAt 正常取档，越界一律回落默认档', () 
   assert.equal(fontSizeAt(undefined), fallback)
 })
 
-test('字号档位：到边界时 canChangeFontSize 为假，nextFontScaleIndex 原地不动', () => {
-  const { FONT_SCALE_STEPS, canChangeFontSize, nextFontScaleIndex } = scaleModule
-  const last = FONT_SCALE_STEPS.length - 1
+test('字号档位：indexOfFontSize 能反查档位，旧档位回落默认', () => {
+  const { DEFAULT_FONT_SCALE_INDEX, FONT_SCALE_STEPS, indexOfFontSize } = scaleModule
 
-  // 中间档两边都能动
-  assert.equal(canChangeFontSize(2, 1), true)
-  assert.equal(canChangeFontSize(2, -1), true)
+  assert.equal(indexOfFontSize(9), 0)
+  assert.equal(indexOfFontSize(15), DEFAULT_FONT_SCALE_INDEX)
+  assert.equal(indexOfFontSize(22), FONT_SCALE_STEPS.length - 1)
 
-  // 两端各自只有一侧可动 —— 这决定了「已经是最小/最大字号」的提示时机
-  assert.equal(canChangeFontSize(0, -1), false, '最小档不能再缩')
-  assert.equal(canChangeFontSize(0, 1), true)
-  assert.equal(canChangeFontSize(last, 1), false, '最大档不能再放大')
-  assert.equal(canChangeFontSize(last, -1), true)
-
-  // 到边界返回原值，调用方据此判断"没动"并给提示
-  assert.equal(nextFontScaleIndex(0, -1), 0)
-  assert.equal(nextFontScaleIndex(last, 1), last)
-  assert.equal(nextFontScaleIndex(2, 1), 3)
-  assert.equal(nextFontScaleIndex(2, -1), 1)
+  // 历史存过 13px/17px 这类已移除的档位时，下拉不能「一个都没选中」。
+  assert.equal(indexOfFontSize(13), DEFAULT_FONT_SCALE_INDEX, '旧档位应回落默认档')
+  assert.equal(indexOfFontSize(17), DEFAULT_FONT_SCALE_INDEX, '旧档位应回落默认档')
+  assert.equal(indexOfFontSize(Number.NaN), DEFAULT_FONT_SCALE_INDEX)
 })
 
-test('字号档位：localStorage 脏数据一律回落默认档', () => {
+test('字号档位：localStorage 存的是字号而非下标，认不出的一律回落默认档', () => {
   const { DEFAULT_FONT_SCALE_INDEX, FONT_SCALE_STEPS, parseStoredFontScale } = scaleModule
 
-  assert.equal(parseStoredFontScale('0'), 0)
-  assert.equal(parseStoredFontScale('6'), 6)
+  // 存字号 → 反查回档位。
+  assert.equal(parseStoredFontScale('9'), 0)
+  assert.equal(parseStoredFontScale('15'), DEFAULT_FONT_SCALE_INDEX)
+  assert.equal(parseStoredFontScale('22'), FONT_SCALE_STEPS.length - 1)
 
-  // 历史脏数据不该让字号失控
+  // ⚠️ 关键：旧版本存的是「档位下标」，其中 2 曾代表 15px。
+  // 现在 2 不在档位表里（档位里没有 2px 这一档），必须回落默认档 15px，
+  // 而不是被当成下标 2 解析成 11px —— 那会让用户没动设置字号却自己变了。
+  assert.equal(parseStoredFontScale('2'), DEFAULT_FONT_SCALE_INDEX, '旧下标不得被当成字号')
+  assert.equal(parseStoredFontScale('6'), DEFAULT_FONT_SCALE_INDEX, '旧下标不得被当成字号')
+
+  // 已移除的旧档位（13/17）也要回落，不能出现「一个都没选中」。
+  assert.equal(parseStoredFontScale('13'), DEFAULT_FONT_SCALE_INDEX)
+  assert.equal(parseStoredFontScale('17'), DEFAULT_FONT_SCALE_INDEX)
+
+  // 脏数据不该让字号失控。
   assert.equal(parseStoredFontScale(null), DEFAULT_FONT_SCALE_INDEX)
   assert.equal(parseStoredFontScale(''), DEFAULT_FONT_SCALE_INDEX)
   assert.equal(parseStoredFontScale('abc'), DEFAULT_FONT_SCALE_INDEX)
   assert.equal(parseStoredFontScale('-1'), DEFAULT_FONT_SCALE_INDEX)
-  assert.equal(parseStoredFontScale(String(FONT_SCALE_STEPS.length)), DEFAULT_FONT_SCALE_INDEX)
-  assert.equal(parseStoredFontScale('2.5'), DEFAULT_FONT_SCALE_INDEX)
+  assert.equal(parseStoredFontScale('999'), DEFAULT_FONT_SCALE_INDEX)
 })
 
 test('字号接线：档位以行内 CSS 变量渲染在组件根节点，而非全局 html', () => {
@@ -116,21 +125,44 @@ test('字号接线：档位以行内 CSS 变量渲染在组件根节点，而非
   )
 })
 
-test('字号接线：工具栏有放大/缩小入口，且在只读与预览下仍可用', () => {
+test('字号接线：下拉挂在「一级标题」之后，选中即设置并持久化', () => {
   const source = readSource('src/components/MarkdownVisualEditor.vue')
 
-  // ⚠️ 别用 [^)]* —— `action: () => changeFontSize(1)` 里的 `()` 会把它截断。
-  assert.match(source, /label: '放大字号'[\s\S]*?changeFontSize\(1\)/, '工具栏应有放大字号入口')
-  assert.match(source, /label: '缩小字号'[\s\S]*?changeFontSize\(-1\)/, '工具栏应有缩小字号入口')
+  // 位置：紧跟块类型选择器之后（heading.after(...)），而不是埋进「更多」菜单。
+  assert.match(
+    source,
+    /heading\.after\(createFontSizeMenu\(\)\)/,
+    '字号下拉应插在「一级标题」选择器之后'
+  )
+  // 旧的放大/缩小入口应已移除。
+  assert.doesNotMatch(source, /label: '放大字号'/, '应移除「更多」菜单里的放大字号入口')
+  assert.doesNotMatch(source, /label: '缩小字号'/, '应移除「更多」菜单里的缩小字号入口')
 
-  // previewAllowed 让按钮在只读/预览模式下不被禁用 —— 看的时候同样需要调大小。
-  const increase = source.match(/label: '放大字号'[^\n]*/)
-  const decrease = source.match(/label: '缩小字号'[^\n]*/)
-  assert.match(increase[0], /previewAllowed: true/, '放大字号应在预览下可用')
-  assert.match(decrease[0], /previewAllowed: true/, '缩小字号应在预览下可用')
+  // 取值来自模块常量，避免组件内手写一份数字列表后与档位逻辑脱节。
+  assert.match(source, /FONT_SCALE_STEPS\.forEach/, '下拉选项应由 FONT_SCALE_STEPS 生成')
+  // 选中即写 localStorage，且写的是字号（不是档位下标）—— 存下标会在档位列表
+  // 变动时静默串档（旧下标 2 曾是 15px，新列表里会变成 11px）。
+  assert.match(
+    source,
+    /function setFontSize[\s\S]*?localStorage\.setItem\(\s*FONT_SCALE_STORAGE_KEY,\s*String\(bodyFontSize\.value\)/,
+    '应把字号本身（而非档位下标）持久化到 localStorage'
+  )
+  // 下拉本身要能被开关/定位机制接管。
+  assert.match(
+    source,
+    /TOOLBAR_MENU_TOGGLE_SELECTOR\s*=\s*'[^']*\.markdown-font-size-menu__toggle/,
+    '字号下拉触发器应纳入统一的菜单开关/定位选择器'
+  )
+})
 
-  // 到边界要给提示，而不是静默无反应。
-  assert.match(source, /已经是最小字号|已经是最大字号/, '到边界应有用户提示')
+test('字号接线：字号下拉在只读与预览下仍可用（它只是显示参数）', () => {
+  const source = readSource('src/components/MarkdownVisualEditor.vue')
+
+  // 只读/预览态会批量禁用工具栏按钮，字号下拉必须被显式排除，
+  // 否则「预览时想调大字号」就点不动了。
+  const guard = source.match(/querySelectorAll<HTMLButtonElement>\(\s*'\.top-bar-heading-selector button[\s\S]*?'/)
+  assert.ok(guard, '应能找到只读态禁用工具栏按钮的守卫')
+  assert.match(guard[0], /markdown-font-size-menu__toggle/, '字号下拉应被排除在禁用列表外')
 })
 
 test('字号接线：样式表按变量缩放正文与标题，且标题不再用 Crepe 默认的 42px', () => {
@@ -163,6 +195,37 @@ test('字号接线：样式表按变量缩放正文与标题，且标题不再�
 
   // 表头底色是钉钉观感的关键差异之一。
   assert.match(css, /ProseMirror table thead th\s*\{[^}]*background:/, '表头应有底色')
+})
+
+test('字号接线：下拉面板与选项有独立样式，且选中项有打勾标记', () => {
+  const css = readSource('src/style.css')
+  const source = readSource('src/components/MarkdownVisualEditor.vue')
+
+  assert.match(css, /\.markdown-font-size-menu__panel\s*\{/, '应有下拉面板样式')
+  assert.match(css, /\.markdown-font-size-menu__item\.active::before\s*\{\s*content:\s*'✓'/, '选中项应打勾')
+  // 触发器只显示数值，不能被 top-bar-item 的 ::after 文案顶出来。
+  assert.match(
+    css,
+    /\.markdown-font-size-menu__toggle::after\s*\{\s*content:\s*none/,
+    '触发器不应显示 data-label 文案'
+  )
+
+  // ⚠️ 选项文字必须是真实文本节点，不能靠 ::after { content: attr(data-label) }。
+  // 伪元素内容不进 textContent —— 读屏与 e2e 都会读到空字符串（本轮真踩过）。
+  assert.match(source, /option\.textContent\s*=\s*String\(size\)/, '选项应用真实文本节点渲染数值')
+  assert.doesNotMatch(
+    css,
+    /\.markdown-font-size-menu__item::after\s*\{\s*content:\s*attr\(data-label\)/,
+    '选项文字不应靠伪元素渲染（textContent 取不到）'
+  )
+
+  // ⚠️ 初始选中态必须在创建选项时设置：菜单创建时尚未插入 DOM，
+  // 此时走 syncFontSizeMenu() 查询会落空，用户打开下拉会看到「一项都没打勾」。
+  assert.match(
+    source,
+    /FONT_SCALE_STEPS\.forEach[\s\S]*?option\.classList\.toggle\('active',\s*isActive\)/,
+    '初始选中态应在创建选项时直接设好，不能依赖插入 DOM 后再查询'
+  )
 })
 
 test('字号约束：字号只做显示缩放，绝不写进正文源码', () => {

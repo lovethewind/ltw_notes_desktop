@@ -173,10 +173,9 @@ import { installXynoteEmbedFeature } from '../editor/xynote-embed'
 import { HARDBREAK_NODE_NAME, TABLE_CELL_NODE_NAMES, installHardbreakFeature } from '../editor/xynote-hardbreak'
 import {
   DEFAULT_FONT_SCALE_INDEX,
+  FONT_SCALE_STEPS,
   FONT_SCALE_STORAGE_KEY,
-  canChangeFontSize,
   fontSizeAt,
-  nextFontScaleIndex,
   parseStoredFontScale
 } from '../utils/editor-font-scale'
 import { Icon } from '@iconify/vue'
@@ -349,6 +348,12 @@ let jsonFormatObserver: MutationObserver | null = null
 let toolbarObserver: MutationObserver | null = null
 let activeFindMatch: { from: number, to: number } | null = null
 const toolbarMenuPanels = new Map<HTMLElement, HTMLDivElement>()
+/**
+ * 工具栏二级菜单触发器（含「更多」「列表」「插入」与字号下拉）。
+ *
+ * 字号下拉复用了同一套开关/定位机制，但类名不同，故统一用一个选择器取触发器。
+ */
+const TOOLBAR_MENU_TOGGLE_SELECTOR = '.markdown-toolbar-menu__toggle, .markdown-font-size-menu__toggle'
 const outlineCache = new Map<string, OutlineCacheEntry>()
 const OUTLINE_STORAGE_KEY = 'markdown-outline-open'
 const OUTLINE_CACHE_LIMIT = 12
@@ -1142,7 +1147,7 @@ function syncPreviewReadonly(): void {
   }
   editorRootRef.value
     ?.querySelectorAll<HTMLButtonElement>(
-      '.top-bar-heading-selector button, .top-bar-actions .top-bar-item:not(.markdown-outline-toggle):not(.markdown-preview-toggle):not(.markdown-tools-menu-toggle)'
+      '.top-bar-heading-selector button, .top-bar-actions .top-bar-item:not(.markdown-outline-toggle):not(.markdown-preview-toggle):not(.markdown-font-size-menu__toggle):not(.markdown-tools-menu-toggle)'
     )
     .forEach((button) => {
       button.disabled = isReadonly
@@ -1173,25 +1178,23 @@ function togglePreview(): void {
 }
 
 /**
- * 调整正文显示字号。
+ * 设置正文显示字号（下拉选中）。
  *
  * 只改显示，不动正文源码 —— markdown 没有行内字号语法，把字号写进正文会污染源码、
- * 影响 Web 端渲染与 Markdown 导出。到边界时给出提示而非静默失败。
+ * 影响 Web 端渲染与 Markdown 导出。
  *
- * :param delta: 档位增量，-1 缩小、+1 放大。
+ * :param index: 目标档位下标，越界由 fontSizeAt 回落到默认档。
  * :return: 无返回值。
  */
-function changeFontSize(delta: number): void {
-  if (!canChangeFontSize(fontScaleIndex.value, delta)) {
-    showFeedback(delta < 0 ? '已经是最小字号' : '已经是最大字号')
-    return
-  }
-  fontScaleIndex.value = nextFontScaleIndex(fontScaleIndex.value, delta)
+function setFontSize(index: number): void {
+  fontScaleIndex.value = Number.isInteger(index) ? index : DEFAULT_FONT_SCALE_INDEX
   try {
-    window.localStorage.setItem(FONT_SCALE_STORAGE_KEY, String(fontScaleIndex.value))
+    // 存字号而非档位下标：档位列表日后调整时，已存的值不会被静默串档。
+    window.localStorage.setItem(FONT_SCALE_STORAGE_KEY, String(bodyFontSize.value))
   } catch {
     // 隐私模式等场景下 localStorage 可能不可写，字号仍在本会话生效，不打断用户。
   }
+  syncFontSizeMenu()
   showFeedback(`正文字号 ${bodyFontSize.value}px`)
 }
 
@@ -1792,7 +1795,7 @@ function resetDocumentHistory(crepe: Crepe): void {
 function closeToolbarMenus(): void {
   toolbarMenuPanels.forEach((panel, menu) => {
     menu.classList.remove('is-open')
-    menu.querySelector<HTMLButtonElement>('.markdown-toolbar-menu__toggle')?.setAttribute('aria-expanded', 'false')
+    menu.querySelector<HTMLButtonElement>(TOOLBAR_MENU_TOGGLE_SELECTOR)?.setAttribute('aria-expanded', 'false')
     panel.classList.remove('is-portal-open')
     panel.removeAttribute('style')
     if (panel.parentElement !== menu) menu.append(panel)
@@ -1807,14 +1810,17 @@ function closeToolbarMenus(): void {
  * :return: 无返回值。
  */
 function positionToolbarMenu(menu: HTMLElement, panel: HTMLDivElement): void {
-  const toggle = menu.querySelector<HTMLButtonElement>('.markdown-toolbar-menu__toggle')
+  const toggle = menu.querySelector<HTMLButtonElement>(TOOLBAR_MENU_TOGGLE_SELECTOR)
   if (!toggle) return
   const toggleRect = toggle.getBoundingClientRect()
   document.body.append(panel)
   panel.classList.add('is-portal-open')
   const panelWidth = panel.offsetWidth
   const centeredLeft = toggleRect.left + toggleRect.width / 2 - panelWidth / 2
-  const alignedLeft = menu.classList.contains('markdown-tools-menu') ? toggleRect.right - panelWidth : centeredLeft
+  // 「更多」与字号下拉都靠右/左对齐到触发器边缘，其余居中 —— 与各自面板的静态定位保持一致。
+  const alignedLeft = menu.classList.contains('markdown-tools-menu')
+    ? toggleRect.right - panelWidth
+    : menu.classList.contains('markdown-font-size-menu') ? toggleRect.left : centeredLeft
   const left = Math.max(12, Math.min(alignedLeft, window.innerWidth - panelWidth - 12))
   panel.style.left = `${left}px`
   panel.style.top = `${Math.min(toggleRect.bottom + 7, window.innerHeight - panel.offsetHeight - 12)}px`
@@ -1830,7 +1836,7 @@ function toggleToolbarMenu(menu: HTMLElement): void {
   const shouldOpen = !menu.classList.contains('is-open')
   closeToolbarMenus()
   menu.classList.toggle('is-open', shouldOpen)
-  menu.querySelector<HTMLButtonElement>('.markdown-toolbar-menu__toggle')?.setAttribute('aria-expanded', String(shouldOpen))
+  menu.querySelector<HTMLButtonElement>(TOOLBAR_MENU_TOGGLE_SELECTOR)?.setAttribute('aria-expanded', String(shouldOpen))
   const panel = toolbarMenuPanels.get(menu)
   if (shouldOpen && panel) positionToolbarMenu(menu, panel)
 }
@@ -1921,6 +1927,96 @@ function createToolbarMenu(options: ToolbarMenuOptions, items: HTMLButtonElement
     button.addEventListener('click', closeToolbarMenus)
     panel.append(button)
   })
+  menu.append(toggle, panel)
+  toolbarMenuPanels.set(menu, panel)
+  return menu
+}
+
+/**
+ * 同步字号下拉的选中态与触发器文案。
+ *
+ * 触发器只显示数值（如「15」），与钉钉字号下拉一致；
+ * 面板里当前档位打勾。
+ *
+ * :return: 无返回值。
+ */
+function syncFontSizeMenu(): void {
+  const menu = editorRootRef.value?.querySelector<HTMLElement>('.markdown-font-size-menu')
+  if (!menu) return
+  // 面板展开时会被 portal 到 body，选项不在 menu 子树里 —— 用面板映射兜底查找。
+  const panel = toolbarMenuPanels.get(menu) ?? menu
+  const current = fontScaleIndex.value
+  panel.querySelectorAll<HTMLButtonElement>('.markdown-font-size-menu__item').forEach((button) => {
+    const isActive = Number(button.dataset.fontSizeIndex) === current
+    button.classList.toggle('active', isActive)
+    button.setAttribute('aria-checked', String(isActive))
+  })
+  const value = menu.querySelector<HTMLElement>('.markdown-font-size-menu__value')
+  if (value) value.textContent = String(bodyFontSize.value)
+}
+
+/**
+ * 创建正文字号下拉（挂在「一级标题」块类型选择器之后）。
+ *
+ * 触发器结构与 Crepe 的块类型按钮对齐（数值 + 箭头），点开是一列字号，
+ * 当前档位打勾。选中后写 localStorage，并同步组件根节点的 CSS 变量。
+ *
+ * :return: 下拉容器。
+ */
+function createFontSizeMenu(): HTMLDivElement {
+  const menu = document.createElement('div')
+  menu.className = 'markdown-font-size-menu'
+
+  const toggle = document.createElement('button')
+  toggle.type = 'button'
+  toggle.className = 'markdown-font-size-menu__toggle top-bar-item'
+  toggle.dataset.label = '字号'
+  toggle.setAttribute('aria-label', '正文字号')
+  toggle.setAttribute('aria-haspopup', 'listbox')
+  toggle.setAttribute('aria-expanded', 'false')
+
+  const value = document.createElement('span')
+  value.className = 'markdown-font-size-menu__value'
+  value.textContent = String(bodyFontSize.value)
+  const chevron = document.createElement('span')
+  chevron.className = 'markdown-font-size-menu__chevron'
+  chevron.setAttribute('aria-hidden', 'true')
+  render(h(Icon, { icon: 'material-symbols:keyboard-arrow-down-rounded', 'aria-hidden': 'true' }), chevron)
+  toggle.append(value, chevron)
+
+  const panel = document.createElement('div')
+  panel.className = 'markdown-font-size-menu__panel'
+  panel.setAttribute('role', 'listbox')
+  panel.setAttribute('aria-label', '正文字号')
+  panel.addEventListener('click', (event) => event.stopPropagation())
+
+  FONT_SCALE_STEPS.forEach((size, index) => {
+    const option = document.createElement('button')
+    option.type = 'button'
+    option.className = 'markdown-font-size-menu__item'
+    option.dataset.fontSizeIndex = String(index)
+    option.setAttribute('role', 'option')
+    option.setAttribute('aria-label', `${size}px`)
+    // 用真实文本节点而非 ::after 伪元素 —— 伪元素内容不进 textContent，
+    // 列表项对读屏与自动化都取不到文本。
+    option.textContent = String(size)
+    // 初始选中态在创建时就设好：此时菜单尚未插入 DOM（调用方还要 heading.after(...)），
+    // 走 syncFontSizeMenu() 查询会落空，导致打开下拉时「一项都没打勾」。
+    const isActive = index === fontScaleIndex.value
+    option.classList.toggle('active', isActive)
+    option.setAttribute('aria-checked', String(isActive))
+    option.addEventListener('click', () => {
+      setFontSize(index)
+      closeToolbarMenus()
+    })
+    panel.append(option)
+  })
+
+  toggle.addEventListener('click', (event) => {
+    event.stopPropagation()
+    toggleToolbarMenu(menu)
+  })
+
   menu.append(toggle, panel)
   toolbarMenuPanels.set(menu, panel)
   return menu
@@ -2084,8 +2180,6 @@ function groupTopBarActions(actions: HTMLElement): void {
   const toolsMenu = createToolbarMenu({
     key: 'tools', label: '更多', icon: 'material-symbols:more-horiz', className: 'markdown-tools-menu'
   }, [
-    createToolbarActionButton({ label: '放大字号', icon: 'material-symbols:text-increase-rounded', action: () => changeFontSize(1), previewAllowed: true }),
-    createToolbarActionButton({ label: '缩小字号', icon: 'material-symbols:text-decrease-rounded', action: () => changeFontSize(-1), previewAllowed: true }),
     createToolbarActionButton({ label: '复制 Markdown', icon: 'material-symbols:content-copy-outline-rounded', action: copyMarkdown, previewAllowed: true }),
     createToolbarActionButton({ label: '专注模式', icon: 'material-symbols:fullscreen-rounded', action: toggleFocusMode, previewAllowed: true })
   ])
@@ -2127,6 +2221,7 @@ function localizeTopBar(root: HTMLElement): void {
     syncOutlineToggle()
     syncPreviewToggle()
     syncFocusModeToggle()
+    syncFontSizeMenu()
     syncHistoryActionButtons(root)
     return
   }
@@ -2138,6 +2233,9 @@ function localizeTopBar(root: HTMLElement): void {
     if (child !== heading) actions.append(child)
   })
   inner.append(actions)
+  // 字号下拉紧跟在「一级标题」块类型选择器之后 —— 两者都是「整篇文档的显示参数」，
+  // 放一起比埋进「更多」菜单里少一次点击。
+  heading.after(createFontSizeMenu())
   groupTopBarActions(actions)
   actions.append(createToolbarDivider())
 
