@@ -456,6 +456,12 @@ body.is-link-modifier-active .milkdown-editor-root a[href] { cursor: pointer; }
 .milkdown-editor-shell {
   --markdown-content-width: 920px;
   --markdown-outline-width: 270px;
+  /*
+    正文显示字号。工具栏的 A- / A+ 只改这一个变量，正文源码不参与 —— markdown 没有
+    行内字号语法，把字号写进正文会污染源码并影响 Web 端与导出，所以字号只做「显示缩放」。
+    标题与表格字号都以它为基准按比例换算，保证整篇等比缩放。
+  */
+  --markdown-body-font-size: 15px;
   position: relative;
   width: 100%;
   min-width: 0;
@@ -505,7 +511,37 @@ body.is-link-modifier-active .milkdown-editor-root a[href] { cursor: pointer; }
 .milkdown-editor-root .milkdown .milkdown-code-block .cm-content ::selection { background: rgba(47,128,237,.32); }
 .milkdown-editor-root .milkdown .milkdown-code-block .cm-activeLine,
 .milkdown-editor-root .milkdown .milkdown-code-block .cm-activeLineGutter { background: rgba(47,128,237,.07); }
-.milkdown-editor-root .milkdown .ProseMirror { box-sizing: border-box; width: min(100%, var(--markdown-content-width)); min-height: calc(100vh - 250px); margin: 0 auto; padding: 34px clamp(64px, 5vw, 96px) 100px; color: #283950; font-size: 14px; line-height: 1.9; outline: 0; }
+.milkdown-editor-root .milkdown .ProseMirror { box-sizing: border-box; width: min(100%, var(--markdown-content-width)); min-height: calc(100vh - 250px); margin: 0 auto; padding: 34px clamp(64px, 5vw, 96px) 100px; color: #283950; font-size: var(--markdown-body-font-size); line-height: 1.75; outline: 0; }
+/*
+  标题体系对齐钉钉：Crepe 默认是 42/36/32/28/24/18px + 字重 400（Georgia 时代的设计），
+  在窄窗口里一个 `# 标题` 能占掉半屏，且字重偏细、层级落差过大。
+  这里收紧为 24/20/17/15.5/15/14px 并统一加粗，字号随 --markdown-body-font-size 等比缩放。
+  颜色改用正文深色（原为蓝色 --crepe-color-primary），与钉钉一致。
+*/
+.milkdown-editor-root .milkdown .ProseMirror :is(h1, h2, h3, h4, h5, h6) {
+  color: #1f2d3d;
+  font-weight: 700;
+  line-height: 1.4;
+}
+.milkdown-editor-root .milkdown .ProseMirror h1 { margin-top: 26px; font-size: calc(var(--markdown-body-font-size) * 1.6); }
+.milkdown-editor-root .milkdown .ProseMirror h2 { margin-top: 22px; font-size: calc(var(--markdown-body-font-size) * 1.333); }
+.milkdown-editor-root .milkdown .ProseMirror h3 { margin-top: 18px; font-size: calc(var(--markdown-body-font-size) * 1.133); }
+.milkdown-editor-root .milkdown .ProseMirror h4 { margin-top: 16px; font-size: calc(var(--markdown-body-font-size) * 1.033); }
+.milkdown-editor-root .milkdown .ProseMirror h5 { margin-top: 14px; font-size: var(--markdown-body-font-size); }
+.milkdown-editor-root .milkdown .ProseMirror h6 { margin-top: 14px; font-size: calc(var(--markdown-body-font-size) * 0.933); }
+/* 标题内行内代码不跟随标题字号撑大（与钉钉一致，保持正文节奏）。 */
+.milkdown-editor-root .milkdown .ProseMirror :is(h1, h2, h3, h4, h5, h6) code { font-size: .88em; }
+/*
+  表头底色对齐钉钉：Crepe 默认表头与正文同底，视觉上表头与数据行糊在一起。
+  用 color-mix 让它跟随主题色，暗色主题下自动变深，无需再写一份暗色规则。
+*/
+.milkdown-editor-root .milkdown .ProseMirror table thead th {
+  background: color-mix(in srgb, var(--crepe-color-selected), transparent 45%);
+  color: #1f2d3d;
+  font-weight: 700;
+}
+.milkdown-editor-root .milkdown .ProseMirror table tbody td,
+.milkdown-editor-root .milkdown .ProseMirror table thead th { font-size: calc(var(--markdown-body-font-size) * 0.933); }
 .milkdown-editor-root .milkdown .milkdown-top-bar { container-type: inline-size; position: sticky; z-index: 20; top: 0; min-height: 48px; padding: 0 12px; border-bottom: 1px solid var(--milkdown-toolbar-divider); background: rgba(248,251,255,.94); backdrop-filter: blur(16px); }
 .milkdown-editor-root .milkdown .milkdown-top-bar .top-bar-inner { display: flex; flex-wrap: nowrap; width: 100%; min-width: 0; align-items: center; }
 .milkdown-editor-root .milkdown .milkdown-top-bar .top-bar-heading-selector { flex: 0 0 104px; width: 104px; margin-right: 3px; padding: 3px; }

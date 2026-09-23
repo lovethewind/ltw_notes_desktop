@@ -8,6 +8,7 @@
       'is-focus-mode': focusMode,
       'is-toolbar-hidden': !props.showToolbar
     }"
+    :style="{ '--markdown-body-font-size': `${bodyFontSize}px` }"
   >
     <Transition name="editor-feedback">
       <div v-if="feedbackText" class="editor-feedback" role="status">{{ feedbackText }}</div>
@@ -170,8 +171,16 @@ import { Decoration, DecorationSet, type EditorView as ProseMirrorView } from '@
 import { markdownToSlice, replaceAll } from '@milkdown/kit/utils'
 import { installXynoteEmbedFeature } from '../editor/xynote-embed'
 import { HARDBREAK_NODE_NAME, TABLE_CELL_NODE_NAMES, installHardbreakFeature } from '../editor/xynote-hardbreak'
+import {
+  DEFAULT_FONT_SCALE_INDEX,
+  FONT_SCALE_STORAGE_KEY,
+  canChangeFontSize,
+  fontSizeAt,
+  nextFontScaleIndex,
+  parseStoredFontScale
+} from '../utils/editor-font-scale'
 import { Icon } from '@iconify/vue'
-import { defineAsyncComponent, h, nextTick, onBeforeUnmount, onMounted, ref, render, watch } from 'vue'
+import { computed, defineAsyncComponent, h, nextTick, onBeforeUnmount, onMounted, ref, render, watch } from 'vue'
 import { extractMarkdownOutline, type MarkdownOutlineItem } from '../utils/markdown-outline'
 import { formatJsonCode } from '../utils/json-code-formatter.js'
 import type { NoteFolder, OfflineNote } from '../types'
@@ -297,6 +306,17 @@ const outlineItems = ref<MarkdownOutlineItem[]>([])
 const outlineOpen = ref(true)
 const previewMode = ref(false)
 const focusMode = ref(false)
+/**
+ * 正文显示字号档位（全局显示缩放，不改正文源码）。
+ *
+ * 档位换算与边界逻辑在 `src/utils/editor-font-scale.ts`（纯逻辑，有真行为测试）；
+ * 这里只负责把它渲染成组件根节点的行内 CSS 变量，由 `src/style.css` 的
+ * `--markdown-body-font-size` 消费，标题/表格字号以它为基准等比换算。
+ * 用行内变量而非全局 `<html>` 属性，是为了不波及冲突对比等其它编辑器实例。
+ */
+const fontScaleIndex = ref(DEFAULT_FONT_SCALE_INDEX)
+/** 当前正文字号（px）。 */
+const bodyFontSize = computed(() => fontSizeAt(fontScaleIndex.value))
 const activeOutlineIndex = ref(0)
 const feedbackText = ref('')
 const imageContextMenu = ref({ visible: false, x: 0, y: 0, address: '' })
@@ -1150,6 +1170,46 @@ function togglePreview(): void {
   }
   syncPreviewToggle()
   void nextTick(updateActiveOutline)
+}
+
+/**
+ * 调整正文显示字号。
+ *
+ * 只改显示，不动正文源码 —— markdown 没有行内字号语法，把字号写进正文会污染源码、
+ * 影响 Web 端渲染与 Markdown 导出。到边界时给出提示而非静默失败。
+ *
+ * :param delta: 档位增量，-1 缩小、+1 放大。
+ * :return: 无返回值。
+ */
+function changeFontSize(delta: number): void {
+  if (!canChangeFontSize(fontScaleIndex.value, delta)) {
+    showFeedback(delta < 0 ? '已经是最小字号' : '已经是最大字号')
+    return
+  }
+  fontScaleIndex.value = nextFontScaleIndex(fontScaleIndex.value, delta)
+  try {
+    window.localStorage.setItem(FONT_SCALE_STORAGE_KEY, String(fontScaleIndex.value))
+  } catch {
+    // 隐私模式等场景下 localStorage 可能不可写，字号仍在本会话生效，不打断用户。
+  }
+  showFeedback(`正文字号 ${bodyFontSize.value}px`)
+}
+
+/**
+ * 从 localStorage 恢复上次选择的字号档位。
+ *
+ * 越界或非数字一律回落到默认档，避免历史脏数据把界面顶到极端字号。
+ *
+ * :return: 无返回值。
+ */
+function restoreFontSize(): void {
+  let stored: string | null = null
+  try {
+    stored = window.localStorage.getItem(FONT_SCALE_STORAGE_KEY)
+  } catch {
+    return
+  }
+  fontScaleIndex.value = parseStoredFontScale(stored)
 }
 
 /**
@@ -2024,6 +2084,8 @@ function groupTopBarActions(actions: HTMLElement): void {
   const toolsMenu = createToolbarMenu({
     key: 'tools', label: '更多', icon: 'material-symbols:more-horiz', className: 'markdown-tools-menu'
   }, [
+    createToolbarActionButton({ label: '放大字号', icon: 'material-symbols:text-increase-rounded', action: () => changeFontSize(1), previewAllowed: true }),
+    createToolbarActionButton({ label: '缩小字号', icon: 'material-symbols:text-decrease-rounded', action: () => changeFontSize(-1), previewAllowed: true }),
     createToolbarActionButton({ label: '复制 Markdown', icon: 'material-symbols:content-copy-outline-rounded', action: copyMarkdown, previewAllowed: true }),
     createToolbarActionButton({ label: '专注模式', icon: 'material-symbols:fullscreen-rounded', action: toggleFocusMode, previewAllowed: true })
   ])
@@ -2351,6 +2413,7 @@ watch(
 watch(() => props.readonly, syncPreviewReadonly)
 onMounted(() => {
   outlineOpen.value = props.showOutline && localStorage.getItem(OUTLINE_STORAGE_KEY) !== 'false'
+  restoreFontSize()
   scheduleOutlineUpdate(contentValue.value, editorDocumentId)
   document.addEventListener('keydown', syncLinkModifierState)
   document.addEventListener('keyup', syncLinkModifierState)
