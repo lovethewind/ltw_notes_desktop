@@ -5,10 +5,8 @@
       'has-outline': props.showOutline && outlineOpen,
       'is-preview': previewMode,
       'is-readonly': props.readonly,
-      'is-focus-mode': focusMode,
       'is-toolbar-hidden': !props.showToolbar
     }"
-    :style="{ '--markdown-body-font-size': `${bodyFontSize}px` }"
   >
     <Transition name="editor-feedback">
       <div v-if="feedbackText" class="editor-feedback" role="status">{{ feedbackText }}</div>
@@ -45,6 +43,125 @@
     <div ref="editorScrollRef" class="milkdown-editor-scroll" @scroll.passive="handleEditorScroll">
       <div ref="editorRootRef" class="milkdown-editor-root" />
     </div>
+    <!--
+      模式条：常驻在编辑区上方（与本地文件预览那条完全同构），编辑 / 预览随时可切。
+      它占网格第 1 行并横跨整幅宽度，编辑区与预览层都在第 2 行 —— 两层永远不会跟顶栏抢
+      同一条位置；侧栏也整列从第 2 行开始，顶部因此只有一条横线。
+      只读上下文（历史预览、冲突对比）里编辑器没有可切的状态，这条不出现。
+    -->
+    <header v-if="showModeBar" class="markdown-note-mode-bar">
+      <Icon
+        :icon="previewMode ? 'material-symbols:visibility-outline-rounded' : 'material-symbols:edit-note-rounded'"
+      />
+      <span class="markdown-note-mode-bar__mode">{{ previewMode ? '预览模式' : '编辑模式' }}</span>
+      <span class="markdown-note-mode-bar__hint">
+        {{ previewMode ? '只读渲染，正文不会被改动' : '所见即所得，改动直接写进正文' }}
+      </span>
+      <!--
+        大纲开关放在模式条上，不再放 Crepe 顶栏：
+        预览层是「盖」在编辑区上的，顶栏（连它那个大纲按钮）整条都被盖住 —— 放到那里的话，
+        大纲一旦是关着的，进预览就再也调不出来（`elementFromPoint` 在按钮中心只会拿到预览层）。
+        开关与面板同生共死，所以只在 `showOutline` 的上文里出现。
+      -->
+      <button
+        v-if="props.showOutline"
+        type="button"
+        class="markdown-note-mode-bar__outline"
+        :class="{ 'is-active': outlineOpen }"
+        :aria-pressed="outlineOpen"
+        aria-controls="markdown-outline-panel"
+        :aria-label="outlineOpen ? '收起大纲' : '展开大纲'"
+        :title="outlineOpen ? '收起大纲' : '展开大纲'"
+        @click="toggleOutline"
+      >
+        <Icon icon="material-symbols:toc-rounded" />
+      </button>
+      <!--
+        「复制 Markdown」也放模式条：它原来在顶栏「更多」里，预览态同样被整层盖住点不到。
+        它只读正文、不写文档，所以编辑态与预览态都该能点。
+      -->
+      <button
+        type="button"
+        class="markdown-note-mode-bar__copy"
+        aria-label="复制 Markdown"
+        title="复制 Markdown"
+        @click="copyMarkdown"
+      >
+        <Icon icon="material-symbols:content-copy-outline-rounded" />
+      </button>
+      <div class="markdown-note-mode-bar__modes" role="group" aria-label="显示模式">
+        <button
+          type="button"
+          class="markdown-note-mode-bar__mode-button"
+          :class="{ 'is-active': !previewMode }"
+          :aria-pressed="!previewMode"
+          @click="setPreviewMode(false)"
+        >
+          编辑
+        </button>
+        <button
+          type="button"
+          class="markdown-note-mode-bar__mode-button"
+          :class="{ 'is-active': previewMode }"
+          :aria-pressed="previewMode"
+          @click="setPreviewMode(true)"
+        >
+          预览
+        </button>
+      </div>
+    </header>
+    <!--
+      预览层：把正文按 Markdown 渲染成只读文档（与外部文件预览同一套渲染与排版）。
+      它只是「盖」在编辑区上 —— 编辑器不卸载、不隐藏布局，退出预览时阅读位置与撤销栈都在。
+      ⚠️ 底色必须不透明：编辑器整层还压在下面，半透明就会把顶栏与正文透出来（两层字叠在一起）。
+    -->
+    <section v-if="previewMode" class="markdown-note-preview" aria-label="笔记预览">
+      <div
+        ref="previewScrollerRef"
+        class="markdown-note-preview__body"
+        @scroll.passive="updateActiveOutline"
+      >
+        <div class="markdown-note-preview__doc markdown-rendered-doc" v-html="previewHtml"></div>
+      </div>
+    </section>
+    <!--
+      图片交互的两个浮层自己会传送到 body，挂在这里只是为了随预览层一起装卸。
+      工具条跟着鼠标悬停的图片走；查看器是整窗覆盖层。
+    -->
+    <PreviewImageBar
+      v-if="imageBarVisible"
+      :anchor="imageBarAnchor"
+      :align="imageBarAlign"
+      :can-open-external="imageBarCanOpenExternal"
+      :notice="imageNotice"
+      @keep="keepImageBar"
+      @dismiss="dismissImageBar"
+      @open="openImageViewer"
+      @copy="copyPreviewImage"
+      @save="savePreviewImageAs"
+      @external="openPreviewImageInBrowser"
+    />
+    <PreviewImageViewer
+      v-if="imageViewerVisible"
+      :images="imageViewerImages"
+      :index="imageViewerIndex"
+      @close="closeImageViewer"
+      @update:index="setImageViewerIndex"
+    />
+    <!--
+      链接编辑浮层：替换 Crepe 自带那条「一行光秃秃输入框」的编辑气泡。
+      它自己会传送到 body（fixed 定位，跟着窗口走），挂在这里只是为了随编辑器一起装卸。
+    -->
+    <LinkEditPopover
+      v-if="linkEditState"
+      :anchor="linkEditState.anchor"
+      :title="linkEditState.title"
+      :href="linkEditState.href"
+      :can-remove="Boolean(linkEditState.mark)"
+      @save="saveLinkEdit"
+      @remove="removeLinkEdit"
+      @close="closeLinkEditor"
+    />
     <aside
       v-if="props.showOutline && outlineOpen"
       id="markdown-outline-panel"
@@ -151,7 +268,7 @@ import { Crepe } from '@milkdown/crepe'
 import { commandsCtx, editorViewCtx } from '@milkdown/kit/core'
 import { historyProviderPlugin, redoCommand, undoCommand } from '@milkdown/kit/plugin/history'
 import { redoDepth, undoDepth } from '@milkdown/kit/prose/history'
-import type { Node as ProseMirrorNode } from '@milkdown/kit/prose/model'
+import type { Mark as ProseMirrorMark, Node as ProseMirrorNode } from '@milkdown/kit/prose/model'
 // 「粘贴（富文本）」需把剪贴板 HTML 解析成 Slice；「粘贴为 Markdown」用 markdownToSlice
 import { DOMParser as ProseMirrorDOMParser } from '@milkdown/kit/prose/model'
 import {
@@ -170,17 +287,15 @@ import { AllSelection, TextSelection } from '@milkdown/kit/prose/state'
 import { Decoration, DecorationSet, type EditorView as ProseMirrorView } from '@milkdown/kit/prose/view'
 import { markdownToSlice, replaceAll } from '@milkdown/kit/utils'
 import { installXynoteEmbedFeature } from '../editor/xynote-embed'
+import { FONT_SIZE_MARK_NAME, installFontSizeFeature } from '../editor/xynote-font-size'
 import { HARDBREAK_NODE_NAME, TABLE_CELL_NODE_NAMES, installHardbreakFeature } from '../editor/xynote-hardbreak'
-import {
-  DEFAULT_FONT_SCALE_INDEX,
-  FONT_SCALE_STEPS,
-  FONT_SCALE_STORAGE_KEY,
-  fontSizeAt,
-  parseStoredFontScale
-} from '../utils/editor-font-scale'
+import { DEFAULT_BODY_FONT_SIZE, FONT_SCALE_STEPS, isBlankText, isDefaultFontSize } from '../utils/inline-font-size'
 import { Icon } from '@iconify/vue'
 import { computed, defineAsyncComponent, h, nextTick, onBeforeUnmount, onMounted, ref, render, watch } from 'vue'
 import { extractMarkdownOutline, type MarkdownOutlineItem } from '../utils/markdown-outline'
+import { renderPreviewMarkdown, resolvePreviewImageSource } from '../utils/markdown-preview'
+import { sanitizePreviewHtml } from '../utils/preview-sanitize'
+import { resolvePreviewImageElement } from '../utils/preview-image-tools'
 import { formatJsonCode } from '../utils/json-code-formatter.js'
 import type { NoteFolder, OfflineNote } from '../types'
 import NoteLinkPicker from './NoteLinkPicker.vue'
@@ -188,6 +303,12 @@ import EditorContextMenu from './EditorContextMenu.vue'
 import type { EditorContextMenuGroup } from './EditorContextMenu.vue'
 import BacklinksPanel from './BacklinksPanel.vue'
 import LinkSuggestPopover from './LinkSuggestPopover.vue'
+import PreviewImageBar from './PreviewImageBar.vue'
+import PreviewImageViewer from './PreviewImageViewer.vue'
+import LinkEditPopover from './LinkEditPopover.vue'
+import { linkTooltipAPI, linkTooltipState } from '@milkdown/kit/component/link-tooltip'
+import type { LinkEditAnchor } from '../utils/link-edit-popover'
+import { usePreviewImageTools } from '../composables/usePreviewImageTools'
 import { dispatchOpenNote, EMBED_CARD_MENU_EVENT, type EmbedCardMenuEventDetail } from '../utils/note-open-events'
 
 // 关系图谱仅在展开时用到 d3-force，改为异步组件避免把布局库打进主 chunk。
@@ -198,6 +319,55 @@ const EMBED_SLASH_ICON = `
   <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="currentColor">
     <path d="M14 3H6C4.9 3 4 3.9 4 5V19C4 20.1 4.9 21 6 21H18C19.1 21 20 20.1 20 19V9L14 3ZM16 17H13V20H11V17H8V15H11V12H13V15H16V17ZM13 10V4.5L18.5 10H13Z" />
   </svg>
+`
+
+/**
+ * 选中气泡里「字号」触发器的图标：大 A + 小 a（Material Symbols format_size）+ 下拉小箭头。
+ *
+ * 为什么要把两个 svg 包进一个 `span.xynote-fs-trigger`：Crepe 的 Toolbar 组件给每个项渲染的是
+ * 属性写死的 `button.toolbar-item`（只有 `class` / `type`，挂不了自定义 class 或 data-*），
+ * 而 `item.icon` 会被当作 HTML 塞进 `span.milkdown-icon`。所以这个 span 既是「在 DOM 里找回
+ * 按钮」的锚点（`.closest('.toolbar-item')`），也是 CSS 里 `:has()` 放宽按钮宽度的钩子。
+ */
+const FONT_SIZE_TRIGGER_ICON = `
+  <span class="xynote-fs-trigger">
+    <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="currentColor">
+      <path d="M9 4v3h5v12h3V7h5V4H9zm-5 5v3h3v7h3v-7h3V9H4z" />
+    </svg>
+    <svg class="xynote-fs-caret" xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="currentColor">
+      <path d="M7 9.5 12 14.5 17 9.5l-1.3-1.3L12 11.9 8.3 8.2z" />
+    </svg>
+  </span>
+`
+
+/**
+ * 链接气泡左侧那两个按钮（打开 / 复制）的图标。
+ *
+ * 背景：Crepe 的 LinkTooltip 只开放一个 `linkIcon` 槽位，而**这个槽位的点击写死是复制**
+ * （`@milkdown/components` 的 `Icon` 组件用 `onPointerdown` 触发
+ * `navigator.clipboard.writeText`），所以「打开」只能自己抢 —— 图标里塞两个带标记的 span，
+ * 再由 `handleLinkTooltipPointerDown` 在**捕获阶段**接管（见该函数注释）。
+ *
+ * 「打开」带文字标签是有意的：气泡里的 URL 文本已经拿掉（它在编辑浮层里有专门的「地址」一行），
+ * 只剩一排光秃秃的图标就看不出哪个是主操作了。
+ *
+ * ⚠️ 两个标记类名是「打开 / 复制」分流的唯一锚点，删掉任一 span 两处一起坏。
+ * 图标本体走 Crepe 同款 viewBox，尺寸由 `src/style.css` 的链接气泡覆写段统一到 19px。
+ */
+const LINK_TOOLTIP_ACTIONS_ICON = `
+  <span class="xynote-link-tooltip-actions">
+    <span class="xynote-link-tooltip-open" aria-label="打开链接">
+      <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="currentColor">
+        <path d="M6.4 19 5 17.6 15.6 7H8V5h13v13h-2V8.4L6.4 19Z" />
+      </svg>
+      <span class="xynote-link-tooltip-open-label">打开</span>
+    </span>
+    <span class="xynote-link-tooltip-copy" aria-label="复制链接">
+      <svg xmlns="http://www.w3.org/2000/svg" height="24px" viewBox="0 -960 960 960" width="24px" fill="currentColor">
+        <path d="M360-240q-33 0-56.5-23.5T280-320v-480q0-33 23.5-56.5T360-880h360q33 0 56.5 23.5T800-800v480q0 33-23.5 56.5T720-240H360Zm0-80h360v-480H360v480ZM200-80q-33 0-56.5-23.5T120-160v-560h80v560h440v80H200Zm160-240v-480 480Z" />
+      </svg>
+    </span>
+  </span>
 `
 
 interface Props {
@@ -236,7 +406,6 @@ interface ToolbarActionItem {
   action: () => void | Promise<void>
   icon: string
   label: string
-  previewAllowed?: boolean
 }
 
 interface ToolbarMenuOptions {
@@ -303,19 +472,63 @@ const imageContextMenuElement = ref<HTMLDivElement | null>(null)
 const contentValue = ref(props.value)
 const outlineItems = ref<MarkdownOutlineItem[]>([])
 const outlineOpen = ref(true)
-const previewMode = ref(false)
-const focusMode = ref(false)
 /**
- * 正文显示字号档位（全局显示缩放，不改正文源码）。
+ * 预览模式：把正文换成「Markdown 渲染」的只读视图（与外部文件预览同一套渲染）。
  *
- * 档位换算与边界逻辑在 `src/utils/editor-font-scale.ts`（纯逻辑，有真行为测试）；
- * 这里只负责把它渲染成组件根节点的行内 CSS 变量，由 `src/style.css` 的
- * `--markdown-body-font-size` 消费，标题/表格字号以它为基准等比换算。
- * 用行内变量而非全局 `<html>` 属性，是为了不波及冲突对比等其它编辑器实例。
+ * 富文本编辑器本身**不卸载也不隐藏布局**，只是被预览层盖住 —— 光标、选区、撤销栈与
+ * 滚动位置全都原样留在原处，退出预览与进去之前完全一致。
  */
-const fontScaleIndex = ref(DEFAULT_FONT_SCALE_INDEX)
-/** 当前正文字号（px）。 */
-const bodyFontSize = computed(() => fontSizeAt(fontScaleIndex.value))
+const previewMode = ref(false)
+/** 预览层的滚动容器（供大纲定位 / 位置复位用）。 */
+const previewScrollerRef = ref<HTMLElement | null>(null)
+/**
+ * 图片交互（悬停工具条 + 点击全屏）的作用域容器。
+ *
+ * 三处入口共用同一份实现（`usePreviewImageTools`）：预览正文是 `v-html` 出来的死 HTML，
+ * 编辑器里是 Crepe 的 nodeView，两边都挂不上 Vue 事件，所以整套交互都在容器上做事件委托。
+ * 预览层是「盖」在编辑区上的 —— 哪个态在前就用哪个容器。
+ */
+const imageToolsContainer = computed<HTMLElement | null>(() =>
+  previewMode.value ? previewScrollerRef.value : editorScrollRef.value
+)
+const {
+  barVisible: imageBarVisible,
+  barAnchor: imageBarAnchor,
+  barAlign: imageBarAlign,
+  canOpenExternal: imageBarCanOpenExternal,
+  notice: imageNotice,
+  viewerVisible: imageViewerVisible,
+  viewerImages: imageViewerImages,
+  viewerIndex: imageViewerIndex,
+  keepBar: keepImageBar,
+  dismissBar: dismissImageBar,
+  openViewer: openImageViewer,
+  closeViewer: closeImageViewer,
+  setViewerIndex: setImageViewerIndex,
+  copyImage: copyPreviewImage,
+  saveImageAs: savePreviewImageAs,
+  openInBrowser: openPreviewImageInBrowser
+} = usePreviewImageTools(imageToolsContainer, {
+  // 编辑态用左对齐：Crepe 自己的图注按钮占着图片右上角，两边都贴右会叠在一起。
+  align: () => (previewMode.value ? 'right' : 'left')
+})
+/**
+ * 是否显示常驻模式条。
+ *
+ * 只有「可写的笔记编辑器」才有两个模式可切：只读上下文（历史预览、冲突对比）里
+ * 预览按钮按下去也会被 `setPreviewMode` 拒掉，所以那条整个不出现。
+ */
+const showModeBar = computed(() => !props.readonly && props.showToolbar)
+/**
+ * 字号下拉触发器上显示的数值（px）。
+ *
+ * 语义跟随选区，**没有「整篇缩放」这一档**（2026-09-24 用户定义）：
+ *  - 有选区 → 选区起点处的字号；
+ *  - 无选区 → 待用字号（`storedMarks`），其次是光标处的字号；
+ *  - 都取不到 → 正文默认值。
+ * 具体见 `syncFontSizeMenu()`，在选区/文档变化时刷新。
+ */
+const fontSizeMenuValue = ref(DEFAULT_BODY_FONT_SIZE)
 const activeOutlineIndex = ref(0)
 const feedbackText = ref('')
 const imageContextMenu = ref({ visible: false, x: 0, y: 0, address: '' })
@@ -390,7 +603,15 @@ function handleEditorLinkClick(event: MouseEvent): void {
     ? event.target.closest<HTMLAnchorElement>('a[href]')
     : null
   const href = anchor?.href ?? ''
-  const shouldOpenLink = previewMode.value || props.readonly || event.metaKey || event.ctrlKey
+  // 链接气泡里的链接：点它**就是**「打开」（气泡本来就是为操作这条链接而弹出的），
+  // 不再要求 ⌘/Ctrl。⚠️ 这里必须只放行 `.link-display` 那一个 `<a>` —— 气泡里的
+  // 编辑 / 删除按钮不是 `<a>`、`closest('a[href]')` 本就返回 null，不受影响。
+  const insideLinkTooltip = Boolean(anchor?.closest('.milkdown-link-preview'))
+  const shouldOpenLink = insideLinkTooltip
+    || previewMode.value
+    || props.readonly
+    || event.metaKey
+    || event.ctrlKey
   // 网页版真实笔记链接 {webUrl}/notes/{serverId}：同样当作内部笔记链接，按 serverId 回落本地打开。
   const webBaseHost = (() => {
     try {
@@ -440,9 +661,224 @@ function handleEditorLinkClick(event: MouseEvent): void {
   })
 }
 
+/**
+ * 接管链接气泡左侧「打开」按钮的按下动作。
+ *
+ * ⚠️ 必须挂在**捕获阶段**：Crepe 给整个 `.link-icon` 挂的是它自己的 `onPointerdown`（复制），
+ * 与这里要拦的是**同一节点上下沉层次不同**的两颗监听 —— 冒泡阶段才动手已经晚了，
+ * 复制早就跑完了（现象：点「打开」链接进了剪贴板却没跳转）。
+ * 捕获阶段先于目标自身触发，`stopPropagation()` 一掐，Crepe 那颗处理器就不会执行。
+ *
+ * 接管后**直接触发气泡里那个 `<a>` 的点击**，内部笔记 / 附件 / 外链的分流全部照旧
+ * （`handleEditorLinkClick` 一并认它），不重复一份路由逻辑。
+ *
+ * :param event: 指针按下事件。
+ * :return: 无返回值。
+ */
+function handleLinkTooltipPointerDown(event: PointerEvent): void {
+  const target = event.target
+  if (!(target instanceof Element)) return
+  if (!target.closest('.xynote-link-tooltip-open')) return
+  event.preventDefault()
+  event.stopPropagation()
+  if (event.button !== 0) return
+  target
+    .closest('.milkdown-link-preview')
+    ?.querySelector<HTMLAnchorElement>('a.link-display')
+    ?.click()
+}
+
+/** 链接编辑浮层的当前目标；关闭时置空。 */
+interface LinkEditState {
+  from: number
+  to: number
+  /** 编辑已有链接时的原 mark：既用来摘掉旧链接，也用来沿用它的 `title` 属性。 */
+  mark: ProseMirrorMark | null
+  title: string
+  href: string
+  anchor: LinkEditAnchor
+}
+
+const linkEditState = ref<LinkEditState | null>(null)
+/** 当前编辑器 view，供链接编辑浮层读写正文。 */
+let linkEditEditorView: ProseMirrorView | null = null
+/**
+ * 切换 Crepe 链接气泡的模式。
+ *
+ * 置 `'edit'` 后 Crepe 自己会做两件事：预览气泡立刻隐藏、且悬停时不再把它弹回来
+ * （`preview-configure` 里 `mode === 'edit'` 直接 return）。我们复用这条现成机制来表达
+ * 「正在编辑这条链接」，不需要自己去抠那个浮层。
+ */
+let setLinkTooltipMode: ((mode: 'preview' | 'edit') => void) | null = null
+
+/**
+ * 量出链接在视口中的包围盒。
+ *
+ * ⚠️ 不用 `posToDOMRect`：它给的是整块包围盒（多行时会把浮层顶到段落中间去）。
+ * `coordsAtPos` 取首尾两个端点的光标矩形，合并后才是链接自身那一段的包围盒。
+ *
+ * :param view: ProseMirror 视图。
+ * :param from: 链接起点。
+ * :param to: 链接终点（可与 from 相等，表示新建链接时的光标位）。
+ * :return: 视口坐标包围盒；位置失效时返回 null。
+ */
+function measureLinkAnchor(view: ProseMirrorView, from: number, to: number): LinkEditAnchor | null {
+  try {
+    const start = view.coordsAtPos(from)
+    const end = view.coordsAtPos(to)
+    return {
+      left: Math.min(start.left, end.left),
+      right: Math.max(start.right, end.right),
+      top: Math.min(start.top, end.top),
+      bottom: Math.max(start.bottom, end.bottom)
+    }
+  } catch {
+    return null
+  }
+}
+
+/**
+ * 打开链接编辑浮层。
+ *
+ * 由覆写后的 `linkTooltipAPI` 调用 —— 「编辑」按钮与选中气泡里的「链接」按钮走的都是它，
+ * 所以两条入口在这里汇成一套界面。
+ *
+ * :param mark: 已有链接的 mark；新建链接时为 null。
+ * :param from: 目标区间起点。
+ * :param to: 目标区间终点。
+ * :return: 无返回值。
+ */
+function openLinkEditor(mark: ProseMirrorMark | null, from: number, to: number): void {
+  const view = linkEditEditorView
+  if (!view) return
+  const doc = view.state.doc
+  if (from < 0 || to < from || to > doc.content.size) return
+  const anchor = measureLinkAnchor(view, from, to)
+  linkEditState.value = {
+    from,
+    to,
+    mark,
+    title: doc.textBetween(from, to, ''),
+    href: typeof mark?.attrs.href === 'string' ? mark.attrs.href : '',
+    anchor: anchor ?? { left: 0, right: 0, top: 0, bottom: 0 }
+  }
+  setLinkTooltipMode?.('edit')
+  bindLinkEditTracking()
+}
+
+/** 关闭链接编辑浮层，并把焦点还给编辑器。 */
+function closeLinkEditor(): void {
+  if (!linkEditState.value) return
+  linkEditState.value = null
+  unbindLinkEditTracking()
+  setLinkTooltipMode?.('preview')
+  linkEditEditorView?.dom.focus({ preventScroll: true })
+}
+
+/** 浮层开着时正文可能滚动、窗口可能缩放，锚点跟着重算，浮层不脱离链接。 */
+function refreshLinkEditAnchor(): void {
+  const state = linkEditState.value
+  const view = linkEditEditorView
+  if (!state || !view) return
+  const anchor = measureLinkAnchor(view, state.from, state.to)
+  if (anchor) linkEditState.value = { ...state, anchor }
+}
+
+let linkEditTrackingBound = false
+
+function bindLinkEditTracking(): void {
+  if (linkEditTrackingBound) return
+  linkEditTrackingBound = true
+  // 捕获阶段收 scroll：容器的 scroll 事件不冒泡，只有捕获能拿到。
+  window.addEventListener('scroll', refreshLinkEditAnchor, true)
+  window.addEventListener('resize', refreshLinkEditAnchor)
+}
+
+function unbindLinkEditTracking(): void {
+  if (!linkEditTrackingBound) return
+  linkEditTrackingBound = false
+  window.removeEventListener('scroll', refreshLinkEditAnchor, true)
+  window.removeEventListener('resize', refreshLinkEditAnchor)
+}
+
+/**
+ * 保存链接编辑结果。
+ *
+ * 「标题」写回链接文字、「地址」写回 href；地址被清空等同于「取消链接」（文字保留）。
+ *
+ * ⚠️ 附件链接把 mime / 大小存在 mark 的 `title` 属性里（`attachment|mime|size`），
+ * 重建 mark 时必须原样带上 —— 丢了它附件就会退化成一条普通外链。
+ *
+ * :param payload: 浮层提交的标题与地址。
+ * :return: 无返回值。
+ */
+function saveLinkEdit(payload: { title: string, href: string }): void {
+  const state = linkEditState.value
+  const view = linkEditEditorView
+  if (!state || !view) {
+    closeLinkEditor()
+    return
+  }
+  const doc = view.state.doc
+  const linkMarkType = view.state.schema.marks.link
+  const href = payload.href.trim()
+  if (!linkMarkType || state.to > doc.content.size) {
+    closeLinkEditor()
+    return
+  }
+  if (!href) {
+    removeLinkEdit()
+    return
+  }
+  const keptTitle = typeof state.mark?.attrs.title === 'string' ? state.mark.attrs.title : null
+  const currentText = doc.textBetween(state.from, state.to, '')
+  // 标题留空时：编辑态保留原文，新建态（区间为空）退回用地址当文字 —— 否则会插入一个空文本节点。
+  const nextText = payload.title.trim() || (state.from === state.to ? href : currentText)
+  const tr = view.state.tr
+  if (state.mark) tr.removeMark(state.from, state.to, state.mark)
+  if (nextText === currentText) {
+    tr.addMark(state.from, state.to, linkMarkType.create({ href, title: keptTitle }))
+  } else {
+    tr.replaceWith(state.from, state.to, view.state.schema.text(nextText))
+    tr.addMark(state.from, state.from + nextText.length, linkMarkType.create({ href, title: keptTitle }))
+  }
+  view.dispatch(tr)
+  closeLinkEditor()
+  showFeedback('链接已更新')
+}
+
+/** 取消链接：摘掉链接标记、保留文字（与「地址清空后保存」同效）。 */
+function removeLinkEdit(): void {
+  const state = linkEditState.value
+  const view = linkEditEditorView
+  const linkMarkType = view?.state.schema.marks.link
+  const hadLink = Boolean(state?.mark)
+  if (state && view && linkMarkType && state.to <= view.state.doc.content.size) {
+    view.dispatch(view.state.tr.removeMark(state.from, state.to, linkMarkType))
+  }
+  closeLinkEditor()
+  if (hadLink) showFeedback('已取消链接')
+}
+
 /** 关闭正文图片右键菜单。 */
 function closeImageContextMenu(): void {
   imageContextMenu.value.visible = false
+}
+
+/**
+ * 从右键事件目标解析出对应的正文图片。
+ *
+ * ⚠️ 图片菜单与正文菜单**必须共用同一判定**（`resolvePreviewImageElement`）：
+ * 两个 `contextmenu` 监听器挂在**同一个元素**上（`stopPropagation()` 挡不住兄弟监听器），
+ * 两边判「是否图片」的口径一旦不一致，就会「图片菜单弹了、正文菜单也认为自己没点到图片
+ * 而跟着弹」—— 一次右键两个菜单叠在一起。编辑态图片块的 `.image-wrapper` 盖在 `img` 之上，
+ * 只写 `closest('img')` 必然漏判，正是这个 bug 的现场。
+ *
+ * :param target: 右键事件的目标元素。
+ * :return: 命中的图片元素；目标不是图片时返回 null。
+ */
+function resolveContextMenuImage(target: Element | null): HTMLImageElement | null {
+  return resolvePreviewImageElement(target)
 }
 
 /**
@@ -453,8 +889,7 @@ function closeImageContextMenu(): void {
  */
 function handleImageContextMenu(event: MouseEvent): void {
   const target = event.target instanceof Element ? event.target : null
-  const image = target?.closest<HTMLImageElement>('img')
-    || target?.closest<HTMLElement>('.image-wrapper')?.querySelector<HTMLImageElement>('img')
+  const image = resolveContextMenuImage(target)
   const address = image?.getAttribute('src') || image?.currentSrc || ''
   if (!image || !address) return
   event.preventDefault()
@@ -595,8 +1030,10 @@ function handleEditorContextMenu(event: MouseEvent): void {
   if (props.readonly || previewMode.value) return
   // 图片有独立右键菜单（复制地址）、嵌入卡片有卡片专属菜单，均跳过避免冲突。
   // 卡片内部已 stopPropagation，此处按节点容器再兜底一次，防止宿主结构变化时菜单串台。
+  // ⚠️ 图片判定必须与 handleImageContextMenu 共用 resolveContextMenuImage：两个 handler 挂在
+  //    同一元素的同一事件上，stopPropagation 挡不住兄弟监听器，只有判据一致才不会双弹。
   const target = event.target instanceof Element ? event.target : null
-  if (target?.closest('img')) return
+  if (resolveContextMenuImage(target)) return
   if (target?.closest('.xynote-embed-nodeview')) return
   event.preventDefault()
   event.stopPropagation()
@@ -1038,17 +1475,49 @@ function scheduleOutlineUpdate(markdown: string, documentId: string): void {
 }
 
 /**
+ * 当前阅读容器与它的标题节点。
+ *
+ * 预览态读的是渲染出来的 HTML，不能再用 `.ProseMirror` 选：那时编辑器虽在 DOM 里，
+ * 但被预览层盖住，量出来的位置没有意义。
+ *
+ * 预览侧还要按 `extractMarkdownOutline` 的同一口径过滤 —— 表格单元格（钉钉式块级渲染）
+ * 与引用块里的 `h*` 是**渲染产物**，大纲里根本没有它们，不过滤会让下标整体错位。
+ *
+ * :return: 滚动容器与按文档顺序排列的标题节点。
+ */
+function getOutlineScope(): { container: HTMLElement | null, headings: HTMLElement[] } {
+  if (previewMode.value) {
+    const container = previewScrollerRef.value
+    return {
+      container,
+      headings: container
+        ? Array.from(container.querySelectorAll<HTMLElement>('h1, h2, h3, h4, h5, h6'))
+          .filter((heading) => !heading.closest('td, th, blockquote, li'))
+        : []
+    }
+  }
+  return {
+    container: editorScrollRef.value,
+    headings: Array.from(editorRootRef.value?.querySelectorAll<HTMLElement>(
+      '.ProseMirror h1, .ProseMirror h2, .ProseMirror h3, .ProseMirror h4, .ProseMirror h5, .ProseMirror h6'
+    ) ?? [])
+  }
+}
+
+/**
  * 根据正文滚动位置更新当前大纲项。
+ *
+ * 阈值 = 跳转落点 + `OUTLINE_ACTIVE_LEAD`：标题顶进入「落点再往下一点」就算当前章节。
+ * **必须跟着落点走，不能写死** —— 落点收到 14px 后，旧常量 86 会让紧邻的下一个标题
+ * 也落在阈值内（`forEach` 取最后一个满足的），跳转过去高亮却停在下一节。
  *
  * :return: 无返回值。
  */
 function updateActiveOutline(): void {
-  const scrollContainer = editorScrollRef.value
-  const headings = editorRootRef.value?.querySelectorAll<HTMLElement>(
-    '.ProseMirror h1, .ProseMirror h2, .ProseMirror h3, .ProseMirror h4, .ProseMirror h5, .ProseMirror h6'
-  )
-  if (!scrollContainer || !headings?.length) return
-  const threshold = scrollContainer.getBoundingClientRect().top + 86
+  const { container, headings } = getOutlineScope()
+  if (!container || !headings.length) return
+  const threshold = container.getBoundingClientRect().top
+    + getOutlineScrollInset() + OUTLINE_SCROLL_GAP + OUTLINE_ACTIVE_LEAD
   let nextIndex = 0
   headings.forEach((heading, index) => {
     if (heading.getBoundingClientRect().top <= threshold) nextIndex = index
@@ -1072,6 +1541,8 @@ function resetEditorScroll(): void {
   const scrollContainer = editorScrollRef.value
   const nextScrollTop = Math.max(0, props.scrollTop)
   if (scrollContainer) scrollContainer.scrollTop = nextScrollTop
+  // 预览层是另一个滚动容器，切文档时也要回到开头，否则会继承上一篇的阅读位置。
+  if (previewScrollerRef.value) previewScrollerRef.value.scrollTop = nextScrollTop
   activeOutlineIndex.value = 0
   void nextTick(() => {
     if (editorScrollRef.value) {
@@ -1093,36 +1564,7 @@ function getScrollTop(): number {
 function toggleOutline(): void {
   outlineOpen.value = !outlineOpen.value
   localStorage.setItem(OUTLINE_STORAGE_KEY, String(outlineOpen.value))
-  syncOutlineToggle()
   if (outlineOpen.value) void nextTick(updateActiveOutline)
-}
-
-/**
- * 同步工具栏大纲按钮状态。
- *
- * :return: 无返回值。
- */
-function syncOutlineToggle(): void {
-  const button = editorRootRef.value?.querySelector<HTMLButtonElement>('.markdown-outline-toggle')
-  if (!button) return
-  button.setAttribute('aria-expanded', String(outlineOpen.value))
-  button.setAttribute('aria-label', outlineOpen.value ? '收起大纲' : '展开大纲')
-  button.dataset.label = '大纲'
-  button.classList.toggle('active', outlineOpen.value)
-}
-
-/**
- * 同步工具栏预览按钮状态。
- *
- * :return: 无返回值。
- */
-function syncPreviewToggle(): void {
-  const button = editorRootRef.value?.querySelector<HTMLButtonElement>('.markdown-preview-toggle')
-  if (!button) return
-  button.setAttribute('aria-pressed', String(previewMode.value))
-  button.setAttribute('aria-label', previewMode.value ? '退出预览并继续编辑' : '预览文档')
-  button.dataset.label = '预览'
-  button.classList.toggle('active', previewMode.value)
 }
 
 /**
@@ -1145,94 +1587,231 @@ function syncPreviewReadonly(): void {
     readonlyObserver = new MutationObserver(syncPreviewReadonly)
     readonlyObserver.observe(editorRootRef.value, { childList: true, subtree: true })
   }
+  // 字号下拉**不再**被排除在禁用列表外：它现在会改动文档内容（给选中文字写入
+  // `<span style="font-size:…">`），只读/预览态必须和别的格式按钮一样禁掉。
+  // 大纲开关与「复制 Markdown」都已不在顶栏（搬到模式条 —— 预览态唯一可点的那条），
+  // 「更多」菜单也随之下线，这里不再有需要豁免的项。
   editorRootRef.value
-    ?.querySelectorAll<HTMLButtonElement>(
-      '.top-bar-heading-selector button, .top-bar-actions .top-bar-item:not(.markdown-outline-toggle):not(.markdown-preview-toggle):not(.markdown-font-size-menu__toggle):not(.markdown-tools-menu-toggle)'
-    )
+    ?.querySelectorAll<HTMLButtonElement>('.top-bar-heading-selector button, .top-bar-actions .top-bar-item')
     .forEach((button) => {
       button.disabled = isReadonly
     })
-  editorRootRef.value?.querySelectorAll<HTMLButtonElement>('.markdown-tools-menu .markdown-toolbar-menu__item')
+  editorRootRef.value?.querySelectorAll<HTMLButtonElement>('.markdown-font-size-menu__item')
     .forEach((button) => {
-      button.disabled = isReadonly && button.dataset.previewAllowed !== 'true'
+      button.disabled = isReadonly
     })
   closeToolbarMenus()
 }
 
 /**
- * 切换整篇文档的编辑和预览状态。
+ * 解析预览里嵌入卡片的标题。
  *
+ * 占位 div 的 `title` 属性只有「带标题插入」时才有，实际多数卡片没写，
+ * 因此这里按 ID 回查工作区笔记列表 —— 渲染模块本身不认识笔记库，标题只能由这边注入。
+ *
+ * :param noteId: 被嵌入的笔记 ID。
+ * :return: 笔记标题；查不到返回 null。
+ */
+function resolveEmbedTitle(noteId: string): string | null {
+  return props.allNotes.find((note) => note.id === noteId)?.title ?? null
+}
+
+/**
+ * 预览正文。只读：唯一数据来源是正文本身，渲染结果绝不回流保存链路。
+ *
+ * 渲染规则（表格单元格的块级处理、公式、嵌入卡片占位）都在 `src/utils/markdown-preview.ts`，
+ * 与本地文件预览共用 —— 两处预览必须长得一样，规则只留一份。
+ *
+ * :return: 已清洗的 HTML 字符串。
+ */
+function resolvePreviewHtml(): string {
+  // 笔记正文没有磁盘路径：传空串，相对路径原样返回（`file:` 与网络地址仍会归一）。
+  const parsed = new DOMParser().parseFromString(
+    renderPreviewMarkdown(contentValue.value, { resolveEmbedTitle }),
+    'text/html'
+  )
+  for (const image of parsed.querySelectorAll('img')) {
+    const resolved = resolvePreviewImageSource(image.getAttribute('src') ?? '', '')
+    if (resolved) image.setAttribute('src', resolved)
+  }
+  // 清洗必须放行 `xinyue-asset:`（本地图片走这个协议），否则 src 会被整条剥掉。
+  return sanitizePreviewHtml(parsed.body.innerHTML)
+}
+
+/** 只在预览态渲染：关着的时候这个 computed 不被任何渲染读取，也不会白跑一遍解析。 */
+const previewHtml = computed(() => (previewMode.value ? resolvePreviewHtml() : ''))
+
+/**
+ * 切到编辑 / 预览模式。
+ *
+ * 预览是「盖上去」而不是「换掉」：编辑器对象、DOM 与滚动位置都不动，
+ * 所以退出预览后光标、选区、撤销栈、阅读位置全部原样还在。
+ *
+ * :param next: true = 进预览，false = 回编辑。
  * :return: 无返回值。
  */
-function togglePreview(): void {
+function setPreviewMode(next: boolean): void {
   if (props.readonly || !editor || !editorReady) return
-  previewMode.value = !previewMode.value
+  if (previewMode.value === next) return
+  previewMode.value = next
   syncPreviewReadonly()
   if (previewMode.value) {
     const activeElement = document.activeElement
     if (activeElement instanceof HTMLElement) activeElement.blur()
     window.getSelection()?.removeAllRanges()
+    // 弹层挂在文档里，不收掉会浮在预览层上面（字号下拉、链接候选、右键菜单…）。
+    closeToolbarMenus()
+    closeLinkSuggest()
+    closeEditorContextMenu()
+    closeImageContextMenu()
   }
-  syncPreviewToggle()
-  void nextTick(updateActiveOutline)
+  // 预览层是这一帧才建出来的，滚动位置要等它上屏后才量得准。
+  void nextTick(() => {
+    // 接着用户刚才读到的位置继续，而不是把长文档拉回开头。
+    scrollToOutline(activeOutlineIndex.value, 'auto')
+    updateActiveOutline()
+  })
+}
+
+/** 在两种模式之间来回切（查找这类「先退回编辑态」的内部调用用）。 */
+function togglePreview(): void {
+  setPreviewMode(!previewMode.value)
 }
 
 /**
- * 设置正文显示字号（下拉选中）。
+ * 把字号应用到当前选区 / 待用格式（下拉选中）。
  *
- * 只改显示，不动正文源码 —— markdown 没有行内字号语法，把字号写进正文会污染源码、
- * 影响 Web 端渲染与 Markdown 导出。
+ * ## 语义（2026-09-24 用户定义，与粗体/斜体完全一致）
  *
- * :param index: 目标档位下标，越界由 fontSizeAt 回落到默认档。
+ *  - **有选区**：给选中的文字单独设字号 —— 写进正文源码，保存后依然在；
+ *  - **无选区**（或选区全是空白）：只改 `storedMarks`，即**只有后续新打的字**带这个字号，
+ *    已有正文一个字都不动；**没有「整篇缩放」这一档**。
+ *  - 设回默认值（15px）时**移除标记**，而不是写一个 `<span style="font-size:15px">` ——
+ *    后者与不写等价，却会污染源码。
+ *
+ * ## 落盘形式
+ *
+ * markdown 没有行内字号语法，只能落成标准 HTML：
+ * `<span style="font-size:18px">…</span>`。Web 端 `marked` 原样保留行内 HTML（已实测），
+ * 第三方渲染器（如 GitHub）可能抹掉 style，安全降级为纯文本。
+ *
+ * :param size: 目标字号（px），取自 FONT_SCALE_STEPS。
  * :return: 无返回值。
  */
-function setFontSize(index: number): void {
-  fontScaleIndex.value = Number.isInteger(index) ? index : DEFAULT_FONT_SCALE_INDEX
-  try {
-    // 存字号而非档位下标：档位列表日后调整时，已存的值不会被静默串档。
-    window.localStorage.setItem(FONT_SCALE_STORAGE_KEY, String(bodyFontSize.value))
-  } catch {
-    // 隐私模式等场景下 localStorage 可能不可写，字号仍在本会话生效，不打断用户。
-  }
+function applyInlineFontSize(size: number): void {
+  if (!editor || !editorReady) return
+  const target = Number.isFinite(size) && size > 0 ? Math.round(size) : DEFAULT_BODY_FONT_SIZE
+  const isDefault = isDefaultFontSize(target)
+  editor.editor.action((ctx) => {
+    const view = ctx.get(editorViewCtx)
+    const markType = view.state.schema.marks[FONT_SIZE_MARK_NAME]
+    if (!markType) return
+    const { state } = view
+    const tr = state.tr
+    // 空选区、或选区里全是空白（空行/缩进）都按「待用格式」处理：给空白加字号 span
+    // 毫无意义，还会在源码里留下 `<span style="font-size:18px"> </span>` 这种垃圾。
+    const selectedText = state.doc.textBetween(state.selection.from, state.selection.to, '\n', ' ')
+    if (state.selection.empty || isBlankText(selectedText)) {
+      // `storedMarks` 是「下一个输入字符将采用的标记集合」，null 表示跟随光标位置。
+      const base = state.storedMarks ?? state.selection.$from.marks()
+      // 先移除再添加 —— **替换**而非叠加。mark 声明了 `excludes: ''`（为了不影响已有文档里
+      // 嵌套的旧标记），`addToSet` 不会顶掉同类型标记，所以必须自己清一遍。
+      const next = markType.removeFromSet(base)
+      tr.setStoredMarks(isDefault ? next : markType.create({ size: target }).addToSet(next))
+    } else {
+      state.selection.ranges.forEach((range) => {
+        tr.removeMark(range.$from.pos, range.$to.pos, markType)
+        if (!isDefault) {
+          tr.addMark(range.$from.pos, range.$to.pos, markType.create({ size: target }))
+        }
+      })
+    }
+    view.dispatch(tr)
+    // 触发器与选项都走 pointerdown + preventDefault，焦点本就不该离开正文；
+    // 这里再兜一次，保证「设完字号直接打字」时输入落在编辑器里
+    // —— `storedMarks` 只在光标态有效，焦点跑了就白设。
+    view.focus()
+  })
+  fontSizeMenuValue.value = target
   syncFontSizeMenu()
-  showFeedback(`正文字号 ${bodyFontSize.value}px`)
+  showFeedback(`字号 ${target}px`)
 }
 
 /**
- * 从 localStorage 恢复上次选择的字号档位。
+ * 读出当前选区 / 光标处的字号，用于刷新下拉显示与打勾。
  *
- * 越界或非数字一律回落到默认档，避免历史脏数据把界面顶到极端字号。
+ *  - 有选区 → 取**选区起点**处的字号（与粗体按钮的 active 判定同一套口径）；
+ *  - 无选区 → 先看待用字号（`storedMarks`），其次看光标处字号；
+ *  - 都取不到 → 正文默认值。
  *
- * :return: 无返回值。
+ * :return: 字号（px）。
  */
-function restoreFontSize(): void {
-  let stored: string | null = null
-  try {
-    stored = window.localStorage.getItem(FONT_SCALE_STORAGE_KEY)
-  } catch {
-    return
-  }
-  fontScaleIndex.value = parseStoredFontScale(stored)
+function readSelectionFontSize(): number {
+  if (!editor || !editorReady) return DEFAULT_BODY_FONT_SIZE
+  let size = DEFAULT_BODY_FONT_SIZE
+  editor.editor.action((ctx) => {
+    const view = ctx.get(editorViewCtx)
+    const markType = view.state.schema.marks[FONT_SIZE_MARK_NAME]
+    if (!markType) return
+    const { state } = view
+    const parsed = Number(markType.isInSet(state.storedMarks ?? state.selection.$from.marks())?.attrs.size)
+    if (Number.isFinite(parsed) && parsed > 0) size = parsed
+  })
+  return size
+}
+
+/**
+ * 大纲跳转后，标题上方保留的呼吸位。
+ *
+ * 编辑态还要**另外**让开 Crepe 那条 sticky 顶栏（`.milkdown-top-bar`，实测 48px）：
+ * 它压在滚动容器顶部、又不在预览层的裁剪祖先里，不让开就会盖住标题。
+ * 预览层的滚动容器上方没有任何遮挡，所以只剩这个呼吸位。
+ */
+const OUTLINE_SCROLL_GAP = 14
+
+/**
+ * 滚动高亮（大纲当前项）相对跳转落点的提前量。
+ *
+ * 取 24：编辑态下「顶栏 48 + 呼吸 14 + 24 = 86」正好是改动前的阈值，高亮灵敏度零变化；
+ * 预览态则是「14 + 24 = 38」。滚动阅读时标题顶还没贴到落点就先亮起来，不会显得迟钝。
+ */
+const OUTLINE_ACTIVE_LEAD = 24
+
+/**
+ * 当前滚动容器顶部被遮住的高度。
+ *
+ * 顶栏高度按实时矩形取（`getBoundingClientRect`）而不是写死 48：窄窗口下工具项可能换行、
+ * 主题与字号也会影响它，同一个常量在别的上下文里就会错位。
+ *
+ * :return: 被遮挡的像素高度；预览态与没有顶栏的上下文都返回 0。
+ */
+function getOutlineScrollInset(): number {
+  if (previewMode.value) return 0
+  const topBar = editorRootRef.value?.querySelector<HTMLElement>('.milkdown-top-bar')
+  return topBar ? Math.round(topBar.getBoundingClientRect().height) : 0
 }
 
 /**
  * 滚动到指定标题。
  *
+ * 落点是「容器顶 + 遮挡高度 + 呼吸位」：标题停在紧贴顶部（编辑态则紧贴顶栏下沿）的位置。
+ * 早前两态共用一个写死的 78px —— 那是照编辑态（顶栏 48 + 呼吸 30）定的，
+ * 预览层没有顶栏，白白空出 78px，用户看到的就是「跳过去还离顶部老远」。
+ *
  * :param index: 标题在文档中的顺序。
+ * :param behavior: 滚动行为；进入预览时定位用 `auto`，用户点击大纲用 `smooth`。
  * :return: 无返回值。
  */
-function scrollToOutline(index: number): void {
-  const scrollContainer = editorScrollRef.value
-  const heading = editorRootRef.value?.querySelectorAll<HTMLElement>(
-    '.ProseMirror h1, .ProseMirror h2, .ProseMirror h3, .ProseMirror h4, .ProseMirror h5, .ProseMirror h6'
-  )[index]
-  if (!scrollContainer || !heading) return
+function scrollToOutline(index: number, behavior: ScrollBehavior = 'smooth'): void {
+  const { container, headings } = getOutlineScope()
+  const heading = headings[index]
+  if (!container || !heading) return
   const top = heading.getBoundingClientRect().top
-    - scrollContainer.getBoundingClientRect().top
-    + scrollContainer.scrollTop
-    - 78
+    - container.getBoundingClientRect().top
+    + container.scrollTop
+    - (getOutlineScrollInset() + OUTLINE_SCROLL_GAP)
   activeOutlineIndex.value = index
-  scrollContainer.scrollTo({ top: Math.max(0, top), behavior: 'smooth' })
+  container.scrollTo({ top: Math.max(0, top), behavior })
 }
 
 /**
@@ -1817,10 +2396,8 @@ function positionToolbarMenu(menu: HTMLElement, panel: HTMLDivElement): void {
   panel.classList.add('is-portal-open')
   const panelWidth = panel.offsetWidth
   const centeredLeft = toggleRect.left + toggleRect.width / 2 - panelWidth / 2
-  // 「更多」与字号下拉都靠右/左对齐到触发器边缘，其余居中 —— 与各自面板的静态定位保持一致。
-  const alignedLeft = menu.classList.contains('markdown-tools-menu')
-    ? toggleRect.right - panelWidth
-    : menu.classList.contains('markdown-font-size-menu') ? toggleRect.left : centeredLeft
+  // 字号下拉左对齐到触发器边缘，其余居中 —— 与各自面板的静态定位保持一致。
+  const alignedLeft = menu.classList.contains('markdown-font-size-menu') ? toggleRect.left : centeredLeft
   const left = Math.max(12, Math.min(alignedLeft, window.innerWidth - panelWidth - 12))
   panel.style.left = `${left}px`
   panel.style.top = `${Math.min(toggleRect.bottom + 7, window.innerHeight - panel.offsetHeight - 12)}px`
@@ -1863,9 +2440,8 @@ function createToolbarActionButton(item: ToolbarActionItem): HTMLButtonElement {
   const button = document.createElement('button')
   button.type = 'button'
   button.className = 'markdown-toolbar-menu__item'
-  button.dataset.action = item.label === '专注模式' ? 'focus-mode' : item.label
+  button.dataset.action = item.label
   button.dataset.label = item.label
-  button.dataset.previewAllowed = String(Boolean(item.previewAllowed))
   button.setAttribute('aria-label', item.label)
   render(h(Icon, { icon: item.icon, 'aria-hidden': 'true' }), button)
   button.addEventListener('click', () => {
@@ -1935,8 +2511,8 @@ function createToolbarMenu(options: ToolbarMenuOptions, items: HTMLButtonElement
 /**
  * 同步字号下拉的选中态与触发器文案。
  *
- * 触发器只显示数值（如「15」），与钉钉字号下拉一致；
- * 面板里当前档位打勾。
+ * 触发器只显示数值（如「15」），与钉钉字号下拉一致；面板里当前档位打勾。
+ * 显示值来自 `fontSizeMenuValue`，由 `refreshFontSizeMenu()` 按选区刷新。
  *
  * :return: 无返回值。
  */
@@ -1945,21 +2521,89 @@ function syncFontSizeMenu(): void {
   if (!menu) return
   // 面板展开时会被 portal 到 body，选项不在 menu 子树里 —— 用面板映射兜底查找。
   const panel = toolbarMenuPanels.get(menu) ?? menu
-  const current = fontScaleIndex.value
+  const current = fontSizeMenuValue.value
   panel.querySelectorAll<HTMLButtonElement>('.markdown-font-size-menu__item').forEach((button) => {
-    const isActive = Number(button.dataset.fontSizeIndex) === current
+    const isActive = Number(button.dataset.fontSize) === current
     button.classList.toggle('active', isActive)
     button.setAttribute('aria-checked', String(isActive))
   })
   const value = menu.querySelector<HTMLElement>('.markdown-font-size-menu__value')
-  if (value) value.textContent = String(bodyFontSize.value)
+  if (value) value.textContent = String(current)
 }
 
 /**
- * 创建正文字号下拉（挂在「一级标题」块类型选择器之后）。
+ * 按当前选区重读字号并刷新下拉（选区/文档变化时调用）。
  *
- * 触发器结构与 Crepe 的块类型按钮对齐（数值 + 箭头），点开是一列字号，
- * 当前档位打勾。选中后写 localStorage，并同步组件根节点的 CSS 变量。
+ * 单独抽一层是因为语义已从「整篇显示参数」变成「跟随选区的格式」：
+ * 移动光标就要重算，`fontSizeMenuValue` 不能只在用户点下拉时更新。
+ *
+ * :return: 无返回值。
+ */
+function refreshFontSizeMenu(): void {
+  fontSizeMenuValue.value = readSelectionFontSize()
+  syncFontSizeMenu()
+}
+
+/**
+ * 创建字号选项面板（顶栏下拉与选中气泡共用同一份 DOM 结构与交互）。
+ *
+ * ## ⚠️ 选项必须用 pointerdown + preventDefault
+ *
+ * 两个独立的坑都靠它解决：
+ *  1. 无选区时「设字号」改的是 `storedMarks`（待用格式），而 `storedMarks` 一旦编辑器失焦
+ *     就被清掉 —— 表现出来是「选了 20px，打出来还是 15px」，全程无报错；
+ *  2. 选中气泡的显示条件里有一条「`document.activeElement` 必须在正文或气泡内」，
+ *     焦点一旦跑到面板上，气泡会自己消失。
+ *
+ * :return: 面板节点。
+ */
+function createFontSizePanel(): HTMLDivElement {
+  const panel = document.createElement('div')
+  panel.className = 'markdown-font-size-menu__panel'
+  panel.setAttribute('role', 'listbox')
+  panel.setAttribute('aria-label', '字号')
+  panel.addEventListener('pointerdown', (event) => event.stopPropagation())
+  panel.addEventListener('click', (event) => event.stopPropagation())
+
+  FONT_SCALE_STEPS.forEach((size) => {
+    const option = document.createElement('button')
+    option.type = 'button'
+    option.className = 'markdown-font-size-menu__item'
+    option.dataset.fontSize = String(size)
+    option.setAttribute('role', 'option')
+    option.setAttribute('aria-label', `${size}px`)
+    // 用真实文本节点而非 ::after 伪元素 —— 伪元素内容不进 textContent，
+    // 列表项对读屏与自动化都取不到文本。
+    option.textContent = String(size)
+    // 初始选中态在创建时就设好：顶栏下拉这一刻还没插进 DOM（调用方还要 heading.after(...)），
+    // 走 syncFontSizeMenu() 查询会落空，导致打开下拉时「一项都没打勾」。
+    // 气泡面板会在打开时整体重算，不依赖这个初值。
+    const isActive = size === fontSizeMenuValue.value
+    option.classList.toggle('active', isActive)
+    option.setAttribute('aria-checked', String(isActive))
+    option.addEventListener('pointerdown', (event) => {
+      event.preventDefault()
+      event.stopPropagation()
+      applyInlineFontSize(size)
+      closeToolbarMenus()
+    })
+    // 见上方说明：pointerdown 被 preventDefault 后浏览器仍可能补一个 click，
+    // 它冒泡到 document 会被 closeToolbarMenus 捕获，把刚关掉/刚打开的面板状态打乱。
+    option.addEventListener('click', (event) => event.stopPropagation())
+    panel.append(option)
+  })
+  return panel
+}
+
+/**
+ * 创建字号下拉（挂在「一级标题」块类型选择器之后）。
+ *
+ * 触发器结构与 Crepe 的块类型按钮对齐（数值 + 箭头），点开是一列字号，当前档位打勾。
+ * 选项面板与选中气泡里的那份由 `createFontSizePanel()` 共用。
+ *
+ * ## ⚠️ 必须用 pointerdown 而不是 click
+ *
+ * 见 `createFontSizePanel()` 的两条说明（`storedMarks` 失焦即丢 / 气泡失焦即消失）。
  *
  * :return: 下拉容器。
  */
@@ -1971,55 +2615,277 @@ function createFontSizeMenu(): HTMLDivElement {
   toggle.type = 'button'
   toggle.className = 'markdown-font-size-menu__toggle top-bar-item'
   toggle.dataset.label = '字号'
-  toggle.setAttribute('aria-label', '正文字号')
+  toggle.setAttribute('aria-label', '字号')
   toggle.setAttribute('aria-haspopup', 'listbox')
   toggle.setAttribute('aria-expanded', 'false')
 
   const value = document.createElement('span')
   value.className = 'markdown-font-size-menu__value'
-  value.textContent = String(bodyFontSize.value)
+  value.textContent = String(fontSizeMenuValue.value)
   const chevron = document.createElement('span')
   chevron.className = 'markdown-font-size-menu__chevron'
   chevron.setAttribute('aria-hidden', 'true')
   render(h(Icon, { icon: 'material-symbols:keyboard-arrow-down-rounded', 'aria-hidden': 'true' }), chevron)
   toggle.append(value, chevron)
 
-  const panel = document.createElement('div')
-  panel.className = 'markdown-font-size-menu__panel'
-  panel.setAttribute('role', 'listbox')
-  panel.setAttribute('aria-label', '正文字号')
-  panel.addEventListener('click', (event) => event.stopPropagation())
+  const panel = createFontSizePanel()
 
-  FONT_SCALE_STEPS.forEach((size, index) => {
-    const option = document.createElement('button')
-    option.type = 'button'
-    option.className = 'markdown-font-size-menu__item'
-    option.dataset.fontSizeIndex = String(index)
-    option.setAttribute('role', 'option')
-    option.setAttribute('aria-label', `${size}px`)
-    // 用真实文本节点而非 ::after 伪元素 —— 伪元素内容不进 textContent，
-    // 列表项对读屏与自动化都取不到文本。
-    option.textContent = String(size)
-    // 初始选中态在创建时就设好：此时菜单尚未插入 DOM（调用方还要 heading.after(...)），
-    // 走 syncFontSizeMenu() 查询会落空，导致打开下拉时「一项都没打勾」。
-    const isActive = index === fontScaleIndex.value
-    option.classList.toggle('active', isActive)
-    option.setAttribute('aria-checked', String(isActive))
-    option.addEventListener('click', () => {
-      setFontSize(index)
-      closeToolbarMenus()
-    })
-    panel.append(option)
-  })
-
-  toggle.addEventListener('click', (event) => {
+  toggle.addEventListener('pointerdown', (event) => {
+    event.preventDefault()
     event.stopPropagation()
     toggleToolbarMenu(menu)
   })
+  // 同理：刚打开的菜单不能被随后补上的 click 立刻关掉。
+  toggle.addEventListener('click', (event) => event.stopPropagation())
 
   menu.append(toggle, panel)
   toolbarMenuPanels.set(menu, panel)
   return menu
+}
+
+/**
+ * 选中气泡里「字号」面板的宿主占位节点（不可见）。
+ *
+ * Crepe 的 Toolbar 组件在**每次选区变化时都会重渲染**，往气泡里插自己的 DOM 会被 Vue 清掉，
+ * 所以面板实际挂到 `document.body`；但 `closeToolbarMenus()` 的统一关闭逻辑是按
+ * 「宿主元素 → 面板」映射驱动的，故造一个隐藏宿主挂进编辑器根节点，把这套关闭机制复用过来。
+ */
+let bubbleFontSizeHost: HTMLDivElement | null = null
+
+/**
+ * 在选中气泡里找回「字号」触发器按钮。
+ *
+ * Crepe 的 Toolbar 只给每个项渲染属性写死的 `button.toolbar-item`（挂不了自定义属性），
+ * 所以拿图标里的标记 span 作为锚点反查（见 `FONT_SIZE_TRIGGER_ICON`）。
+ *
+ * :return: 触发器按钮；气泡尚未渲染时返回 null。
+ */
+function findBubbleFontSizeTrigger(): HTMLElement | null {
+  const marker = editorRootRef.value?.querySelector<HTMLElement>('.milkdown-toolbar .xynote-fs-trigger')
+  return marker?.closest<HTMLElement>('.toolbar-item') ?? null
+}
+
+/**
+ * 按当前选区刷新气泡字号面板的打勾状态。
+ *
+ * 气泡只在有选区时出现，所以这里读到的必然是选区起点处的字号（与 B/I/S 的 active 同一口径）。
+ *
+ * :param panel: 字号面板。
+ * :return: 无返回值。
+ */
+function syncBubbleFontSizePanel(panel: HTMLDivElement): void {
+  const current = readSelectionFontSize()
+  panel.querySelectorAll<HTMLButtonElement>('.markdown-font-size-menu__item').forEach((button) => {
+    const isActive = Number(button.dataset.fontSize) === current
+    button.classList.toggle('active', isActive)
+    button.setAttribute('aria-checked', String(isActive))
+  })
+}
+
+/**
+ * 开合选中气泡内的字号面板（贴在「字号」按钮正下方）。
+ *
+ * 复用顶栏那套「portals 到 body + `is-portal-open` 固定定位 + `toolbarMenuPanels` 统一关闭」，
+ * 因此滚动、失焦、切换预览等既有路径都能把它一并收掉。
+ *
+ * :return: 无返回值。
+ */
+function toggleBubbleFontSizePanel(): void {
+  const trigger = findBubbleFontSizeTrigger()
+  if (!trigger) return
+
+  const wasOpen = bubbleFontSizeHost?.classList.contains('is-open') ?? false
+  closeToolbarMenus()
+  if (wasOpen) return
+
+  if (!bubbleFontSizeHost) {
+    bubbleFontSizeHost = document.createElement('div')
+    bubbleFontSizeHost.className = 'markdown-font-size-menu__bubble-host'
+    bubbleFontSizeHost.hidden = true
+    toolbarMenuPanels.set(bubbleFontSizeHost, createFontSizePanel())
+  }
+  editorRootRef.value?.append(bubbleFontSizeHost)
+  const panel = toolbarMenuPanels.get(bubbleFontSizeHost)
+  if (!panel) return
+
+  syncBubbleFontSizePanel(panel)
+  bubbleFontSizeHost.classList.add('is-open')
+  document.body.append(panel)
+  panel.classList.add('is-portal-open')
+
+  const rect = trigger.getBoundingClientRect()
+  const panelWidth = panel.offsetWidth
+  const panelHeight = panel.offsetHeight
+  const left = Math.max(12, Math.min(rect.left + rect.width / 2 - panelWidth / 2, window.innerWidth - panelWidth - 12))
+  panel.style.left = `${left}px`
+  // ⚠️ 默认贴在按钮**下方**，但面板已有 17 档、最高 320px：按钮一旦落在窗口下半部，
+  // 原来的「贴下方 + clamp 进窗口」会把面板顶回去**盖在按钮上**。后果有两个：
+  //   1. 用户没法再点同一个按钮把面板收起来（按钮被盖住了）；
+  //   2. 更糟 —— 松开鼠标时落点注定在面板里，`click` 的 target 变成 BODY，
+  //      关闭守卫落空、面板当场消失（见 trackBubbleFontSizePointerDown()）。
+  // 所以下方放不下时**翻到按钮上方**，两边都放不下才退回 clamp。
+  const gap = 8
+  const fitsBelow = rect.bottom + gap + panelHeight <= window.innerHeight - 12
+  const fitsAbove = rect.top - gap - panelHeight >= 12
+  const top = fitsBelow || !fitsAbove ? rect.bottom + gap : rect.top - gap - panelHeight
+  panel.style.top = `${Math.max(12, Math.min(top, window.innerHeight - panelHeight - 12))}px`
+}
+
+/**
+ * 「这次按下是否落在气泡的字号按钮上」—— 留给随后那次 click 判定用。
+ *
+ * 为什么不能直接看 click 的落点，见 `trackBubbleFontSizePointerDown()` 的说明。
+ */
+let bubbleFontSizeArmed = false
+
+/**
+ * 记录「这次 pointerdown 是否落在气泡的字号按钮上」。
+ *
+ * 面板的**打开**动作在 `pointerdown`（Crepe 的 Toolbar 只监听 pointerdown），而 **收起**动作在
+ * `document` 上常驻的 `closeToolbarMenus`（监听 click）；不拦住紧随其后的 click，面板刚开就会被关。
+ *
+ * ## ⚠️ 判定必须用「按下」的落点，不能用「松开」的落点
+ *
+ * `click` 的 target 是 mousedown 与 mouseup 两点的**最近公共祖先**，而面板就贴在按钮下方 8px 处
+ * 展开 —— 真人松开时只要比按下时低 8px 以上，`mouseup` 就落进面板里，`click` 的 target 直接从
+ * `BUTTON.toolbar-item` 变成 `BODY`，任何基于 `closest()` 的落点判定都会**静默落空**
+ * （实测：原地松开 target 是 `BUTTON.toolbar-item`，下飘 20px 变成 `DIV.milkdown-toolbar`，
+ * 落进面板变成 `BODY`）。现象就是「按住时面板在，一松手就没了」。
+ *
+ * 而 `pointerdown` 发生在**面板打开之前**，落点还没被面板遮住，也不受松开那一刻位移的影响
+ * —— 与 Crepe 自己开合面板用的是同一个事件、同一个落点口径，天然不会跑偏。
+ *
+ * 标记 span（`.xynote-fs-trigger`）只是按钮内的锚点，所以先回到**整个按钮**再反查它：
+ * 按钮被 `:has()` 从 30px 放宽到 43px（给下拉箭头留位），落在左右留白上时
+ * `event.target` 是 `button` 本身，只认 span 会命中不到。
+ *
+ * :param event: 指针按下事件。
+ * :return: 无返回值。
+ */
+function trackBubbleFontSizePointerDown(event: PointerEvent): void {
+  const target = event.target as Element | null
+  const item = target?.closest?.<HTMLElement>('.milkdown-toolbar .toolbar-item')
+  bubbleFontSizeArmed = Boolean(item?.querySelector('.xynote-fs-trigger'))
+}
+
+/**
+ * 放行「按下气泡字号按钮」之后补上的那次 click。
+ *
+ * 只看 `trackBubbleFontSizePointerDown()` 在**按下时**打的标记，不看这次 click 的落点
+ * （原因见该函数）。必须注册在**捕获阶段**，早于 document 冒泡阶段注册的 `closeToolbarMenus`。
+ *
+ * :param event: 点击事件。
+ * :return: 无返回值。
+ */
+function guardBubbleFontSizeClick(event: MouseEvent): void {
+  if (!bubbleFontSizeArmed) return
+  bubbleFontSizeArmed = false
+  event.stopPropagation()
+}
+
+/** 盯气泡 `style` 属性的观察器（floating-ui 每次写完坐标都会触发）。 */
+let bubbleAvoidObserver: MutationObserver | null = null
+
+/** 等气泡容器出现的一次性观察器（Crepe 首帧不一定已经把它挂进 `.milkdown`）。 */
+let bubbleAppearObserver: MutationObserver | null = null
+
+/**
+ * 气泡撞到顶栏时，把它翻到**选区下方**。
+ *
+ * ## 为什么需要这一步
+ *
+ * 顶栏是 `position: sticky` 且在**滚动容器内部**（`.milkdown-editor-scroll` 里），而
+ * floating-ui 的 `flip()` 只按「裁剪祖先」算空间 —— 顶栏占的那 48px 照样算「上方有空间」，
+ * 于是气泡不会翻转，直接落在 `选区 top − 10 − 46` 处。若选区就在文档首行（或滚动后紧贴顶栏
+ * 的那一行），气泡的上半截会插进顶栏里：实测顶栏 bottom=242 而气泡 top=226.5，
+ * **15.5px 被盖住**，连 12px 圆角一起被吃掉（看起来「上沿切平、贴在顶栏下沿」）。
+ *
+ * 层级那边另有兜底（`src/style.css` 把气泡抬到 z-index 30），但那只能保证「不被吃掉」，
+ * 会变成气泡糊在顶栏上；这里负责给出真正合理的落点 —— 与钉钉 / Word 一致：
+ * **上方放不下就翻到选区下方**。
+ *
+ * ## 为什么用 MutationObserver 盯 `style`
+ *
+ * 坐标是 floating-ui 在 `computePosition()` 的 promise 里写进内联样式的（还带 20ms 节流），
+ * 项目侧接不到它的回调，也无法给它注入 middleware（Crepe 把 TooltipProvider 写死在
+ * `feature/toolbar/index.js` 里）。**它写坐标的那一刻**就是唯一可靠的时机。
+ *
+ * 不会和它打架：只在「气泡确实压住了顶栏」时才动手，且位移小于 0.5px 直接返回 ——
+ * 自己写进去的 top 会再触发一次回调，那次判定必然「没撞上」（气泡已被挪到顶栏下方），
+ * 于是自激在第一轮就停住。
+ *
+ * :param toolbar: 气泡容器 `.milkdown-toolbar`。
+ * :return: 无返回值。
+ */
+function avoidToolbarTopBarCover(toolbar: HTMLElement): void {
+  const topBar = editorRootRef.value?.querySelector<HTMLElement>('.milkdown-top-bar')
+  if (!topBar) return
+  const rect = toolbar.getBoundingClientRect()
+  // 隐藏态（`data-show="false"` → `display: none`）尺寸全为 0，直接跳过。
+  if (rect.height <= 0 || rect.width <= 0) return
+
+  const barRect = topBar.getBoundingClientRect()
+  // 没压住顶栏就什么都不做 —— 保持 floating-ui 的原生落点。
+  if (rect.top >= barRect.bottom - 0.5) return
+
+  const gap = 8
+  // 首选：贴着选区下方 10px（与 floating-ui 的 offset 同量级）。
+  const selection = window.getSelection()
+  const selectionRect = selection?.rangeCount ? selection.getRangeAt(0).getBoundingClientRect() : null
+  let targetTop = selectionRect && selectionRect.height > 0 ? selectionRect.bottom + 10 : Number.NaN
+  // 选区拿不到、或翻下去仍会压住顶栏时，退化成「贴着顶栏下沿」。
+  if (!Number.isFinite(targetTop) || targetTop < barRect.bottom + gap) targetTop = barRect.bottom + gap
+  // 别掉出视口下沿（长文档 + 选区贴近底部时的兜底）。
+  targetTop = Math.min(targetTop, window.innerHeight - gap - rect.height)
+
+  // ⚠️ 用「当前内联 top + 需要下移多少」增量算，不要自己拼绝对坐标 ——
+  // 内联 top 是相对气泡 offsetParent（实测是 `.milkdown`）的，绝对值换算要处理它的
+  // 边框 / 滚动偏移，增量法天然免疫。
+  const currentTop = Number.parseFloat(toolbar.style.top) || 0
+  const nextTop = currentTop + (targetTop - rect.top)
+  if (Math.abs(nextTop - currentTop) < 0.5) return
+  toolbar.style.top = `${nextTop}px`
+}
+
+/**
+ * 给气泡挂上避让观察器（floating-ui 每写一次坐标就检查一次）。
+ *
+ * :param toolbar: 气泡容器。
+ * :return: 无返回值。
+ */
+function observeBubbleTopBarCover(toolbar: HTMLElement): void {
+  bubbleAvoidObserver?.disconnect()
+  bubbleAvoidObserver = new MutationObserver(() => avoidToolbarTopBarCover(toolbar))
+  bubbleAvoidObserver.observe(toolbar, { attributes: true, attributeFilter: ['style'] })
+}
+
+/**
+ * 启动「气泡避让顶栏」。
+ *
+ * 气泡容器是 Crepe 在首次 update 时才挂进 `.milkdown` 的，创建编辑器那一刻不一定存在；
+ * 不存在就先拿一个只盯 `.milkdown` 直接子节点的观察器等它出现，出现后再换成盯 `style` 的那个。
+ *
+ * :return: 无返回值。
+ */
+function startBubbleTopBarAvoidance(): void {
+  const root = editorRootRef.value
+  if (!root) return
+  const toolbar = root.querySelector<HTMLElement>('.milkdown-toolbar')
+  if (toolbar) {
+    observeBubbleTopBarCover(toolbar)
+    return
+  }
+  const milkdown = root.querySelector<HTMLElement>('.milkdown')
+  if (!milkdown) return
+  bubbleAppearObserver?.disconnect()
+  bubbleAppearObserver = new MutationObserver(() => {
+    const appeared = root.querySelector<HTMLElement>('.milkdown-toolbar')
+    if (!appeared) return
+    bubbleAppearObserver?.disconnect()
+    bubbleAppearObserver = null
+    observeBubbleTopBarCover(appeared)
+  })
+  bubbleAppearObserver.observe(milkdown, { childList: true })
 }
 
 /** 执行编辑器撤销命令。 */
@@ -2069,24 +2935,6 @@ async function copyMarkdown(): Promise<void> {
   } catch {
     showFeedback('复制失败，请检查剪贴板权限')
   }
-}
-
-/** 同步专注模式按钮状态。 */
-function syncFocusModeToggle(): void {
-  const button = editorRootRef.value?.querySelector<HTMLButtonElement>('[data-action="focus-mode"]')
-  if (!button) return
-  const label = focusMode.value ? '退出专注' : '专注模式'
-  button.dataset.label = label
-  button.setAttribute('aria-label', label)
-  button.classList.toggle('active', focusMode.value)
-}
-
-/** 切换编辑器专注模式。 */
-function toggleFocusMode(): void {
-  focusMode.value = !focusMode.value
-  document.body.classList.toggle('markdown-editor-focus-mode', focusMode.value)
-  syncFocusModeToggle()
-  closeToolbarMenus()
 }
 
 /**
@@ -2143,7 +2991,6 @@ function handleEditorDocumentKeydown(event: KeyboardEvent): void {
   if (event.key !== 'Escape') return
   closeImageContextMenu()
   closeToolbarMenus()
-  if (focusMode.value) toggleFocusMode()
 }
 
 /**
@@ -2177,13 +3024,8 @@ function groupTopBarActions(actions: HTMLElement): void {
     ...pickButtons(['表格', '公式', '引用', '分隔线']),
     createToolbarActionButton({ label: '行内公式', icon: 'material-symbols:functions-rounded', action: toggleInlineFormula })
   ])
-  const toolsMenu = createToolbarMenu({
-    key: 'tools', label: '更多', icon: 'material-symbols:more-horiz', className: 'markdown-tools-menu'
-  }, [
-    createToolbarActionButton({ label: '复制 Markdown', icon: 'material-symbols:content-copy-outline-rounded', action: copyMarkdown, previewAllowed: true }),
-    createToolbarActionButton({ label: '专注模式', icon: 'material-symbols:fullscreen-rounded', action: toggleFocusMode, previewAllowed: true })
-  ])
-  toolsMenu.querySelector('.markdown-toolbar-menu__toggle')?.classList.add('markdown-tools-menu-toggle')
+  // 「更多」菜单随「复制 Markdown」「专注模式」一起下线：前者搬到常驻模式条
+  // （预览态顶栏被整层盖住，放这里点不到），后者整体去掉。
   actions.replaceChildren(
     createTopBarActionButton({ label: '撤销', icon: 'material-symbols:undo-rounded', action: undoEditor }),
     createTopBarActionButton({ label: '重做', icon: 'material-symbols:redo-rounded', action: redoEditor }),
@@ -2194,11 +3036,8 @@ function groupTopBarActions(actions: HTMLElement): void {
     createToolbarDivider(),
     ...pickButtons(['链接', '图片', '代码块']),
     createToolbarDivider(),
-    insertMenu,
-    createToolbarDivider(),
-    toolsMenu
+    insertMenu
   )
-  syncFocusModeToggle()
 }
 
 /**
@@ -2218,10 +3057,7 @@ function localizeTopBar(root: HTMLElement): void {
   const heading = inner?.querySelector<HTMLElement>('.top-bar-heading-selector')
   if (!inner || !heading) return
   if (inner.querySelector('.top-bar-actions')) {
-    syncOutlineToggle()
-    syncPreviewToggle()
-    syncFocusModeToggle()
-    syncFontSizeMenu()
+    refreshFontSizeMenu()
     syncHistoryActionButtons(root)
     return
   }
@@ -2233,34 +3069,16 @@ function localizeTopBar(root: HTMLElement): void {
     if (child !== heading) actions.append(child)
   })
   inner.append(actions)
-  // 字号下拉紧跟在「一级标题」块类型选择器之后 —— 两者都是「整篇文档的显示参数」，
+  // 字号下拉紧跟「一级标题」块类型选择器之后 —— 两者都作用于选中内容的排版格式，
   // 放一起比埋进「更多」菜单里少一次点击。
   heading.after(createFontSizeMenu())
   groupTopBarActions(actions)
-  actions.append(createToolbarDivider())
-
-  const outlineToggle = document.createElement('button')
-  outlineToggle.type = 'button'
-  outlineToggle.className = 'markdown-outline-toggle top-bar-item'
-  outlineToggle.setAttribute('aria-controls', 'markdown-outline-panel')
-  render(h(Icon, { icon: 'material-symbols:toc-rounded', 'aria-hidden': 'true' }), outlineToggle)
-  outlineToggle.addEventListener('click', toggleOutline)
-  actions.append(outlineToggle)
-
-  const previewToggle = document.createElement('button')
-  previewToggle.type = 'button'
-  previewToggle.className = 'markdown-preview-toggle top-bar-item'
-  render(h(Icon, { icon: 'material-symbols:visibility-outline-rounded', 'aria-hidden': 'true' }), previewToggle)
-  previewToggle.addEventListener('click', togglePreview)
-  actions.append(previewToggle)
 
   if (!toolbarEventsBound) {
     document.addEventListener('click', closeToolbarMenus)
     document.addEventListener('keydown', handleEditorDocumentKeydown)
     toolbarEventsBound = true
   }
-  syncOutlineToggle()
-  syncPreviewToggle()
   syncHistoryActionButtons(root)
 }
 
@@ -2323,7 +3141,28 @@ async function createEditor(): Promise<void> {
           })
         }
       },
-      [Crepe.Feature.LinkTooltip]: { inputPlaceholder: '粘贴链接地址…' },
+      [Crepe.Feature.LinkTooltip]: {
+        inputPlaceholder: '粘贴链接地址…',
+        // 左槽位改造成「打开 / 复制」两个按钮（Crepe 原本只给一个复制按钮、且点了没有任何提示）。
+        linkIcon: LINK_TOOLTIP_ACTIONS_ICON,
+        onCopyLink: () => showFeedback('链接已复制')
+      },
+      // 选中气泡（选区上方浮出的 B/I/S 工具条）里追加「字号」下拉。
+      // Crepe 的 Toolbar 只给每项渲染一个写死属性的 icon 按钮，没有下拉/文字能力，
+      // 所以这里只挂一个触发器，面板由 toggleBubbleFontSizePanel() 自己开。
+      [Crepe.Feature.Toolbar]: {
+        buildToolbar: (builder) => {
+          builder.getGroup('formatting').addItem('xynote-font-size', {
+            icon: FONT_SIZE_TRIGGER_ICON,
+            // 与 B/I/S 同一口径：选区起点带行内字号标记时点亮。
+            active: (activeCtx) => {
+              const markType = activeCtx.get(editorViewCtx).state.schema.marks[FONT_SIZE_MARK_NAME]
+              return Boolean(markType?.isInSet(activeCtx.get(editorViewCtx).state.selection.$from.marks()))
+            },
+            onRun: () => toggleBubbleFontSizePanel()
+          })
+        }
+      },
       [Crepe.Feature.CodeMirror]: {
         searchPlaceholder: '搜索代码语言', noResultText: '没有匹配结果', copyText: '复制',
         onCopy: () => showFeedback('代码已复制'),
@@ -2356,9 +3195,24 @@ async function createEditor(): Promise<void> {
   // 内联 <br> 保真：抢在 commonmark 内置 remarkPreserveEmptyLinePlugin 之前改写节点，
   // 否则用户正文里的 <br> 会被当作「空行占位符」直接删除。见 src/editor/xynote-hardbreak.ts
   crepe.addFeature(installHardbreakFeature)
+  // 行内字号：把 `<span style="font-size:…">` 往返成可编辑的 mark。
+  // 见 src/editor/xynote-font-size.ts 与 src/utils/inline-font-size.ts
+  crepe.addFeature(installFontSizeFeature)
   crepe.on((listener) => {
     listener.updated(() => {
       if (editorRootRef.value) syncHistoryActionButtons(editorRootRef.value)
+    })
+    // 字号下拉要跟随选区：移动光标 / 拖选后必须重算，否则触发器上的数值会停在旧位置
+    // （`storedMarks` 只在光标态有效，所以这里只能靠选区事件，不能靠文档更新事件）。
+    listener.selectionUpdated(() => {
+      if (!editorReady) return
+      // ⚠️ 这个回调是在 ProseMirror 的 `state.apply` **内部**同步触发的，
+      // 此刻 `view.state` 仍是**上一个** state —— 直接读会永远慢一拍
+      // （下拉数值停在移动光标之前）。推到微任务里读，此时 dispatch 已返回。
+      queueMicrotask(() => {
+        if (!editorReady) return
+        refreshFontSizeMenu()
+      })
     })
     listener.markdownUpdated((_context, markdown) => {
       editorMarkdown = markdown
@@ -2383,7 +3237,9 @@ async function createEditor(): Promise<void> {
   }
   localizeTopBar(editorRootRef.value)
   startToolbarSync(editorRootRef.value)
+  startBubbleTopBarAvoidance()
   editorRootRef.value.addEventListener('click', handleEditorLinkClick)
+  editorRootRef.value.addEventListener('pointerdown', handleLinkTooltipPointerDown, true)
   editorRootRef.value.addEventListener('contextmenu', handleImageContextMenu)
   editorRootRef.value.addEventListener('contextmenu', handleEditorContextMenu)
   editorRootRef.value.addEventListener('click', handleJsonCodeFormatClick)
@@ -2393,6 +3249,18 @@ async function createEditor(): Promise<void> {
   crepe.editor.action((context) => {
     const view = context.get(editorViewCtx)
     linkSuggestEditorView = view
+    linkEditEditorView = view
+    // 链接编辑：接管 Crepe 自带的编辑气泡（一行光秃秃的输入框），换成自研的表单浮层。
+    // ⚠️「编辑」按钮与选中气泡里的「链接」按钮走的是**同一个 API**（editLink / addLink），
+    // 覆写一次两条入口一起改。覆写在 create() 之后，所以能盖掉插件安装时写入的实现。
+    context.update(linkTooltipAPI.key, (api) => ({
+      ...api,
+      addLink: (from, to) => openLinkEditor(null, from, to),
+      editLink: (mark, from, to) => openLinkEditor(mark, from, to)
+    }))
+    setLinkTooltipMode = (mode) => {
+      context.update(linkTooltipState.key, (state) => ({ ...state, mode }))
+    }
     view.setProps({
       decorations: (state) => createEditorDecorations(state.doc),
       handleKeyDown: handleSuggestKeydown,
@@ -2438,6 +3306,9 @@ function setContent(value: string, documentId: string): void {
 function findText(keyword: string, requestedIndex: number): { count: number, index: number } {
   const normalizedKeyword = keyword.trim().toLocaleLowerCase()
   if (!editor || !editorReady) return { count: 0, index: -1 }
+  // 预览层盖在编辑器上，高亮在里面看不见 —— 先带用户回到编辑态再定位。
+  // 与外部文件预览（MarkdownSourceEditor）同一处置：两边都是「预览不可编辑，查找要能看见」。
+  if (previewMode.value) togglePreview()
   const matches: Array<{ from: number, to: number }> = []
   editor.editor.action((context) => {
     const view = context.get(editorViewCtx)
@@ -2511,7 +3382,6 @@ watch(
 watch(() => props.readonly, syncPreviewReadonly)
 onMounted(() => {
   outlineOpen.value = props.showOutline && localStorage.getItem(OUTLINE_STORAGE_KEY) !== 'false'
-  restoreFontSize()
   scheduleOutlineUpdate(contentValue.value, editorDocumentId)
   document.addEventListener('keydown', syncLinkModifierState)
   document.addEventListener('keyup', syncLinkModifierState)
@@ -2519,6 +3389,10 @@ onMounted(() => {
   window.addEventListener('blur', clearLinkModifierState)
   document.addEventListener('pointerdown', closeImageContextMenu)
   document.addEventListener('pointerdown', closeEditorContextMenu)
+  // 捕获阶段：pointerdown 要先于 Crepe 的按钮处理打上标记，click 要先于 document 上冒泡阶段的
+  // closeToolbarMenus 执行 —— 两条配套，见 trackBubbleFontSizePointerDown()。
+  document.addEventListener('pointerdown', trackBubbleFontSizePointerDown, true)
+  document.addEventListener('click', guardBubbleFontSizeClick, true)
   editorScrollRef.value?.addEventListener('scroll', closeImageContextMenu, { passive: true })
   editorScrollRef.value?.addEventListener('scroll', closeEditorContextMenu, { passive: true })
   // 卡片右键：由 nodeView 深处的 CustomEvent 冒泡至此，复用右键菜单组件弹出卡片操作项
@@ -2554,20 +3428,31 @@ onBeforeUnmount(() => {
   jsonFormatObserver = null
   toolbarObserver?.disconnect()
   toolbarObserver = null
+  bubbleAvoidObserver?.disconnect()
+  bubbleAvoidObserver = null
+  bubbleAppearObserver?.disconnect()
+  bubbleAppearObserver = null
   editorRootRef.value?.removeEventListener('click', handleEditorLinkClick)
+  editorRootRef.value?.removeEventListener('pointerdown', handleLinkTooltipPointerDown, true)
   editorRootRef.value?.removeEventListener('contextmenu', handleImageContextMenu)
   editorRootRef.value?.removeEventListener('contextmenu', handleEditorContextMenu)
   editorRootRef.value?.removeEventListener('click', handleJsonCodeFormatClick)
   editorRootRef.value?.removeEventListener('paste', handleAttachmentPaste, true)
   editorRootRef.value?.removeEventListener('dragover', handleAttachmentDragOver)
   editorRootRef.value?.removeEventListener('drop', handleAttachmentDrop)
-  document.body.classList.remove('markdown-editor-focus-mode')
+  document.removeEventListener('pointerdown', trackBubbleFontSizePointerDown, true)
+  document.removeEventListener('click', guardBubbleFontSizeClick, true)
   if (toolbarEventsBound) {
     document.removeEventListener('click', closeToolbarMenus)
     document.removeEventListener('keydown', handleEditorDocumentKeydown)
   }
   closeToolbarMenus()
   toolbarMenuPanels.clear()
+  unbindLinkEditTracking()
+  linkEditState.value = null
+  linkEditEditorView = null
+  setLinkTooltipMode = null
+  bubbleFontSizeHost = null
   if (feedbackTimer) clearTimeout(feedbackTimer)
   if (outlineTimer) clearTimeout(outlineTimer)
   if (suppressionTimer) clearTimeout(suppressionTimer)
@@ -2600,4 +3485,133 @@ onBeforeUnmount(() => {
   gap: 10px;
   line-height: 16px;
 }
+
+/*
+  常驻模式条：占网格第 1 行，编辑区与预览层都在第 2 行 ——
+  这样两层永远待在模式条下面，不会像之前那样跟 Crepe 顶栏抢同一条位置。
+  第 1 行**跨满整幅宽度**（含侧栏那一列）：侧栏整列从第 2 行开始，顶部于是只剩一条横线，
+  模式条的「编辑 | 预览」不会跟侧栏的「大纲 | 关系」挤在同一水平带里。
+  视觉与本地文件预览那条完全同构（同一套字号 / 配色 / 按钮组）。
+*/
+.markdown-note-mode-bar {
+  grid-row: 1;
+  grid-column: 1 / -1;
+  height: 35px;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 0 16px;
+  border-bottom: 1px solid var(--line);
+  background: rgba(248, 251, 255, .82);
+  color: #99a4b3;
+  font-size: 9px;
+  font-weight: 800;
+  letter-spacing: .1em;
+}
+.markdown-note-mode-bar svg { font-size: 15px; }
+.markdown-note-mode-bar__mode { color: #6f8299; letter-spacing: .12em; }
+/*
+  模式条上的图标按钮（大纲开关 / 复制 Markdown）。
+  两个都必须放在这条上：顶栏在预览态被预览层整层盖住，放顶栏里是点不到的。
+*/
+.markdown-note-mode-bar__outline,
+.markdown-note-mode-bar__copy {
+  flex: 0 0 auto;
+  width: 26px;
+  height: 26px;
+  display: grid;
+  place-items: center;
+  margin-right: 2px;
+  border: 0;
+  border-radius: 7px;
+  background: none;
+  color: #7d8b9e;
+  cursor: pointer;
+}
+.markdown-note-mode-bar__outline:hover,
+.markdown-note-mode-bar__copy:hover { background: rgba(47, 128, 237, .09); color: #4a7fc1; }
+.markdown-note-mode-bar__outline.is-active { background: rgba(47, 128, 237, .13); color: #2268c7; }
+.markdown-note-mode-bar__hint {
+  min-width: 0;
+  flex: 1;
+  overflow: hidden;
+  color: #a9b5c5;
+  font-weight: 500;
+  letter-spacing: 0;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.markdown-note-mode-bar__modes {
+  flex: 0 0 auto;
+  display: flex;
+  gap: 2px;
+  padding: 2px;
+  border-radius: 7px;
+  background: rgba(47, 128, 237, .07);
+}
+.markdown-note-mode-bar__mode-button {
+  padding: 3px 9px;
+  border: 0;
+  border-radius: 5px;
+  background: none;
+  color: #7d8b9e;
+  font-family: inherit;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0;
+  cursor: pointer;
+}
+.markdown-note-mode-bar__mode-button:hover { color: #4a7fc1; }
+.markdown-note-mode-bar__mode-button.is-active { background: #fff; color: #2268c7; }
+
+/*
+  笔记预览层。
+  「盖」在编辑区上而不是替换它：Crepe 编辑器不卸载、不隐藏布局，于是光标、选区、
+  撤销栈与滚动位置全都原样保留，退出预览立刻回到原状态。
+  ⚠️ 两个 grid-area 都要显式写：显式定位的预览层会把没定位的滚动容器挤到第二列去。
+  ⚠️ 底色必须**不透明**：编辑器整层还压在下面，半透明就会把 Crepe 顶栏与正文透出来，
+     两层的字叠在一起（用户看到的就是这个「压字」）。
+*/
+.milkdown-editor-shell .milkdown-editor-scroll { grid-area: 2 / 1; }
+.markdown-note-preview {
+  grid-area: 2 / 1;
+  z-index: 40;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  background: #fbfdff;
+}
+.markdown-note-preview__body { min-height: 0; flex: 1; overflow: auto; padding: 26px clamp(28px, 5vw, 96px) 90px; }
+/* 正文列宽与编辑器一致：进出预览时左右边界不跳。 */
+.markdown-note-preview__doc {
+  max-width: var(--markdown-content-width);
+  margin: 0 auto;
+  color: #283950;
+  font-size: 13.5px;
+  line-height: 1.75;
+  word-break: break-word;
+}
+/* 图片可点击进全屏（交互挂在容器的事件委托上），光标要给出提示。 */
+.markdown-note-preview__doc img { cursor: zoom-in; }
+/*
+  编辑态的图片块同样能点进全屏。只改 img：Crepe 的缩放手柄（row-resize）与图注按钮
+  是 wrapper 的兄弟/子节点而非 img，各自的光标不受影响。
+*/
+.milkdown-editor-root .milkdown-image-block .image-wrapper img { cursor: zoom-in; }
+html[data-theme="dark"] .markdown-note-mode-bar { border-color: #223349; background: rgba(14, 25, 42, .92); color: #6d8098; }
+html[data-theme="dark"] .markdown-note-mode-bar__mode { color: #8fa5bd; }
+html[data-theme="dark"] .markdown-note-mode-bar__hint { color: #67788d; }
+html[data-theme="dark"] .markdown-note-mode-bar__outline,
+html[data-theme="dark"] .markdown-note-mode-bar__copy { color: #8496ad; }
+html[data-theme="dark"] .markdown-note-mode-bar__outline:hover,
+html[data-theme="dark"] .markdown-note-mode-bar__copy:hover { background: rgba(120, 168, 235, .14); color: #9dc3f2; }
+html[data-theme="dark"] .markdown-note-mode-bar__outline.is-active { background: rgba(120, 168, 235, .2); color: #a9cdf7; }
+html[data-theme="dark"] .markdown-note-mode-bar__modes { background: rgba(120, 168, 235, .12); }
+html[data-theme="dark"] .markdown-note-mode-bar__mode-button { color: #8496ad; }
+html[data-theme="dark"] .markdown-note-mode-bar__mode-button:hover { color: #9dc3f2; }
+html[data-theme="dark"] .markdown-note-mode-bar__mode-button.is-active { background: #1b2b42; color: #a9cdf7; }
+html[data-theme="dark"] .markdown-note-preview { background: #0e1a2c; }
+html[data-theme="dark"] .markdown-note-preview__doc { color: #d9e6f6; }
 </style>

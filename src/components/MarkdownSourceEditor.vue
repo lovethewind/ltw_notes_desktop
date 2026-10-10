@@ -10,12 +10,12 @@
  * 组件自身不写盘，只回传正文：`emit('change', value, documentId)`。
  */
 import { Icon } from '@iconify/vue'
-import DOMPurify from 'dompurify'
 import { defaultKeymap, history, historyKeymap, indentWithTab } from '@codemirror/commands'
 import { HighlightStyle, indentOnInput, syntaxHighlighting } from '@codemirror/language'
 import { markdown, markdownLanguage } from '@codemirror/lang-markdown'
 import { EditorState, StateEffect, StateField, Transaction } from '@codemirror/state'
 import { renderPreviewMarkdown, resolvePreviewImageSource } from '../utils/markdown-preview'
+import { sanitizePreviewHtml } from '../utils/preview-sanitize'
 import {
   Decoration,
   drawSelection,
@@ -30,12 +30,22 @@ import {
 } from '@codemirror/view'
 import { tags } from '@lezer/highlight'
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import PreviewImageBar from './PreviewImageBar.vue'
+import PreviewImageViewer from './PreviewImageViewer.vue'
+import { usePreviewImageTools } from '../composables/usePreviewImageTools'
 
 interface Props {
   /** 文档标识（外部文件用绝对路径），随 change 事件一并回传。 */
   documentId?: string
   /** 磁盘上的 Markdown 原文。 */
   value?: string
+  /**
+   * 工作区笔记列表（只用到 `id` 与 `title`）。
+   *
+   * 外部文件本身不属于笔记库，但正文里可能带着从笔记复制来的嵌入卡片占位，
+   * 预览时靠它把占位还原成一张看得见的卡片。
+   */
+  allNotes?: Array<{ id: string, title: string }>
 }
 
 interface FindMatches {
@@ -45,7 +55,7 @@ interface FindMatches {
   active: number
 }
 
-const props = withDefaults(defineProps<Props>(), { documentId: '', value: '' })
+const props = withDefaults(defineProps<Props>(), { documentId: '', value: '', allNotes: () => [] })
 
 const emit = defineEmits<{
   (event: 'change', value: string, documentId: string): void
@@ -53,6 +63,29 @@ const emit = defineEmits<{
 
 const container = ref<HTMLElement | null>(null)
 const previewScroller = ref<HTMLElement | null>(null)
+/**
+ * 预览图片交互（悬停工具条 + 点击全屏）。
+ *
+ * 与笔记预览共用同一份实现：预览正文是 `v-html` 出来的死 HTML，图片挂不上 Vue 事件，
+ * 只能在容器上做事件委托。
+ */
+const {
+  barVisible: imageBarVisible,
+  barAnchor: imageBarAnchor,
+  canOpenExternal: imageBarCanOpenExternal,
+  notice: imageNotice,
+  viewerVisible: imageViewerVisible,
+  viewerImages: imageViewerImages,
+  viewerIndex: imageViewerIndex,
+  keepBar: keepImageBar,
+  dismissBar: dismissImageBar,
+  openViewer: openImageViewer,
+  closeViewer: closeImageViewer,
+  setViewerIndex: setImageViewerIndex,
+  copyImage: copyPreviewImage,
+  saveImageAs: savePreviewImageAs,
+  openInBrowser: openPreviewImageInBrowser
+} = usePreviewImageTools(previewScroller)
 let view: EditorView | null = null
 
 type EditorMode = 'source' | 'preview'
@@ -144,6 +177,19 @@ const sourceHighlight = HighlightStyle.define([
 ])
 
 /**
+ * 解析预览里嵌入卡片的标题。
+ *
+ * 外部文件不属于笔记库，但正文里可能带着从笔记复制来的嵌入卡片占位；
+ * 从 props.allNotes 回查真实标题，查不到就交给渲染模块退回默认文案。
+ *
+ * :param noteId: 被嵌入的笔记 ID。
+ * :return: 笔记标题；查不到返回 null。
+ */
+function resolveEmbedTitle(noteId: string): string | null {
+  return props.allNotes.find((note) => note.id === noteId)?.title ?? null
+}
+
+/**
  * 预览正文。只读：唯一的数据来源是 props.value，渲染结果不回流到保存链路。
  *
  * 渲染规则（含表格单元格的块级处理）在 `src/utils/markdown-preview.ts`，那里有独立的行为测试。
@@ -151,12 +197,17 @@ const sourceHighlight = HighlightStyle.define([
  * :return: 已清洗的 HTML 字符串。
  */
 function resolvePreviewHtml(): string {
-  const parsed = new DOMParser().parseFromString(renderPreviewMarkdown(props.value), 'text/html')
+  const parsed = new DOMParser().parseFromString(
+    renderPreviewMarkdown(props.value, { resolveEmbedTitle }),
+    'text/html'
+  )
   for (const image of parsed.querySelectorAll('img')) {
     const resolved = resolvePreviewImageSource(image.getAttribute('src') ?? '', props.documentId)
     if (resolved) image.setAttribute('src', resolved)
   }
-  return DOMPurify.sanitize(parsed.body.innerHTML)
+  // 与笔记预览共用同一份清洗配置：外部文件里若写着 `xinyue-asset://` 地址（从笔记复制来的），
+  // src 同样不能被剥掉。
+  return sanitizePreviewHtml(parsed.body.innerHTML)
 }
 
 const previewHtml = computed(() => (mode.value === 'preview' ? resolvePreviewHtml() : ''))
@@ -389,9 +440,29 @@ watch(
     <div
       v-if="mode === 'preview'"
       ref="previewScroller"
-      class="markdown-source-editor__preview"
+      class="markdown-source-editor__preview markdown-rendered-doc"
       v-html="previewHtml"
     ></div>
+    <!-- 图片交互的两个浮层自己会传送到 body，挂在这里只是为了随预览态一起装卸。 -->
+    <PreviewImageBar
+      v-if="imageBarVisible"
+      :anchor="imageBarAnchor"
+      :can-open-external="imageBarCanOpenExternal"
+      :notice="imageNotice"
+      @keep="keepImageBar"
+      @dismiss="dismissImageBar"
+      @open="openImageViewer"
+      @copy="copyPreviewImage"
+      @save="savePreviewImageAs"
+      @external="openPreviewImageInBrowser"
+    />
+    <PreviewImageViewer
+      v-if="imageViewerVisible"
+      :images="imageViewerImages"
+      :index="imageViewerIndex"
+      @close="closeImageViewer"
+      @update:index="setImageViewerIndex"
+    />
   </section>
 </template>
 
@@ -419,9 +490,6 @@ watch(
   --source-editor-marker: #93a3b8;
   --source-editor-find: rgba(255, 205, 92, .42);
   --source-editor-find-active: rgba(255, 158, 44, .62);
-  /* 预览用的两块色：面板底（代码块 / 表头 / 行内码）与分隔线（表格 / 引用 / 分割线）。 */
-  --source-editor-panel: rgba(240, 245, 252, .72);
-  --source-editor-rule: #e2eaf4;
   min-width: 0;
   min-height: 0;
   display: flex;
@@ -448,8 +516,6 @@ html[data-theme="dark"] .markdown-source-editor {
   --source-editor-marker: #6b7f97;
   --source-editor-find: rgba(214, 168, 62, .38);
   --source-editor-find-active: rgba(244, 152, 42, .55);
-  --source-editor-panel: rgba(12, 24, 42, .72);
-  --source-editor-rule: #223349;
 }
 
 .markdown-source-editor__bar {
@@ -501,7 +567,9 @@ html[data-theme="dark"] .markdown-source-editor__mode-button { color: #8496ad; }
 html[data-theme="dark"] .markdown-source-editor__mode-button:hover { color: #9dc3f2; }
 html[data-theme="dark"] .markdown-source-editor__mode-button.is-active { background: #1b2b42; color: #a9cdf7; }
 
-/* 预览区：只读渲染，自己滚动。v-html 的内容也命中这里（本组件样式刻意非 scoped）。 */
+/* 预览区：只读渲染，自己滚动。
+   文档元素本身的排版在 style.css 的 `.markdown-rendered-doc`（与笔记预览共用一份），
+   这里只负责容器：尺寸、内边距、底色与滚动。 */
 .markdown-source-editor__preview {
   min-height: 0;
   flex: 1;
@@ -513,75 +581,8 @@ html[data-theme="dark"] .markdown-source-editor__mode-button.is-active { backgro
   line-height: 1.75;
   word-break: break-word;
 }
-.markdown-source-editor__preview > *:first-child { margin-top: 0; }
-.markdown-source-editor__preview > *:last-child { margin-bottom: 0; }
-.markdown-source-editor__preview h1,
-.markdown-source-editor__preview h2,
-.markdown-source-editor__preview h3,
-.markdown-source-editor__preview h4,
-.markdown-source-editor__preview h5,
-.markdown-source-editor__preview h6 {
-  margin: 20px 0 8px;
-  color: var(--source-editor-heading);
-  font-weight: 700;
-  line-height: 1.35;
-}
-.markdown-source-editor__preview h1 { font-size: 20px; }
-.markdown-source-editor__preview h2 { font-size: 17px; }
-.markdown-source-editor__preview h3 { font-size: 15px; }
-.markdown-source-editor__preview h4,
-.markdown-source-editor__preview h5,
-.markdown-source-editor__preview h6 { font-size: 13.5px; }
-.markdown-source-editor__preview p { margin: 0 0 10px; }
-.markdown-source-editor__preview ul,
-.markdown-source-editor__preview ol { margin: 0 0 10px; padding-left: 22px; }
-.markdown-source-editor__preview li { margin: 3px 0; }
-.markdown-source-editor__preview a { color: var(--source-editor-link); text-decoration: none; }
-.markdown-source-editor__preview a:hover { text-decoration: underline; }
-.markdown-source-editor__preview strong { color: var(--source-editor-strong); }
-.markdown-source-editor__preview code {
-  padding: 1px 5px;
-  border-radius: 4px;
-  background: var(--source-editor-panel);
-  color: var(--source-editor-code);
-  font-family: ui-monospace, "SFMono-Regular", Menlo, monospace;
-  font-size: 12px;
-}
-.markdown-source-editor__preview pre {
-  margin: 0 0 12px;
-  padding: 12px 14px;
-  border: 1px solid var(--source-editor-rule);
-  border-radius: 8px;
-  background: var(--source-editor-panel);
-  overflow-x: auto;
-}
-.markdown-source-editor__preview pre code { padding: 0; background: none; color: var(--source-editor-text); }
-.markdown-source-editor__preview blockquote {
-  margin: 0 0 12px;
-  padding: 2px 0 2px 12px;
-  border-left: 3px solid var(--source-editor-rule);
-  color: var(--source-editor-quote);
-}
-.markdown-source-editor__preview img { max-width: 100%; border-radius: 8px; }
-.markdown-source-editor__preview hr { margin: 18px 0; border: 0; border-top: 1px solid var(--source-editor-rule); }
-.markdown-source-editor__preview table {
-  width: 100%;
-  margin: 0 0 12px;
-  border-collapse: collapse;
-  font-size: 12.5px;
-}
-.markdown-source-editor__preview th,
-.markdown-source-editor__preview td {
-  padding: 6px 9px;
-  border: 1px solid var(--source-editor-rule);
-  text-align: left;
-  vertical-align: top;
-}
-.markdown-source-editor__preview th {
-  background: var(--source-editor-panel);
-  color: var(--source-editor-heading);
-  font-weight: 700;
-}
+/* 图片可点击进全屏（交互挂在容器的事件委托上），光标要给出提示。 */
+.markdown-source-editor__preview img { cursor: zoom-in; }
 
 html[data-theme="dark"] .markdown-source-editor__bar { border-color: #223349; color: #6d8098; }
 html[data-theme="dark"] .markdown-source-editor__mode { color: #8fa5bd; }

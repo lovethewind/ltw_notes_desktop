@@ -458,6 +458,14 @@ export interface NotesDesktopApi {
   repairAttachmentIntegrity(): Promise<AttachmentIntegrityRepairResult>
   openExternalLink(url: string): Promise<boolean>
   saveImageAsset(input: SaveImageAssetInput): Promise<ImageAsset>
+  /** 复制预览里的图片到系统剪贴板。 */
+  copyPreviewImage(src: string): Promise<{ ok: boolean, message: string }>
+  /** 把预览里的图片另存为本地文件。 */
+  savePreviewImageAs(src: string): Promise<
+    | { ok: true, canceled: true }
+    | { ok: true, canceled: false, fileName: string }
+    | { ok: false, message: string }
+  >
   createNote(folderId: string | null): Promise<OfflineNote>
   /** 复制笔记到指定文件夹。 */
   duplicateNote(noteId: string, targetFolderId: string | null, title: string): Promise<OfflineNote>
@@ -493,12 +501,20 @@ export interface NotesDesktopApi {
   createTag(name: string): Promise<NoteTag>
   deleteTag(tagId: string): Promise<boolean>
   exportNoteMarkdown(noteId: string): Promise<DataTransferResult>
+  /** 导出为「纯净」Markdown：不含元数据与应用私有标签，给其他软件看的那一份。 */
+  exportNoteMarkdownClean(noteId: string): Promise<DataTransferResult>
   exportAllMarkdown(): Promise<DataTransferResult>
   exportSelectedMarkdown(noteIds: string[]): Promise<DataTransferResult>
   exportFullBackup(): Promise<DataTransferResult>
   importMarkdown(folderId: string | null): Promise<DataTransferResult>
   /** 导入单个 Markdown 文件（含其引用的本地图片），不建来源文件夹。 */
   importSingleMarkdown(folderId: string | null): Promise<DataTransferResult>
+  /**
+   * 把当前已打开的外部文件导入笔记库（不弹文件选择框）。
+   *
+   * `content` 是编辑器里的当前正文 —— 可能还没落盘，以用户看到的为准。
+   */
+  importMarkdownPath(filePath: string, content: string, folderId: string | null): Promise<DataTransferResult>
   importFullBackup(): Promise<DataTransferResult>
   /** 监听菜单栏打开导入导出窗口的请求。 */
   onOpenDataTransfer(callback: () => void): () => void

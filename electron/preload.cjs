@@ -113,6 +113,22 @@ contextBridge.exposeInMainWorld("notesDesktop", {
   repairAttachmentIntegrity: () => ipcRenderer.invoke("asset-management:repair-integrity"),
   openExternalLink: (url) => ipcRenderer.invoke("external-link:open", url),
   saveImageAsset: (input) => ipcRenderer.invoke("asset:save-image", input),
+  /**
+   * 复制预览里的图片到系统剪贴板。
+   *
+   * 走主进程：`file://` 与 `xinyue-asset://` 在渲染层都拿不到可写的 Blob。
+   *
+   * @param {string} src 图片地址（传 `currentSrc`）。
+   * @returns {Promise<{ ok: boolean, message: string }>} 复制结果。
+   */
+  copyPreviewImage: (src) => ipcRenderer.invoke("image:copy", src),
+  /**
+   * 把预览里的图片另存为本地文件。
+   *
+   * @param {string} src 图片地址。
+   * @returns {Promise<{ ok: boolean, canceled?: boolean, fileName?: string, message?: string }>} 保存结果。
+   */
+  savePreviewImageAs: (src) => ipcRenderer.invoke("image:save-as", src),
   createNote: (folderId) => ipcRenderer.invoke("note:create", folderId),
   /**
    * 复制笔记到指定文件夹。
@@ -204,11 +220,15 @@ contextBridge.exposeInMainWorld("notesDesktop", {
   createTag: (name) => ipcRenderer.invoke("tag:create", name),
   deleteTag: (tagId) => ipcRenderer.invoke("tag:delete", tagId),
   exportNoteMarkdown: (noteId) => ipcRenderer.invoke("data:export-note-markdown", noteId),
+  exportNoteMarkdownClean: (noteId) => ipcRenderer.invoke("data:export-note-markdown-clean", noteId),
   exportAllMarkdown: () => ipcRenderer.invoke("data:export-all-markdown"),
   exportSelectedMarkdown: (noteIds) => ipcRenderer.invoke("data:export-selected-markdown", noteIds),
   exportFullBackup: () => ipcRenderer.invoke("data:export-backup"),
   importMarkdown: (folderId) => ipcRenderer.invoke("data:import-markdown", folderId),
   importSingleMarkdown: (folderId) => ipcRenderer.invoke("data:import-single-markdown", folderId),
+  /** 把当前已打开的外部文件导入笔记库（正文由编辑器给出，可能含未保存的改动）。 */
+  importMarkdownPath: (filePath, content, folderId) =>
+    ipcRenderer.invoke("data:import-markdown-path", filePath, content, folderId),
   importFullBackup: () => ipcRenderer.invoke("data:import-backup"),
   /**
    * 监听菜单栏打开导入导出窗口的请求。

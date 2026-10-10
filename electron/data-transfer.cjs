@@ -164,6 +164,115 @@ function parseMarkdownDocument(value, fallbackTitle) {
   }
 }
 
+/** 笔记嵌入卡片在正文里的载体（与 `src/editor/xynote-embed.ts` 写入的形式一致）。 */
+const EMBED_PLACEHOLDER_PATTERN = /<div[^>]*\bdata-xynote-embed=["']note:([^"']+)["'][^>]*>\s*<\/div>/gi
+
+/** 占位 div 上可能写着标题的属性。 */
+const EMBED_TITLE_PATTERN = /\btitle=["']([^"']*)["']/i
+
+/** 行内字号 mark 序列化出来的 span（只含 font-size 一条声明的形式）。 */
+const FONT_SIZE_SPAN_PATTERN = /<span[^>]*\bstyle=["'][^"']*font-size:[^"']*["'][^>]*>([\s\S]*?)<\/span>/gi
+
+/** 富文本为保真空行写下的硬换行。 */
+const HARD_BREAK_PATTERN = /<br\s*\/?>/gi
+
+/**
+ * 按 ``` / ~~~ 围栏把正文切成「代码段 / 普通段」。
+ *
+ * 降级替换只能作用在普通段上：代码块里出现的 `<br />`、`<span style="font-size:…">`
+ * 是用户要看的原文，一起换掉就等于把导出的文件改坏了。
+ *
+ * @param {unknown} markdown Markdown 原文。
+ * @returns {Array<{ code: boolean, text: string }>} 分段结果（按原文顺序）。
+ */
+function splitFencedCodeSegments(markdown) {
+  const segments = []
+  let buffer = []
+  let openFence = null
+
+  for (const line of String(markdown || "").split("\n")) {
+    const fenceMatch = /^\s{0,3}(`{3,}|~{3,})/.exec(line)
+    if (openFence === null) {
+      if (fenceMatch) {
+        if (buffer.length) segments.push({ code: false, text: buffer.join("\n") })
+        buffer = [line]
+        openFence = fenceMatch[1]
+        continue
+      }
+      buffer.push(line)
+      continue
+    }
+    buffer.push(line)
+    // 闭合围栏必须同种字符且不短于开启的那个（CommonMark 的口径）。
+    if (fenceMatch && fenceMatch[1][0] === openFence[0] && fenceMatch[1].length >= openFence.length) {
+      segments.push({ code: true, text: buffer.join("\n") })
+      buffer = []
+      openFence = null
+    }
+  }
+  // 没收上口的围栏按代码块处理，宁可少改也不要动到用户写的原文。
+  if (buffer.length) segments.push({ code: openFence !== null, text: buffer.join("\n") })
+  return segments
+}
+
+/**
+ * 把一张嵌入卡片降级成一行可读的引用。
+ *
+ * @param {string} noteId 被嵌入的笔记 ID。
+ * @param {string} rawHtml 原始占位 div（用于取出 `title` 属性）。
+ * @param {(noteId: string) => (Record<string, any> | null)} [resolveEmbed] 标题/地址解析器。
+ * @returns {string} 一行引用文本。
+ */
+function renderPortableEmbed(noteId, rawHtml, resolveEmbed) {
+  const inlineTitle = (EMBED_TITLE_PATTERN.exec(rawHtml) || [])[1]
+  const resolved = typeof resolveEmbed === "function" ? resolveEmbed(noteId) : null
+  const title = String((resolved && resolved.title) || inlineTitle || "").trim() || "未命名笔记"
+  const url = String((resolved && resolved.url) || "").trim()
+  return url ? `> 嵌入的笔记：[${title}](${url})` : `> 嵌入的笔记：${title}`
+}
+
+/**
+ * 把正文里的应用内部写法降级为通用 Markdown（代码块原样跳过）。
+ *
+ * @param {unknown} text 一段正文。
+ * @param {(noteId: string) => (Record<string, any> | null)} [resolveEmbed] 嵌入卡片解析器。
+ * @returns {string} 降级后的正文。
+ */
+function degradeApplicationMarkup(text, resolveEmbed) {
+  return String(text)
+    .replace(EMBED_PLACEHOLDER_PATTERN, (match, noteId) => renderPortableEmbed(noteId, match, resolveEmbed))
+    .replace(FONT_SIZE_SPAN_PATTERN, "$1")
+    .replace(HARD_BREAK_PATTERN, "\n")
+    // 硬换行变成真换行后，原本靠多个 <br /> 撑出的空行会堆成长串，收一下。
+    .replace(/\n{3,}/g, "\n\n")
+}
+
+/**
+ * 生成「给外部看」的纯净 Markdown：不含元数据、不含应用私有标签。
+ *
+ * 与 `createMarkdownDocument` 的分工：
+ *   - 那个是**迁移 / 回读**通道（带 front matter，导回来不丢标题标签时间）；
+ *   - 这个是**对外分享**通道（任何 Markdown 软件都能正常显示，标题改用一级标题承载）。
+ *
+ * 降级规则：嵌入卡片 → 一行引用（能解析到网页地址时带链接）、行内字号 span → 纯文本、
+ * `<br />` → 真换行。**围栏代码块内原样保留**。
+ *
+ * @param {Record<string, any>} note 笔记数据。
+ * @param {{ resolveEmbed?: (noteId: string) => (Record<string, any> | null) }} [options] 选项。
+ * @returns {string} Markdown 文档。
+ */
+function createCleanMarkdownDocument(note, options = {}) {
+  const body = splitFencedCodeSegments(note && note.content)
+    .map((segment) => (segment.code ? segment.text : degradeApplicationMarkup(segment.text, options.resolveEmbed)))
+    .join("\n")
+    .trim()
+  const title = String((note && note.title) || "").trim()
+  // front matter 被剥掉了，标题改用一级标题承载；正文首行已经是同名标题就不重复加。
+  const hasOwnHeading = body.split("\n", 1)[0].trim() === `# ${title}`
+  const heading = title && !hasOwnHeading ? `# ${title}\n\n` : ""
+  return `${heading}${body}\n`
+}
+
 /**
  * 按文件夹层级创建全部未删除笔记的 Markdown ZIP。
  *
@@ -392,6 +501,7 @@ function parsePortableBackupArchive(source) {
 
 module.exports = {
   collectMarkdownDocumentsFromZip,
+  createCleanMarkdownDocument,
   createMarkdownDocument,
   createMarkdownZip,
   createPortableBackupArchive,

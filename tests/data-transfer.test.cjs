@@ -6,6 +6,7 @@ const test = require("node:test")
 const AdmZip = require("adm-zip")
 const {
   collectMarkdownDocumentsFromZip,
+  createCleanMarkdownDocument,
   createPortableBackupArchive,
   createMarkdownDocument,
   createMarkdownZip,
@@ -295,13 +296,48 @@ test("单文件导入入口：独立 IPC、不建来源文件夹、并搬移本�
   assert.match(mainSource, /importSingleMarkdown:\s*importSingleMarkdownFile/)
 
   // 单文件收集图片并做目录穿越防护
-  assert.match(mainSource, /async function collectSingleMarkdownDocument\(filePath\)/)
+  // 正文可被覆盖（「把当前打开的文件导入到笔记」用编辑器里的当前值），否则从磁盘读。
+  assert.match(mainSource, /async function collectSingleMarkdownDocument\(filePath, contentOverride\)/)
+  assert.match(mainSource, /typeof contentOverride === "string"\s*\n\s*\? contentOverride\s*\n\s*: await fs\.promises\.readFile\(filePath, "utf8"\)/)
   assert.match(mainSource, /extractLocalImageReferences\(document\.content\)/)
   assert.match(mainSource, /absolutePath\.startsWith\(rootDirectory \+ path\.sep\)/)
+  // 覆盖正文的能力只该由「导入当前文件」使用：其余入口一律走磁盘原件。
+  assert.match(mainSource, /const \{ document, resourceCount \} = await collectSingleMarkdownDocument\(filePath\)/)
+  assert.match(mainSource, /await collectSingleMarkdownDocument\(filePath, content\)/)
 
   // IPC 与 preload 三处都要有，缺一处就断链
   assert.match(handlerSource, /"data:import-single-markdown"/)
   assert.match(preloadSource, /importSingleMarkdown:\s*\(folderId\)\s*=>\s*ipcRenderer\.invoke\("data:import-single-markdown",\s*folderId\)/)
+})
+
+test("导入当前文件：不弹文件框、正文取编辑器当前值、位置窗口第三模式", () => {
+  const mainSource = readFileSync(resolve(__dirname, "../electron/main.cjs"), "utf8")
+  const preloadSource = readFileSync(resolve(__dirname, "../electron/preload.cjs"), "utf8")
+  const handlerSource = readFileSync(resolve(__dirname, "../electron/ipc-handlers.cjs"), "utf8")
+  const appSource = readFileSync(resolve(__dirname, "../src/App.vue"), "utf8")
+
+  // 主进程：参数化入口，绝不弹系统文件框（文件本来就开着）。
+  const importFromPath = mainSource.match(/async function importMarkdownFromPath[\s\S]*?\n\}/)
+  assert.ok(importFromPath, '应有 importMarkdownFromPath')
+  assert.doesNotMatch(importFromPath[0], /showOpenDialog/)
+  assert.match(mainSource, /importMarkdownPath:\s*importMarkdownFromPath/)
+
+  // IPC 与 preload 三处都要有。
+  assert.match(handlerSource, /"data:import-markdown-path"/)
+  assert.match(
+    preloadSource,
+    /importMarkdownPath:\s*\(filePath, content, folderId\)\s*=>\s*ipcRenderer\.invoke\("data:import-markdown-path", filePath, content, folderId\)/
+  )
+
+  // 文件标签头部按钮 → 位置窗口第三模式 → 真的调到新 IPC。
+  assert.match(appSource, /class="editor-header-button is-import-note"/)
+  assert.match(appSource, /@click="openActiveFileImportTarget"/)
+  assert.match(appSource, /markdownImportTargetMode = ref<'single' \| 'folder' \| 'current-file'>\('folder'\)/)
+  assert.match(appSource, /openMarkdownImportTarget\('current-file'\)/)
+  assert.match(appSource, /@click="importActiveFileNote"/)
+  assert.match(appSource, /window\.notesDesktop\.importMarkdownPath\(filePath, content, targetFolderId\)/)
+  // 导入的是编辑器里的当前正文，不是磁盘上那份（未保存的改动也要带上）。
+  assert.match(appSource, /const \{ filePath, content \} = doc/)
 })
 
 test("导入导出面板提供「单个 Markdown 文件」入口，且位置窗口按入口切换动作", () => {
@@ -314,9 +350,112 @@ test("导入导出面板提供「单个 Markdown 文件」入口，且位置窗�
   assert.match(appSource, /openMarkdownImportTarget\('folder'\)/)
 
   // 位置窗口按模式切换提示文案与确认按钮，避免点「单个文件」却看到文件夹的说法
-  assert.match(appSource, /markdownImportTargetMode === 'single' \? 'tabler:file-download' : 'tabler:folder-down'/)
+  assert.match(appSource, /markdownImportTargetMode === 'folder' \? 'tabler:folder-down' : 'tabler:file-import'/)
   assert.match(appSource, /@click="importSingleMarkdownNote"/)
 
   // 渲染层必须真的调到新 IPC，否则 UI 是死的
   assert.match(appSource, /window\.notesDesktop\.importSingleMarkdown\(targetFolderId\)/)
+})
+
+test("纯净Markdown导出：不写front matter，标题改用一级标题承载", () => {
+  const document = createCleanMarkdownDocument({ title: "测试", content: "正文" })
+
+  assert.equal(document, "# 测试\n\n正文\n")
+  // front matter 是「导回来不丢元数据」用的，纯净导出不该带。
+  assert.doesNotMatch(document, /^---/)
+  assert.doesNotMatch(document, /createdAt/)
+})
+
+test("纯净Markdown导出：正文首行已是同名一级标题时不重复添加", () => {
+  const document = createCleanMarkdownDocument({ title: "测试", content: "# 测试\n\n正文" })
+
+  assert.equal(document, "# 测试\n\n正文\n")
+})
+
+test("纯净Markdown导出：嵌入卡片降级成一行引用，能解析到网页地址时带链接", () => {
+  const content = ["开头", "", '<div data-xynote-embed="note:abc"></div>', "", "结尾"].join("\n")
+  const document = createCleanMarkdownDocument(
+    { title: "含嵌入", content },
+    {
+      resolveEmbed: (noteId) => (
+        noteId === "abc"
+          ? { title: "被嵌入的笔记", url: "https://lovethewind.cn/notes/123" }
+          : null
+      )
+    }
+  )
+
+  assert.match(document, /> 嵌入的笔记：\[被嵌入的笔记\]\(https:\/\/lovethewind\.cn\/notes\/123\)/)
+  assert.doesNotMatch(document, /data-xynote-embed/)
+})
+
+test("纯净Markdown导出：解析不到目标时退回纯文本引用，不留空div", () => {
+  const document = createCleanMarkdownDocument(
+    { title: "T", content: '<div data-xynote-embed="note:gone"></div>' }
+  )
+
+  assert.match(document, /> 嵌入的笔记：未命名笔记/)
+  assert.doesNotMatch(document, /data-xynote-embed/)
+})
+
+test("纯净Markdown导出：行内字号与保真硬换行降级成通用写法", () => {
+  const document = createCleanMarkdownDocument({
+    title: "T",
+    content: [
+      '[<span style="font-size:16px">环境信息</span>](https://a.example)',
+      "",
+      "<br />",
+      "",
+      "<br />",
+      "",
+      "666000"
+    ].join("\n")
+  })
+
+  assert.match(document, /\[环境信息\]\(https:\/\/a\.example\)/)
+  assert.doesNotMatch(document, /font-size/)
+  assert.doesNotMatch(document, /<br/)
+  // 多个 <br /> 撑出来的长串空行要收敛成一个空行。
+  assert.match(document, /\n\n666000/)
+  assert.doesNotMatch(document, /\n{3,}/)
+})
+
+test("纯净Markdown导出：围栏代码块里的同款标签原样保留", () => {
+  const content = [
+    "看这段 HTML：",
+    "",
+    "```html",
+    '<div data-xynote-embed="note:abc"></div>',
+    "第一行<br />第二行",
+    "```",
+    "",
+    "结束"
+  ].join("\n")
+  const document = createCleanMarkdownDocument({ title: "T", content })
+
+  // 代码块是用户要看的原文，降级替换绝不能伸进去。
+  assert.match(document, /<div data-xynote-embed="note:abc"><\/div>/)
+  assert.match(document, /第一行<br \/>第二行/)
+})
+
+test("纯净Markdown导出：围栏没闭合时按代码块处理，不擅自改写", () => {
+  const document = createCleanMarkdownDocument({
+    title: "T",
+    content: ["```", "第一行<br />第二行"].join("\n")
+  })
+
+  assert.match(document, /第一行<br \/>第二行/)
+})
+
+test("纯净Markdown导出接线：IPC、preload、类型与面板入口齐全", () => {
+  const projectRoot = resolve(__dirname, "..")
+  const read = (relative) => readFileSync(resolve(projectRoot, relative), "utf8")
+
+  assert.match(read("electron/ipc-handlers.cjs"), /data:export-note-markdown-clean/)
+  assert.match(read("electron/preload.cjs"), /exportNoteMarkdownClean: \(noteId\) => ipcRenderer\.invoke\("data:export-note-markdown-clean", noteId\)/)
+  assert.match(read("electron/main.cjs"), /exportNoteClean: exportNoteMarkdownClean/)
+  assert.match(read("src/types.ts"), /exportNoteMarkdownClean\(noteId: string\): Promise<DataTransferResult>/)
+  // 面板入口与渲染层调用都要真的接上，否则按钮是死的。
+  assert.match(read("src/App.vue"), /导出为纯净 Markdown/)
+  assert.match(read("src/App.vue"), /window\.notesDesktop\.exportNoteMarkdownClean\(activeNoteId\.value as string\)/)
 })

@@ -32,7 +32,9 @@ test('预览只读渲染，且不与保存链路共享任何代码', () => {
   // 渲染规则（含表格单元格的块级处理）抽到了 utils/markdown-preview，那里有行为测试；
   // 组件这边只负责清洗与图片地址归一。
   assert.match(text, /renderPreviewMarkdown/)
-  assert.match(text, /DOMPurify\.sanitize\(/)
+  // 清洗走共用入口（`utils/preview-sanitize`）：协议白名单只留一份，
+  // 三处渲染入口各写一遍 `DOMPurify.sanitize` 正是本地图片在预览里断链的成因。
+  assert.match(text, /sanitizePreviewHtml\(/)
   assert.match(text, /resolvePreviewImageSource/)
 
   // 回传正文的地方全项目只该有两处：输入时与卸载兜底。预览不得新增第三处。
@@ -119,4 +121,20 @@ test('顶部栏文案改为中性模式说明，预览样式仍以组件前缀�
   // 该组件样式必须保持全局（CodeMirror 的 style-mod 注入在 head 末尾）。
   assert.match(text, /<style>/)
   assert.doesNotMatch(text, /<style scoped>/)
+})
+
+test('嵌入卡片预览接线：两处预览都注入了标题解析器', () => {
+  // 外部文件预览：正文里可能带着从笔记复制来的嵌入占位，要靠工作区笔记列表还原标题。
+  const sourceEditor = source()
+  assert.match(sourceEditor, /function resolveEmbedTitle\(noteId: string\): string \| null/)
+  assert.match(sourceEditor, /renderPreviewMarkdown\(props\.value, \{ resolveEmbedTitle \}\)/)
+  assert.match(sourceEditor, /allNotes\?: Array<\{ id: string, title: string \}>/)
+
+  // 笔记预览：直接查编辑器已经拿到的 allNotes。
+  const visualEditor = readSource('src/components/MarkdownVisualEditor.vue')
+  assert.match(visualEditor, /function resolveEmbedTitle\(noteId: string\): string \| null/)
+  assert.match(visualEditor, /renderPreviewMarkdown\(contentValue\.value, \{ resolveEmbedTitle \}\)/)
+
+  // App 得把笔记列表交给外部文件预览，否则那条路径上永远查不到标题。
+  assert.match(readSource('src/App.vue'), /:all-notes="workspace\.notes"/)
 })

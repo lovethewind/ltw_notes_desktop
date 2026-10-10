@@ -1,7 +1,7 @@
 const fs = require("node:fs")
 const path = require("node:path")
 const { createHash, randomBytes } = require("node:crypto")
-const { pathToFileURL } = require("node:url")
+const { fileURLToPath, pathToFileURL } = require("node:url")
 const Database = require("better-sqlite3")
 const {
   app,
@@ -11,6 +11,7 @@ const {
   globalShortcut,
   ipcMain,
   Menu,
+  nativeImage,
   nativeTheme,
   net,
   protocol,
@@ -20,6 +21,7 @@ const {
 const { openNotesDatabase } = require("./database.cjs")
 const {
   collectMarkdownDocumentsFromZip,
+  createCleanMarkdownDocument,
   createMarkdownDocument,
   createMarkdownZip,
   createPortableBackupArchive,
@@ -912,6 +914,103 @@ async function openExternalLink(rawUrl) {
   return true
 }
 
+/** 附件可移植地址（导出产物里的写法）所用主机名。 */
+const PORTABLE_ASSET_HOSTNAME = "xinyue-asset.local"
+
+/**
+ * 把预览里回传的图片地址解析成磁盘路径。
+ *
+ * 预览里的 `<img>` 有四种来源，渲染层一律只回传 `currentSrc`：
+ *   1. `xinyue-asset://local/<id>` —— 笔记附件，由主进程的私有协议独家服务；
+ *   2. `https://xinyue-asset.local/<id>` —— 附件可移植写法（导出后又被导入的笔记里会有）；
+ *   3. `file:///…` / 绝对路径 —— 本地 Markdown 文件里的图片（相对路径已被渲染层归一）；
+ *   4. `http(s)://…` —— 网络图片。
+ *
+ * @param {string} rawSrc 图片地址。
+ * @returns {string} 磁盘上的绝对路径。
+ */
+function resolveImageSourcePath(rawSrc) {
+  const source = String(rawSrc || "").trim()
+  if (!source) throw new Error("图片地址为空")
+
+  if (source.startsWith(`${LOCAL_ASSET_PROTOCOL}://`) || /^https?:\/\//i.test(source)) {
+    const parsedUrl = new URL(source)
+    if (source.startsWith(`${LOCAL_ASSET_PROTOCOL}://`) || parsedUrl.hostname === PORTABLE_ASSET_HOSTNAME) {
+      const assetId = decodeURIComponent(parsedUrl.pathname.replace(/^\/+/, ""))
+      const asset = repository.getAsset(assetId)
+      if (!asset?.localPath || !fs.existsSync(asset.localPath)) throw new Error("附件不存在")
+      return asset.localPath
+    }
+    // 网络图片没有本地路径，交给调用方走下载分支。
+    return ""
+  }
+
+  const filePath = source.startsWith("file:") ? fileURLToPath(source) : source
+  if (!path.isAbsolute(filePath) || !fs.existsSync(filePath)) throw new Error("图片文件不存在")
+  return filePath
+}
+
+/**
+ * 读取预览里某张图片的字节，供复制到剪贴板与另存为使用。
+ *
+ * @param {string} rawSrc 图片地址（渲染层回传的 `currentSrc`）。
+ * @returns {Promise<{ buffer: Buffer, fileName: string }>} 图片字节与推荐文件名。
+ */
+async function readPreviewImageBuffer(rawSrc) {
+  const source = String(rawSrc || "").trim()
+  const localPath = resolveImageSourcePath(source)
+  if (localPath) {
+    const stat = await fs.promises.stat(localPath)
+    if (!stat.isFile()) throw new Error("图片地址不是一个文件")
+    return { buffer: await fs.promises.readFile(localPath), fileName: path.basename(localPath) }
+  }
+  const response = await net.fetch(source)
+  if (!response.ok) throw new Error(`图片下载失败（HTTP ${response.status}）`)
+  const buffer = Buffer.from(await response.arrayBuffer())
+  // 地址末尾取不到扩展名时用 image.png 兜底，别让「未命名」这种占位名进另存为对话框。
+  const remoteName = decodeURIComponent(new URL(source).pathname.split("/").pop() || "")
+  return { buffer, fileName: path.extname(remoteName) ? sanitizeFileName(remoteName) : "image.png" }
+}
+
+/**
+ * 把预览里的图片复制到系统剪贴板。
+ *
+ * 走主进程而不是渲染层的 `navigator.clipboard`：`file://` 与私有协议都取不到可写的
+ * `Blob`，而主进程能直接把字节读成 `nativeImage`。
+ *
+ * @param {string} rawSrc 图片地址。
+ * @returns {Promise<{ ok: boolean, message: string }>} 复制结果，不抛异常（错误信息直接给界面提示）。
+ */
+async function copyPreviewImage(rawSrc) {
+  try {
+    const { buffer } = await readPreviewImageBuffer(rawSrc)
+    const image = nativeImage.createFromBuffer(buffer)
+    if (image.isEmpty()) return { ok: false, message: "该图片格式暂不支持复制到剪贴板" }
+    clipboard.writeImage(image)
+    return { ok: true, message: "图片已复制" }
+  } catch (error) {
+    return { ok: false, message: error?.message || "复制图片失败" }
+  }
+}
+
+/**
+ * 把预览里的图片另存为本地文件。
+ *
+ * @param {string} rawSrc 图片地址。
+ * @returns {Promise<{ ok: boolean, canceled?: boolean, fileName?: string, message?: string }>} 保存结果。
+ */
+async function savePreviewImageAs(rawSrc) {
+  try {
+    const { buffer, fileName } = await readPreviewImageBuffer(rawSrc)
+    const result = await dialog.showSaveDialog(mainWindow, { title: "保存图片", defaultPath: fileName })
+    if (result.canceled || !result.filePath) return { ok: true, canceled: true }
+    await fs.promises.writeFile(result.filePath, buffer)
+    return { ok: true, canceled: false, fileName: path.basename(result.filePath) }
+  } catch (error) {
+    return { ok: false, message: error?.message || "保存图片失败" }
+  }
+}
+
 /**
  * 根据响应类型和文件名推断可离线展示的图片类型。
  *
@@ -1402,6 +1501,54 @@ async function exportNoteMarkdown(noteId) {
 }
 
 /**
+ * 解析一张嵌入卡片指向的笔记，供纯净导出写成「带网页链接的一行引用」。
+ *
+ * @param {string} embeddedId 被嵌入的笔记 ID。
+ * @returns {{ title: string, url: string } | null} 标题与网页地址；目标不存在时返回 null。
+ */
+function resolveEmbeddedNote(embeddedId) {
+  const target = repository.getNote(embeddedId)
+  if (!target) return null
+  const base = String(syncSettings.webUrl || "").replace(/\/+$/, "")
+  // 没同步到云端的笔记没有 serverId，写不出可访问的地址，退回纯文本引用。
+  return {
+    title: target.title,
+    url: target.serverId && base ? `${base}/notes/${target.serverId}` : ""
+  }
+}
+
+/**
+ * 导出当前笔记为「纯净」Markdown —— 给其他软件看的那一份。
+ *
+ * 与 `exportNoteMarkdown` 的分工：那个保留 front matter、正文原样落盘，用于以后导回本应用；
+ * 这个把嵌入卡片、行内字号、保真硬换行降级成通用写法，并且不写元数据。
+ *
+ * @param {string} noteId 笔记 ID。
+ * @returns {Promise<Record<string, any>>} 导出结果。
+ */
+async function exportNoteMarkdownClean(noteId) {
+  const note = repository.getNoteForEditing(noteId)
+  if (!note) throw new Error("当前笔记不存在")
+  const result = await dialog.showSaveDialog(mainWindow, {
+    title: "导出为纯净 Markdown",
+    defaultPath: `${sanitizeFileName(note.title)}.md`,
+    filters: [{ name: "Markdown", extensions: ["md"] }]
+  })
+  if (result.canceled || !result.filePath) return { canceled: true }
+  const portableNote = { ...note, content: repository.expandAssetReferences(note.content) }
+  await fs.promises.writeFile(
+    result.filePath,
+    createCleanMarkdownDocument(portableNote, { resolveEmbed: resolveEmbeddedNote }),
+    "utf8"
+  )
+  return {
+    canceled: false,
+    message: "已导出为纯净 Markdown，可直接用其他软件打开",
+    filePath: result.filePath
+  }
+}
+
+/**
  * 将全部未删除笔记按文件夹层级导出为 Markdown ZIP。
  *
  * @returns {Promise<Record<string, any>>} 导出结果。
@@ -1513,10 +1660,14 @@ async function collectMarkdownDocuments(rootPath, currentPath = rootPath) {
  * 图片会全部断链。资源与正文同目录或在其子目录时才算命中。
  *
  * @param {string} filePath 选中的 Markdown 文件绝对路径。
+ * @param {string | null} [contentOverride] 正文覆盖值（「把已打开的文件导入到笔记」时用，
+ *        此时正文来自编辑器（可能含未保存的改动），不能再从磁盘读；图片仍按文件所在目录找）。
  * @returns {Promise<{ document: Record<string, any>, resourceCount: number }>} 文档与资源数量。
  */
-async function collectSingleMarkdownDocument(filePath) {
-  const content = await fs.promises.readFile(filePath, "utf8")
+async function collectSingleMarkdownDocument(filePath, contentOverride) {
+  const content = typeof contentOverride === "string"
+    ? contentOverride
+    : await fs.promises.readFile(filePath, "utf8")
   const rootDirectory = path.dirname(filePath)
   const document = {
     ...parseMarkdownDocument(content, path.basename(filePath, path.extname(filePath))),
@@ -1565,6 +1716,37 @@ async function importSingleMarkdownFile(folderId) {
   const filePath = result.filePaths[0]
   const { document, resourceCount } = await collectSingleMarkdownDocument(filePath)
   if (!String(document.content || "").trim()) throw new Error("所选文件没有可导入的内容")
+  await restoreMarkdownResources([document])
+  const imported = applyLocalMutation(() => repository.importMarkdownDocuments(
+    [document],
+    folderId,
+    ""
+  ))
+  mainWindow?.webContents.send("workspace:changed")
+  const resourceSuffix = resourceCount ? `，${resourceCount} 个图片资源` : ""
+  return {
+    canceled: false,
+    message: `已导入“${document.title}”${resourceSuffix}`,
+    ...imported
+  }
+}
+
+/**
+ * 把「当前已打开的外部文件」导入笔记库。
+ *
+ * 与 importSingleMarkdownFile 的区别只有一处：不弹系统文件选择框 —— 文件已经开着，
+ * 用户要的是「把手上这份存进笔记库」，再让他去磁盘里找一遍是多余的。
+ * 正文取编辑器传过来的当前值（未保存的改动也算），图片仍按文件所在目录收集。
+ *
+ * @param {string} filePath 文件在磁盘上的绝对路径。
+ * @param {string | null} folderId 目标文件夹 ID。
+ * @param {string} [content] 编辑器里的当前正文。
+ * @returns {Promise<Record<string, any>>} 导入结果。
+ */
+async function importMarkdownFromPath(filePath, folderId, content) {
+  if (!filePath || !isMarkdownLikePath(filePath)) throw new Error("请先打开一个 Markdown 文件")
+  const { document, resourceCount } = await collectSingleMarkdownDocument(filePath, content)
+  if (!String(document.content || "").trim()) throw new Error("当前文件没有可导入的内容")
   await restoreMarkdownResources([document])
   const imported = applyLocalMutation(() => repository.importMarkdownDocuments(
     [document],
@@ -2163,7 +2345,9 @@ function registerIpcHandlers() {
       deleteAllOrphans: deleteAllOrphanAttachments,
       repairIntegrity: repairAttachmentIntegrity,
       openExternalLink,
-      saveImage: saveImageAsset
+      saveImage: saveImageAsset,
+      copyPreviewImage,
+      savePreviewImageAs
     },
     notes: {
       create: (folderId) => applyLocalMutation(() => repository.createNote(folderId)),
@@ -2278,11 +2462,13 @@ function registerIpcHandlers() {
     },
     dataTransfer: {
       exportNote: exportNoteMarkdown,
+      exportNoteClean: exportNoteMarkdownClean,
       exportAll: exportAllMarkdown,
       exportSelected: exportSelectedMarkdown,
       exportBackup: exportFullBackup,
       importMarkdown: importMarkdownFiles,
       importSingleMarkdown: importSingleMarkdownFile,
+      importMarkdownPath: importMarkdownFromPath,
       importBackup: importFullBackup
     },
     backups: {

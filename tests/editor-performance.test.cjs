@@ -127,8 +127,9 @@ test("正文图片右键可以复制当前图片地址", () => {
   )
 
   assert.match(editorSource, /addEventListener\('contextmenu', handleImageContextMenu\)/)
-  assert.match(editorSource, /target\?\.closest<HTMLImageElement>\('img'\)/)
-  assert.match(editorSource, /closest<HTMLElement>\('\.image-wrapper'\).*querySelector<HTMLImageElement>\('img'\)/s)
+  // 图片判定（含编辑态 .image-wrapper 兜底、排除图注按钮与缩放手柄）收敛在
+  // src/utils/preview-image-tools.ts，图片菜单与正文菜单共用它，细节断言见 preview-image-tools.test.cjs。
+  assert.match(editorSource, /return resolvePreviewImageElement\(target\)/)
   assert.match(editorSource, /navigator\.clipboard\.writeText\(imageContextMenu\.value\.address\)/)
   assert.match(editorSource, /复制图片地址/)
   assert.match(editorSource, /Math\.min\(event\.clientX, window\.innerWidth/)
@@ -341,7 +342,16 @@ test("编辑器外部链接仅在 Command 或 Ctrl 加左键时打开", () => {
 
   assert.match(editorSource, /event\.button !== 0/)
   assert.match(editorSource, /event\.metaKey \|\| event\.ctrlKey/)
-  assert.match(editorSource, /const shouldOpenLink = previewMode\.value \|\| props\.readonly \|\| event\.metaKey \|\| event\.ctrlKey/)
+  // ⚠️ 口径：正文里的链接仍是「⌘/Ctrl 加左键」；**链接气泡里的链接不要求修饰键** ——
+  // 气泡本来就是「点一下这条链接」弹出来的，再要修饰键就等于没给入口（2026-10-10）。
+  assert.match(
+    editorSource,
+    /const insideLinkTooltip = Boolean\(anchor\?\.closest\('\.milkdown-link-preview'\)\)/
+  )
+  assert.match(
+    editorSource,
+    /const shouldOpenLink = insideLinkTooltip\s*\n\s*\|\| previewMode\.value\s*\n\s*\|\| props\.readonly\s*\n\s*\|\| event\.metaKey\s*\n\s*\|\| event\.ctrlKey/
+  )
   assert.match(editorSource, /if \(event\.button !== 0 \|\| !shouldOpenLink\) return/)
   assert.match(editorSource, /window\.notesDesktop\.openExternalLink/)
   assert.match(preloadSource, /external-link:open/)
@@ -471,9 +481,10 @@ test("嵌入卡片展开全文接线完整", () => {
   assert.match(cardSource, /fullHtml\.value = renderNoteBody\(rawContent\.value\)/)
   assert.match(
     cardSource,
-    /DOMPurify\.sanitize\(marked\.parse\(withoutNested, \{ async: false \}\)\)/
+    /sanitizePreviewHtml\(marked\.parse\(withoutNested, \{ async: false \}\)\)/
   )
-  assert.match(cardSource, /import DOMPurify from 'dompurify'/)
+  // 清洗统一走共用入口（协议白名单只留一份，本地图片的 `xinyue-asset:` 才不会被剥掉）。
+  assert.match(cardSource, /import \{ sanitizePreviewHtml \} from '\.\.\/utils\/preview-sanitize'/)
   assert.match(cardSource, /import \{ marked \} from 'marked'/)
 
   // 3) 递归防护：展开视图里摘掉嵌套嵌入卡片 HTML，换成不可递归的**单行占位**（防 A↔B 成环）。

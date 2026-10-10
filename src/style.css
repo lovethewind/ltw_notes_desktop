@@ -37,6 +37,9 @@
   --overlay-surface-max-height: min(420px, calc(100vh - 96px));
   --overlay-scroll-max-height: min(280px, calc(100vh - 230px));
   --overlay-side-panel-width: min(410px, calc(100vw - 24px));
+  /* 窗口用 hiddenInset，交通灯（x:18）是浮在内容之上的原生控件，任何铺满窗口的浮层
+     都得让出这条左边距，否则自己的左上角内容会被压在按钮底下。 */
+  --titlebar-safe-left: 86px;
 }
 
 * { box-sizing: border-box; scrollbar-width: thin; scrollbar-color: rgba(100, 121, 148, .36) transparent; }
@@ -79,7 +82,7 @@ button { color: inherit; }
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 0 20px 0 86px;
+  padding: 0 20px 0 var(--titlebar-safe-left);
   border-bottom: 1px solid rgba(161, 179, 202, .25);
   background: rgba(246, 250, 255, .72);
   backdrop-filter: blur(24px);
@@ -349,8 +352,12 @@ body.is-link-modifier-active .milkdown-editor-root a[href] { cursor: pointer; }
 .editor-header-button.is-history { width: 32px; padding: 0; justify-content: center; }
 .editor-header-button.is-history svg { font-size: 18px; }
 /* 外部文件标签没有自动保存，保存/另存为做成等宽图标按钮。 */
-.editor-header-button.is-file-save, .editor-header-button.is-save-as { width: 32px; padding: 0; justify-content: center; }
-.editor-header-button.is-file-save svg, .editor-header-button.is-save-as svg { font-size: 18px; }
+.editor-header-button.is-file-save,
+.editor-header-button.is-save-as,
+.editor-header-button.is-import-note { width: 32px; padding: 0; justify-content: center; }
+.editor-header-button.is-file-save svg,
+.editor-header-button.is-save-as svg,
+.editor-header-button.is-import-note svg { font-size: 18px; }
 .editor-header-button.is-file-save:disabled { cursor: not-allowed; }
 .editor-header-button:hover, .editor-header-button:focus-visible { background: #edf5ff; color: var(--blue); }
 .editor-header-button:disabled { cursor: wait; opacity: .55; transform: none; }
@@ -453,6 +460,137 @@ body.is-link-modifier-active .milkdown-editor-root a[href] { cursor: pointer; }
 .markdown-content pre code { padding: 0; background: transparent; color: inherit; }
 .markdown-content blockquote { margin: 1em 0; border-left: 3px solid #6fa8ee; padding: 5px 14px; background: #f1f7ff; color: #63738a; }
 .markdown-content img { max-width: 100%; border-radius: 10px; }
+/*
+  「渲染预览」的共用排版：本地文件预览（MarkdownSourceEditor）与笔记预览（MarkdownVisualEditor）
+  看到的是同一份 Markdown 渲染结果，样式必须只留一份 —— 各写一套迟早漂移。
+  组件侧只负责各自的容器（内边距 / 滚动 / 尺寸），这里只管文档元素本身。
+*/
+.markdown-rendered-doc {
+  --rendered-doc-heading: #1d3f6e;
+  --rendered-doc-strong: #17263c;
+  --rendered-doc-link: #2268c7;
+  --rendered-doc-code: #bd3d63;
+  --rendered-doc-quote: #63738a;
+  --rendered-doc-panel: rgba(240, 245, 252, .72);
+  --rendered-doc-rule: #e2eaf4;
+}
+html[data-theme="dark"] .markdown-rendered-doc {
+  --rendered-doc-heading: #a9cdf7;
+  --rendered-doc-strong: #eef5ff;
+  --rendered-doc-link: #7fb2f0;
+  --rendered-doc-code: #f0a2bd;
+  --rendered-doc-quote: #93a7bf;
+  --rendered-doc-panel: rgba(12, 24, 42, .72);
+  --rendered-doc-rule: #223349;
+}
+.markdown-rendered-doc > *:first-child { margin-top: 0; }
+.markdown-rendered-doc > *:last-child { margin-bottom: 0; }
+.markdown-rendered-doc h1,
+.markdown-rendered-doc h2,
+.markdown-rendered-doc h3,
+.markdown-rendered-doc h4,
+.markdown-rendered-doc h5,
+.markdown-rendered-doc h6 {
+  margin: 20px 0 8px;
+  color: var(--rendered-doc-heading);
+  font-weight: 700;
+  line-height: 1.35;
+}
+.markdown-rendered-doc h1 { font-size: 20px; }
+.markdown-rendered-doc h2 { font-size: 17px; }
+.markdown-rendered-doc h3 { font-size: 15px; }
+.markdown-rendered-doc h4,
+.markdown-rendered-doc h5,
+.markdown-rendered-doc h6 { font-size: 13.5px; }
+.markdown-rendered-doc p { margin: 0 0 10px; }
+.markdown-rendered-doc ul,
+.markdown-rendered-doc ol { margin: 0 0 10px; padding-left: 22px; }
+.markdown-rendered-doc li { margin: 3px 0; }
+.markdown-rendered-doc a { color: var(--rendered-doc-link); text-decoration: none; }
+.markdown-rendered-doc a:hover { text-decoration: underline; }
+.markdown-rendered-doc strong { color: var(--rendered-doc-strong); }
+.markdown-rendered-doc code {
+  padding: 1px 5px;
+  border-radius: 4px;
+  background: var(--rendered-doc-panel);
+  color: var(--rendered-doc-code);
+  font-family: ui-monospace, "SFMono-Regular", Menlo, monospace;
+  font-size: 12px;
+}
+.markdown-rendered-doc pre {
+  margin: 0 0 12px;
+  padding: 12px 14px;
+  border: 1px solid var(--rendered-doc-rule);
+  border-radius: 8px;
+  background: var(--rendered-doc-panel);
+  overflow-x: auto;
+}
+.markdown-rendered-doc pre code { padding: 0; background: none; color: inherit; }
+.markdown-rendered-doc blockquote {
+  margin: 0 0 12px;
+  padding: 2px 0 2px 12px;
+  border-left: 3px solid var(--rendered-doc-rule);
+  color: var(--rendered-doc-quote);
+}
+.markdown-rendered-doc img { max-width: 100%; border-radius: 8px; }
+.markdown-rendered-doc hr { margin: 18px 0; border: 0; border-top: 1px solid var(--rendered-doc-rule); }
+.markdown-rendered-doc table {
+  width: 100%;
+  margin: 0 0 12px;
+  border-collapse: collapse;
+  font-size: 12.5px;
+}
+.markdown-rendered-doc th,
+.markdown-rendered-doc td {
+  padding: 6px 9px;
+  border: 1px solid var(--rendered-doc-rule);
+  text-align: left;
+  vertical-align: top;
+}
+.markdown-rendered-doc th {
+  background: var(--rendered-doc-panel);
+  color: var(--rendered-doc-heading);
+  font-weight: 700;
+}
+/* 嵌套表格（单元格里的表格）再收一档，否则内层单元格padding与字号都和外面一样大。 */
+.markdown-rendered-doc table table { margin: 4px 0; font-size: 12px; }
+.markdown-rendered-doc table table th,
+.markdown-rendered-doc table table td { padding: 4px 7px; }
+/* 公式：块级公式自己滚，别把整行撑破。 */
+.markdown-rendered-doc .markdown-math-block { margin: 0 0 12px; overflow-x: auto; }
+.markdown-rendered-doc .markdown-math-block > .katex-display { margin: 0; }
+.markdown-rendered-doc .markdown-math-fallback { color: var(--rendered-doc-code); }
+/*
+  嵌入卡片占位：正文里的 `<div data-xynote-embed>` 是编辑器的自定义块载体，
+  预览渲染器认不出它，只会输出一个看不见的空块 —— 嵌入的笔记在预览里等于消失。
+  这里给出一张看得见的卡片，至少让读者知道「此处原本嵌了一篇笔记」。
+  标题由渲染模块（utils/markdown-preview.ts）注入，取不到就显示占位文案。
+*/
+.markdown-rendered-doc .markdown-embed-placeholder {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0 0 12px;
+  border: 1px solid var(--rendered-doc-rule);
+  border-left: 3px solid var(--rendered-doc-link);
+  border-radius: 10px;
+  padding: 10px 12px;
+  background: var(--rendered-doc-panel);
+}
+.markdown-rendered-doc .markdown-embed-placeholder__title {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--rendered-doc-heading);
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.markdown-rendered-doc .markdown-embed-placeholder__meta {
+  flex: 0 0 auto;
+  margin-left: auto;
+  color: var(--rendered-doc-quote);
+  font-size: 12px;
+}
 .milkdown-editor-shell {
   --markdown-content-width: 920px;
   --markdown-outline-width: 270px;
@@ -468,11 +606,20 @@ body.is-link-modifier-active .milkdown-editor-root a[href] { cursor: pointer; }
   min-height: 0;
   display: grid;
   grid-template-columns: minmax(0, 1fr);
+  /* 第 1 行 = 常驻模式条，第 2 行 = 编辑区 / 预览层。只读上下文没有模式条，第 1 行自动塌成 0。 */
+  grid-template-rows: auto minmax(0, 1fr);
   overflow: hidden;
   background: rgba(248,251,255,.34);
   flex: 1;
 }
 .milkdown-editor-shell.has-outline { grid-template-columns: minmax(0, 1fr) var(--markdown-outline-width); }
+/*
+  侧栏只占第 2 行 —— 第 1 行整条留给模式条（它跨满两列）。
+  顶部因此只剩一条横线：侧栏若像早先那样跨满两行（`grid-row: 1 / -1`），就会跟模式条同处
+  一条水平带，于是「编辑 | 预览」与「大纲 | 关系」两组按钮挤在一行、读起来像同一条顶栏上的
+  四个页签（`✕` 还会被误当成关预览）；两条底边也差 19px（35 vs 54），顶部出现台阶。
+*/
+.milkdown-editor-shell > .markdown-outline { grid-column: 2; grid-row: 2; }
 .milkdown-editor-scroll { min-width: 0; min-height: 0; overflow-y: auto; overscroll-behavior: contain; scrollbar-gutter: stable; }
 .editor-panel .editor-body .milkdown-editor-scroll::-webkit-scrollbar { width: 6px; height: 6px; }
 .milkdown-editor-root, .milkdown-editor-root .milkdown { min-height: 100%; }
@@ -511,7 +658,27 @@ body.is-link-modifier-active .milkdown-editor-root a[href] { cursor: pointer; }
 .milkdown-editor-root .milkdown .milkdown-code-block .cm-content ::selection { background: rgba(47,128,237,.32); }
 .milkdown-editor-root .milkdown .milkdown-code-block .cm-activeLine,
 .milkdown-editor-root .milkdown .milkdown-code-block .cm-activeLineGutter { background: rgba(47,128,237,.07); }
-.milkdown-editor-root .milkdown .ProseMirror { box-sizing: border-box; width: min(100%, var(--markdown-content-width)); min-height: calc(100vh - 250px); margin: 0 auto; padding: 34px clamp(64px, 5vw, 96px) 100px; color: #283950; font-size: var(--markdown-body-font-size); line-height: 1.75; outline: 0; }
+/*
+  ⚠️ 必须用**直接子代** `>` 选中主编辑器。
+
+  编辑器里不止一个 `.ProseMirror`：Crepe 的行内公式编辑气泡会内嵌**第二个 EditorView**
+  （`.milkdown > .milkdown-latex-inline-edit > .container > div > .ProseMirror`）。
+  写成后代选择器会把这套「视口级」尺寸也套到那个一行的输入框上 ——
+  实测气泡被 `min-height: calc(100vh - 250px)` 撑到 222×674（窗口 920 高），几乎铺满视口，
+  这正是 2026-10-08「公式弹窗有问题」的根因。下面另有一条高特异性兜底规则。
+*/
+.milkdown-editor-root .milkdown > .ProseMirror { box-sizing: border-box; width: min(100%, var(--markdown-content-width)); min-height: calc(100vh - 250px); margin: 0 auto; padding: 34px clamp(64px, 5vw, 96px) 100px; color: #283950; font-size: var(--markdown-body-font-size); line-height: 1.75; outline: 0; }
+/*
+  兜底：公式编辑气泡里的内层编辑器复位成「普通一行输入框」。
+  即使将来 Crepe 换了气泡 DOM（不再挂在 `.milkdown` 下），也拦住主编辑器那套
+  min-height / width / margin / padding（含窄窗口的 `padding-inline: 76px`）继承过去。
+*/
+.milkdown-editor-root .milkdown .milkdown-latex-inline-edit .ProseMirror {
+  width: auto;
+  min-height: 0;
+  margin: 0;
+  padding: 0;
+}
 /*
   标题体系对齐钉钉：Crepe 默认是 42/36/32/28/24/18px + 字重 400（Georgia 时代的设计），
   在窄窗口里一个 `# 标题` 能占掉半屏，且字重偏细、层级落差过大。
@@ -593,13 +760,130 @@ body.is-link-modifier-active .milkdown-editor-root a[href] { cursor: pointer; }
 }
 .markdown-toolbar-menu { position: relative; flex: 0 0 auto; }
 .markdown-toolbar-menu__panel { position: absolute; z-index: 40; top: calc(100% + 7px); left: 50%; display: none; min-width: 156px; padding: 7px; border: 1px solid #dbe4ef; border-radius: 11px; background: rgba(255,255,255,.98); box-shadow: 0 16px 45px rgba(29,52,83,.18); transform: translateX(-50%); }
-.markdown-tools-menu .markdown-toolbar-menu__panel { right: 0; left: auto; transform: none; }
 .markdown-toolbar-menu.is-open .markdown-toolbar-menu__panel { display: grid; gap: 3px; animation: toolbar-menu-in .18s cubic-bezier(.16,1,.3,1); }
 .markdown-toolbar-menu__panel.is-portal-open { position: fixed; z-index: 140; right: auto; display: grid; gap: 3px; transform: none; animation: toolbar-menu-in .18s cubic-bezier(.16,1,.3,1); }
 .markdown-toolbar-menu__item { width: 100%; height: 36px; display: flex; align-items: center; gap: 9px; border: 0; border-radius: 8px; padding: 0 10px; background: transparent; color: #526079; cursor: pointer; font-size: 11px; font-weight: 650; text-align: left; }
 .markdown-toolbar-menu__item::after { content: attr(data-label); }
 .markdown-toolbar-menu__item svg { width: 17px; height: 17px; color: var(--blue); }
 .markdown-toolbar-menu__item:hover, .markdown-toolbar-menu__item:focus-visible, .markdown-toolbar-menu__item.active { background: #edf5ff; color: var(--blue); }
+/* ── 选中气泡（Crepe 的 Toolbar，不是自研组件）─────────────────────────────────
+   Crepe 默认给的是 8px 圆角 + 32px 方块按钮 + 24px 图标 + 24px 高分隔线，跟应用其余
+   部分（顶栏 8px 圆角按钮、二级菜单 11px 圆角）不在一个语系里。这里整体对齐顶栏：
+   12px 圆角、1px 描边、分层投影、19px 图标、hover/active 用蓝色。
+
+  配色全走变量，**只有投影需要暗色分支**：`--crepe-color-hover/-selected/-primary`
+  与 `--milkdown-toolbar-divider` 在暗色块里都已重新赋过值，会自动跟随。
+
+   ⚠️ `z-index: 30` 是**兜底**：顶栏那条覆写把顶栏抬到了 20（Crepe 默认 10 与气泡同分，
+   同分时气泡后挂进 DOM 本会赢），而 Crepe 给气泡的只有 10 → 气泡会被顶栏画在上面。
+   日常靠 `startBubbleTopBarAvoidance()` 把气泡翻到选区下方来避让（见 MarkdownVisualEditor.vue），
+   这里只管「任何情况下都不许被顶栏吃掉」——气泡自己那份字号下拉本来就是 140（见上方
+   `.is-portal-open`），气泡本体跟着抬到同一量级才自洽。 */
+.milkdown-editor-root .milkdown .milkdown-toolbar {
+  z-index: 30;
+  padding: 4px 5px;
+  border: 1px solid var(--milkdown-toolbar-divider);
+  border-radius: 12px;
+  background: var(--crepe-color-surface);
+  box-shadow: 0 12px 34px rgba(29,52,83,.18), 0 2px 6px rgba(29,52,83,.08);
+}
+.milkdown-editor-root .milkdown .milkdown-toolbar .toolbar-item {
+  width: 30px; height: 30px;
+  display: inline-flex; align-items: center; justify-content: center;
+  margin: 3px; padding: 0;
+  border-radius: 8px;
+  transition: color .16s ease, background .16s ease;
+}
+.milkdown-editor-root .milkdown .milkdown-toolbar .toolbar-item svg { width: 19px; height: 19px; }
+.milkdown-editor-root .milkdown .milkdown-toolbar .toolbar-item:hover { background: var(--crepe-color-hover); }
+.milkdown-editor-root .milkdown .milkdown-toolbar .toolbar-item:hover svg { color: var(--crepe-color-primary); fill: var(--crepe-color-primary); }
+.milkdown-editor-root .milkdown .milkdown-toolbar .toolbar-item.active { background: var(--crepe-color-selected); }
+.milkdown-editor-root .milkdown .milkdown-toolbar .toolbar-item.active svg { color: var(--crepe-color-primary); fill: var(--crepe-color-primary); }
+.milkdown-editor-root .milkdown .milkdown-toolbar .divider { height: 18px; margin: 0 5px; background: var(--milkdown-toolbar-divider); }
+/* 气泡里「字号」触发器是图标 + 小箭头两个 svg。Crepe 的 Toolbar 组件给每个项渲染的
+   是属性写死的 `button.toolbar-item`（挂不了 class），所以靠图标里的标记 span 用
+   :has() 反选到按钮本身，把固定 30px 宽度放开到装得下箭头。 */
+.milkdown-editor-root .milkdown .milkdown-toolbar .toolbar-item:has(.xynote-fs-trigger) { width: auto; min-width: 30px; padding: 0 4px 0 6px; }
+.milkdown-editor-root .milkdown .milkdown-toolbar .xynote-fs-trigger { display: inline-flex; align-items: center; gap: 1px; }
+.milkdown-editor-root .milkdown .milkdown-toolbar .toolbar-item svg.xynote-fs-caret { width: 13px; height: 13px; }
+/* ── 链接气泡（Crepe 的 LinkTooltip，不是自研组件）─────────────────────────────
+   点链接弹出来的那条：左侧「打开（带文字）/ 复制」、右侧「编辑 / 删除」。
+   与选中气泡同一套语系 —— 12px 圆角、1px 描边、分层投影、30px 方块按钮、19px 图标、
+   hover 淡蓝底 + 图标变蓝；只是它是一条「链接条」，所以去掉 item 的 3px 外边距、
+   纵向更紧凑（40px 高 vs 选中气泡 46px）。
+
+   三条实现约束：
+   ① 「打开 / 复制」是**一个槽位里塞了两个按钮**（Crepe 只给一个 `linkIcon`），
+      所以 `.link-icon` 自身必须退化成透明容器，hover 底色只落在里面两个按钮上 ——
+      否则整块一起亮，分不清按的是哪个。标记类名的来源见 `LINK_TOOLTIP_ACTIONS_ICON`。
+   ② 中间的 URL 文本整条收起（`display: none`）：地址在编辑浮层里有专门的「地址」一行，
+      气泡里再挂一条 220px 的长 URL 既挤又读不全。⚠️ 只隐藏、**不许从 DOM 里删掉** ——
+      「打开」按钮靠 `a.link-display.click()` 复用正文链接的分流逻辑（内链 / 附件 / 外链）。
+   ③ `z-index: 30` 是**兜底**：顶栏被项目抬到了 20，而 Crepe 只给气泡 10 —— 链接正好落在
+      顶栏下沿一个气泡高（40px）之内时，floating-ui 会认为「上方有空间」（它只按裁剪祖先
+      `.milkdown-editor-scroll` 算，而顶栏就在这个容器内部），把气泡放进顶栏那一条带里。
+      选中气泡另有 `startBubbleTopBarAvoidance()` 翻到下方避让；链接气泡没有这条避让，
+      所以这里至少保证「任何情况下不许被顶栏吃掉」。
+
+   配色全走变量（暗色块里都已重新赋过值 → 一份规则服务两套主题），**只有投影需要暗色分支**。
+   ⚠️ 选择器都带上 `> .link-preview >` 这一整条链：Crepe 自带的同款规则是 4 个类，
+   只加 `.milkdown-editor-root` 前缀会打平，得靠这条链多出的一层类稳赢。
+
+   ℹ️ Crepe 自带的编辑气泡（`.milkdown-link-edit`）**已被接管、不会再出现**
+   （`linkTooltipAPI` 的 addLink / editLink 被覆写成自研的 `LinkEditPopover`），
+   所以这里不再有它的覆写规则 —— 那些 `.link-edit` / `.input-area` / `.confirm` 已是死代码。 */
+.milkdown-editor-root .milkdown .milkdown-link-preview { z-index: 30; }
+.milkdown-editor-root .milkdown .milkdown-link-preview > .link-preview {
+  height: auto;
+  gap: 2px;
+  padding: 4px 5px;
+  border: 1px solid var(--milkdown-toolbar-divider);
+  border-radius: 12px;
+  background: var(--crepe-color-surface);
+  box-shadow: 0 12px 34px rgba(29,52,83,.18), 0 2px 6px rgba(29,52,83,.08);
+  cursor: default;
+}
+.milkdown-editor-root .milkdown .milkdown-link-preview > .link-preview > .link-icon { width: auto; padding: 0; gap: 2px; background: transparent; }
+.milkdown-editor-root .milkdown .milkdown-link-preview > .link-preview > .link-icon:hover { background: transparent; }
+.milkdown-editor-root .milkdown .milkdown-link-preview > .link-preview > .link-icon > .xynote-link-tooltip-actions { display: inline-flex; align-items: center; gap: 2px; }
+.milkdown-editor-root .milkdown .milkdown-link-preview > .link-preview > .link-icon .xynote-link-tooltip-open,
+.milkdown-editor-root .milkdown .milkdown-link-preview > .link-preview > .link-icon .xynote-link-tooltip-copy,
+.milkdown-editor-root .milkdown .milkdown-link-preview > .link-preview > .link-edit-button,
+.milkdown-editor-root .milkdown .milkdown-link-preview > .link-preview > .link-remove-button {
+  height: 30px;
+  display: inline-flex; align-items: center; justify-content: center;
+  padding: 0;
+  border-radius: 12px;
+  cursor: pointer;
+  transition: color .16s ease, background .16s ease;
+}
+/* 「复制 / 编辑 / 删除」是 30px 方块；「打开」带文字标签，宽度自适应。 */
+.milkdown-editor-root .milkdown .milkdown-link-preview > .link-preview > .link-icon .xynote-link-tooltip-copy,
+.milkdown-editor-root .milkdown .milkdown-link-preview > .link-preview > .link-edit-button,
+.milkdown-editor-root .milkdown .milkdown-link-preview > .link-preview > .link-remove-button { width: 30px; }
+.milkdown-editor-root .milkdown .milkdown-link-preview > .link-preview > .link-icon .xynote-link-tooltip-open { width: auto; gap: 5px; padding: 0 9px; color: var(--milkdown-toolbar-icon); }
+.milkdown-editor-root .milkdown .milkdown-link-preview > .link-preview > .link-icon .xynote-link-tooltip-open-label { font-size: 13px; font-style: normal; line-height: 1; white-space: nowrap; }
+.milkdown-editor-root .milkdown .milkdown-link-preview > .link-preview > .link-icon svg,
+.milkdown-editor-root .milkdown .milkdown-link-preview > .link-preview > .link-edit-button > svg,
+.milkdown-editor-root .milkdown .milkdown-link-preview > .link-preview > .link-remove-button > svg {
+  width: 19px; height: 19px;
+  color: var(--milkdown-toolbar-icon);
+  fill: var(--milkdown-toolbar-icon);
+}
+.milkdown-editor-root .milkdown .milkdown-link-preview > .link-preview > .link-icon .xynote-link-tooltip-open:hover,
+.milkdown-editor-root .milkdown .milkdown-link-preview > .link-preview > .link-icon .xynote-link-tooltip-copy:hover,
+.milkdown-editor-root .milkdown .milkdown-link-preview > .link-preview > .link-edit-button:hover,
+.milkdown-editor-root .milkdown .milkdown-link-preview > .link-preview > .link-remove-button:hover { background: var(--crepe-color-hover); color: var(--crepe-color-primary); }
+.milkdown-editor-root .milkdown .milkdown-link-preview > .link-preview > .link-icon .xynote-link-tooltip-open:hover svg,
+.milkdown-editor-root .milkdown .milkdown-link-preview > .link-preview > .link-icon .xynote-link-tooltip-copy:hover svg,
+.milkdown-editor-root .milkdown .milkdown-link-preview > .link-preview > .link-edit-button:hover > svg,
+.milkdown-editor-root .milkdown .milkdown-link-preview > .link-preview > .link-remove-button:hover > svg {
+  color: var(--crepe-color-primary);
+  fill: var(--crepe-color-primary);
+}
+/* URL 文本收起：地址改由编辑浮层的「地址」一行承担（见本段注释 ②）。
+   ⚠️ 只是隐藏，DOM 必须留着 —— 「打开」按钮靠 `a.link-display.click()` 复用分流逻辑。 */
+.milkdown-editor-root .milkdown .milkdown-link-preview > .link-preview > .link-display { display: none; }
 .markdown-outline { min-width: 0; min-height: 0; display: flex; flex-direction: column; overflow: hidden; border-left: 1px solid var(--line); background: rgba(249,252,255,.8); }
 .markdown-outline__header { flex: none; height: 54px; display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 0 10px 0 12px; border-bottom: 1px solid #e8eef5; background: rgba(249,252,255,.94); }
 .markdown-outline__tabs { display: inline-flex; gap: 2px; padding: 2px; border-radius: 9px; background: rgba(24,39,63,.05); }
@@ -634,7 +918,6 @@ body.is-link-modifier-active .milkdown-editor-root a[href] { cursor: pointer; }
 .editor-feedback { position: absolute; z-index: 60; top: 76px; left: 50%; border: 1px solid rgba(110,131,157,.2); border-radius: 999px; padding: 8px 13px; background: rgba(25,43,66,.9); box-shadow: 0 12px 30px rgba(22,39,63,.2); color: #fff; font-size: 10px; transform: translateX(-50%); }
 .editor-feedback-enter-active, .editor-feedback-leave-active { transition: opacity .18s ease, transform .18s ease; }
 .editor-feedback-enter-from, .editor-feedback-leave-to { opacity: 0; transform: translate(-50%, -4px); }
-body.markdown-editor-focus-mode .milkdown-editor-shell.is-focus-mode { position: fixed; z-index: 50; inset: 54px 10px 10px; border: 1px solid var(--line); border-radius: 18px; box-shadow: 0 24px 80px rgba(25,44,70,.24); background: var(--surface-solid); }
 .editor-empty { margin: auto; display: grid; justify-items: center; gap: 9px; color: #8795a8; text-align: center; }
 .editor-empty > div { width: 56px; height: 56px; display: grid; place-items: center; border-radius: 18px; background: linear-gradient(135deg, rgba(44,122,123,.12), rgba(47,128,237,.14)); color: var(--blue); font-size: 27px; }
 .editor-empty h2 { margin: 5px 0 0; color: #304159; font-size: 20px; }
@@ -976,6 +1259,7 @@ body.markdown-editor-focus-mode .milkdown-editor-shell.is-focus-mode { position:
 .conflict-center-dialog > header > button:hover, .conflict-center-dialog > header > button:focus-visible { background: #e4effc; color: var(--blue); }
 .conflict-center-dialog > header > button:disabled { cursor: not-allowed; opacity: .45; }
 .conflict-center-body { min-height: 0; flex: 1; display: flex; overflow: hidden; background: #f3f6fa; }
+.conflict-detail { min-width: 0; min-height: 0; flex: 1; display: flex; flex-direction: column; overflow: hidden; }
 .conflict-note-list { width: 190px; flex: 0 0 190px; overflow-y: auto; border-right: 1px solid #dce5ef; padding: 10px; background: #f9fbfd; }
 .conflict-note-list > button { width: 100%; display: grid; grid-template-columns: 23px minmax(0, 1fr); align-items: center; gap: 8px; border: 0; border-radius: 10px; padding: 9px; background: transparent; color: #6e8198; cursor: pointer; text-align: left; }
 .conflict-note-list > button:hover, .conflict-note-list > button:focus-visible { background: #edf4fc; }
@@ -999,6 +1283,57 @@ body.markdown-editor-focus-mode .milkdown-editor-shell.is-focus-mode { position:
 .conflict-version-content { min-height: 0; flex: 1; display: flex; overflow: hidden; }
 .conflict-version-content > .milkdown-editor-shell { height: 100%; background: #fff; }
 .conflict-version-content .milkdown-editor-root .milkdown .ProseMirror { min-height: 100%; padding: 24px 28px 60px; font-size: 13px; line-height: 1.75; }
+
+/* ── 冲突对比：并排文本 diff ──────────────────────────────────────────
+   左右两列在同一个滚动容器里、用同一套网格列渲染，所以两侧逐行对齐、滚动天然同步。
+   差异行整行着色（本地独有＝琥珀、云端独有＝蓝），行内改动的那几个字再单独标出来。 */
+.conflict-view-switch { flex: 0 0 auto; display: flex; align-items: center; gap: 5px; margin: 12px 14px 0; }
+.conflict-view-switch > span { margin-right: auto; color: #8a99ab; font-size: 10px; font-weight: 700; }
+.conflict-view-switch button { height: 28px; display: inline-flex; align-items: center; gap: 5px; border: 1px solid #dbe4ee; border-radius: 9px; padding: 0 11px; background: #f5f8fb; color: #5b7089; cursor: pointer; font-size: 11px; font-weight: 700; }
+.conflict-view-switch button:hover, .conflict-view-switch button:focus-visible { border-color: #9fc4ee; background: #edf5ff; color: #2f75c5; }
+.conflict-view-switch button.is-active { border-color: transparent; background: linear-gradient(135deg, var(--teal), var(--blue)); color: #fff; box-shadow: 0 6px 14px rgba(47,128,237,.22); }
+.conflict-view-switch button svg { font-size: 15px; }
+.conflict-diff { min-width: 0; min-height: 0; flex: 1; display: flex; flex-direction: column; overflow: hidden; margin: 10px 14px 14px; border: 1px solid #dce5ef; border-radius: 15px; background: #fff; box-shadow: 0 5px 18px rgba(35,57,86,.05); }
+.conflict-diff__bar { flex: 0 0 auto; min-height: 40px; display: flex; align-items: center; gap: 10px; border-bottom: 1px solid #e5ebf3; padding: 6px 12px; }
+.conflict-diff__stat { display: inline-flex; align-items: center; gap: 6px; color: #b3761f; font-size: 10px; font-weight: 750; }
+.conflict-diff__stat svg { font-size: 15px; }
+.conflict-diff__stat strong { font-size: 12px; }
+.conflict-diff__stat.is-clean { color: #2f8a68; }
+.conflict-diff__nav { margin-left: auto; display: flex; gap: 6px; }
+.conflict-diff__nav button { height: 26px; display: inline-flex; align-items: center; gap: 4px; border: 1px solid #dbe4ee; border-radius: 8px; padding: 0 9px; background: #f5f8fb; color: #5b7089; cursor: pointer; font-size: 10px; font-weight: 700; }
+.conflict-diff__nav button:hover:not(:disabled), .conflict-diff__nav button:focus-visible:not(:disabled) { border-color: #9fc4ee; background: #edf5ff; color: #2f75c5; }
+.conflict-diff__nav button:disabled { cursor: not-allowed; opacity: .45; }
+.conflict-diff__nav button svg { font-size: 14px; }
+.conflict-diff__scroll { min-height: 0; flex: 1; overflow: auto; overscroll-behavior: contain; scrollbar-gutter: stable; background: #fbfcfe; }
+.conflict-diff__scroll::-webkit-scrollbar { width: 8px; height: 8px; }
+.conflict-diff__scroll::-webkit-scrollbar-thumb { border-radius: 999px; background: #cfdae8; }
+.conflict-diff__columns, .conflict-diff__row { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.conflict-diff__columns { position: sticky; top: 0; z-index: 2; border-bottom: 1px solid #e5ebf3; background: #f5f8fb; box-shadow: 0 4px 10px rgba(35,57,86,.07); }
+.conflict-diff__column-head { min-height: 34px; display: flex; align-items: center; gap: 7px; padding: 0 12px; color: #5b7089; }
+.conflict-diff__column-head + .conflict-diff__column-head { border-left: 1px solid #e5ebf3; }
+.conflict-diff__column-head svg { font-size: 15px; }
+.conflict-diff__column-head.is-local svg { color: #b8791c; }
+.conflict-diff__column-head.is-remote svg { color: #397fcf; }
+.conflict-diff__column-head strong { font-size: 11px; }
+.conflict-diff__column-head small { margin-left: auto; color: #97a6b8; font-size: 9px; font-weight: 600; }
+.conflict-diff__row { border-bottom: 1px solid rgba(226,233,242,.6); }
+.conflict-diff__cell { position: relative; min-width: 0; display: flex; gap: 8px; padding: 1px 12px 1px 0; }
+.conflict-diff__cell + .conflict-diff__cell { border-left: 1px solid #eaeff6; }
+.conflict-diff__no { flex: 0 0 42px; padding-right: 8px; color: #a8b6c7; font-size: 10px; font-variant-numeric: tabular-nums; text-align: right; user-select: none; }
+.conflict-diff__text { min-width: 0; flex: 1; min-height: 1.75em; padding: 1px 0; color: #33465e; font-family: ui-monospace, "SFMono-Regular", Menlo, monospace; font-size: 11.5px; line-height: 1.75; white-space: pre-wrap; overflow-wrap: anywhere; }
+.conflict-diff__row.is-diff .conflict-diff__cell::before { content: ""; position: absolute; top: 0; bottom: 0; left: 0; width: 3px; }
+.conflict-diff__row.is-diff .conflict-diff__cell.is-removed { background: #fff8ec; }
+.conflict-diff__row.is-diff .conflict-diff__cell.is-removed::before { background: #e5b25f; }
+.conflict-diff__row.is-diff .conflict-diff__cell.is-added { background: #f1f7ff; }
+.conflict-diff__row.is-diff .conflict-diff__cell.is-added::before { background: #79aee8; }
+.conflict-diff__row.is-diff .conflict-diff__cell.is-removed .conflict-diff__no { color: #c08a2e; }
+.conflict-diff__row.is-diff .conflict-diff__cell.is-added .conflict-diff__no { color: #4a86cf; }
+.conflict-diff__row.is-current .conflict-diff__cell.is-removed { background: #ffefd2; }
+.conflict-diff__row.is-current .conflict-diff__cell.is-added { background: #e3efff; }
+.conflict-diff__cell.is-void { background: repeating-linear-gradient(135deg, rgba(226,233,242,.55) 0 6px, transparent 6px 12px); }
+.conflict-diff__mark { border-radius: 3px; padding: 0 1px; background: #ffe0a8; color: #8a5a12; }
+.conflict-diff__cell.is-added .conflict-diff__mark { background: #cfe4ff; color: #1f5ba8; }
+
 .conflict-center-error { display: flex; align-items: center; gap: 7px; margin: 0; border-top: 1px solid #f2d4d8; padding: 8px 18px; background: #fff4f5; color: #c34a59; font-size: 10px; font-weight: 650; }
 .conflict-center-dialog > footer { min-height: 64px; display: flex; align-items: center; gap: 9px; border-top: 1px solid #e2e9f2; padding: 12px 18px; background: #fff; }
 .conflict-center-dialog > footer > span { flex: 1; color: #8a99ab; font-size: 10px; }
@@ -1209,6 +1544,10 @@ button:focus-visible { outline: 3px solid rgba(47,128,237,.22); outline-offset: 
   .milkdown-editor-root .milkdown .milkdown-code-block .cm-activeLine,
   .milkdown-editor-root .milkdown .milkdown-code-block .cm-activeLineGutter { background: rgba(91,160,245,.1); }
   .milkdown-editor-root .milkdown .milkdown-top-bar { border-bottom-color: #283b56; background: rgba(17,31,52,.94); }
+  /* 选中气泡只有投影需要暗色分支，其余配色已由 --crepe-color-* / --milkdown-toolbar-divider 自动跟随。 */
+  .milkdown-editor-root .milkdown .milkdown-toolbar { box-shadow: 0 14px 38px rgba(0,0,0,.46), 0 2px 6px rgba(0,0,0,.3); }
+  /* 链接气泡同理：只有投影需要暗色分支。 */
+  .milkdown-editor-root .milkdown .milkdown-link-preview > .link-preview { box-shadow: 0 14px 38px rgba(0,0,0,.46), 0 2px 6px rgba(0,0,0,.3); }
   .milkdown-editor-root .milkdown .ProseMirror { color: #d9e5f5; }
   .milkdown-editor-root .milkdown .milkdown-top-bar .top-bar-item:hover,
   .milkdown-editor-root .milkdown .milkdown-top-bar .top-bar-item:focus-visible,
@@ -1400,6 +1739,38 @@ button:focus-visible { outline: 3px solid rgba(47,128,237,.22); outline-offset: 
   .conflict-center-dialog > header > button { background: #1d3049; color: #9caec3; }
   .conflict-center-dialog > header > button:hover, .conflict-center-dialog > header > button:focus-visible { background: #23405f; color: #9bc4f7; }
   .conflict-center-body { background: #0c1728; }
+  .conflict-view-switch > span { color: #899ab0; }
+  .conflict-view-switch button { border-color: #30445f; background: #1a2b43; color: #b6c5d8; }
+  .conflict-view-switch button:hover, .conflict-view-switch button:focus-visible { border-color: #4779ad; background: #203c59; color: #a4ceff; }
+  .conflict-diff { border-color: #2b3e58; background: #101d30; box-shadow: 0 5px 18px rgba(0,0,0,.35); }
+  .conflict-diff__bar { border-color: #2b3e58; }
+  .conflict-diff__stat { color: #e4ad58; }
+  .conflict-diff__stat.is-clean { color: #7fd3ab; }
+  .conflict-diff__nav button { border-color: #30445f; background: #1a2b43; color: #b6c5d8; }
+  .conflict-diff__nav button:hover:not(:disabled), .conflict-diff__nav button:focus-visible:not(:disabled) { border-color: #4779ad; background: #203c59; color: #a4ceff; }
+  .conflict-diff__scroll { background: #0d192a; }
+  .conflict-diff__scroll::-webkit-scrollbar-thumb { background: #2f4460; }
+  .conflict-diff__columns { border-color: #2b3e58; background: #16263d; box-shadow: 0 4px 10px rgba(0,0,0,.3); }
+  .conflict-diff__column-head { color: #9db0c6; }
+  .conflict-diff__column-head + .conflict-diff__column-head { border-color: #2b3e58; }
+  .conflict-diff__column-head.is-local svg { color: #e5ad58; }
+  .conflict-diff__column-head.is-remote svg { color: #82b9f4; }
+  .conflict-diff__column-head small { color: #7f92a8; }
+  .conflict-diff__row { border-color: rgba(43,62,88,.55); }
+  .conflict-diff__cell + .conflict-diff__cell { border-color: #223349; }
+  .conflict-diff__no { color: #61748c; }
+  .conflict-diff__text { color: #cbd8e8; }
+  .conflict-diff__row.is-diff .conflict-diff__cell.is-removed { background: rgba(190,123,25,.13); }
+  .conflict-diff__row.is-diff .conflict-diff__cell.is-removed::before { background: #b78035; }
+  .conflict-diff__row.is-diff .conflict-diff__cell.is-removed .conflict-diff__no { color: #d8a75a; }
+  .conflict-diff__row.is-diff .conflict-diff__cell.is-added { background: rgba(65,126,191,.16); }
+  .conflict-diff__row.is-diff .conflict-diff__cell.is-added::before { background: #417ebf; }
+  .conflict-diff__row.is-diff .conflict-diff__cell.is-added .conflict-diff__no { color: #82b9f4; }
+  .conflict-diff__row.is-current .conflict-diff__cell.is-removed { background: rgba(190,123,25,.24); }
+  .conflict-diff__row.is-current .conflict-diff__cell.is-added { background: rgba(65,126,191,.28); }
+  .conflict-diff__cell.is-void { background: repeating-linear-gradient(135deg, rgba(43,62,88,.5) 0 6px, transparent 6px 12px); }
+  .conflict-diff__mark { background: rgba(190,123,25,.36); color: #ffd894; }
+  .conflict-diff__cell.is-added .conflict-diff__mark { background: rgba(65,126,191,.42); color: #bcdcff; }
   .conflict-note-list { border-color: #2b3e58; background: #101d30; }
   .conflict-note-list > button { color: #91a3b9; }
   .conflict-note-list > button:hover, .conflict-note-list > button:focus-visible { background: #1b304a; }
@@ -1561,6 +1932,14 @@ button:focus-visible { outline: 3px solid rgba(47,128,237,.22); outline-offset: 
   .conflict-note-list > button { width: 150px; flex: 0 0 150px; }
   .conflict-compare-grid { grid-template-columns: 1fr; overflow-y: auto; padding: 9px; }
   .conflict-version { min-height: 300px; }
+  /* 窄窗口下两列各自只剩三百来像素：压掉行号与内边距，把宽度让给正文。 */
+  .conflict-view-switch { margin: 9px 9px 0; }
+  .conflict-view-switch > span { display: none; }
+  .conflict-diff { margin: 8px 9px 9px; }
+  .conflict-diff__no { flex-basis: 30px; padding-right: 5px; }
+  .conflict-diff__cell { gap: 5px; padding-right: 8px; }
+  .conflict-diff__text { font-size: 10.5px; }
+  .conflict-diff__column-head { padding: 0 9px; }
   .conflict-center-dialog > footer { min-height: 58px; gap: 6px; padding: 9px; }
   .conflict-center-dialog > footer > span { display: none; }
   .conflict-center-dialog > footer button { min-width: 0; flex: 1; padding: 0 7px; }

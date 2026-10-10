@@ -170,6 +170,58 @@ test('图片地址归一：file:// 去协议、相对路径按文件目录拼绝
   assert.equal(resolvePreviewImageSource('', docPath), '')
 })
 
+test('行内公式按 KaTeX 渲染，前后文字不受影响', () => {
+  const html = previewModule.renderPreviewMarkdown('这是公式 $E=mc^2$ 结束')
+
+  assert.match(html, /^<p>这是公式 <span class="katex">/, '公式应渲染成 KaTeX 结构')
+  assert.match(html, /结束<\/p>\s*$/, '公式后面的文字要照常保留')
+  // 原文里的美元号不能残留成字面文本。
+  assert.doesNotMatch(html, /\$E=mc\^2\$/)
+})
+
+test('块级公式独占一段，走 display 模式', () => {
+  const html = previewModule.renderPreviewMarkdown('$$\n\n\\frac{a}{b}\n\n$$')
+
+  assert.match(html, /<div class="markdown-math-block"><span class="katex-display">/)
+  // 单行紧凑写法（手写文件里常见）也要认。
+  const compact = previewModule.renderPreviewMarkdown('$$a^2+b^2=c^2$$')
+  assert.match(compact, /markdown-math-block[\s\S]*katex-display/)
+})
+
+test('单元格里的行内公式与块级公式都渲染（递归解析器同样挂了公式扩展）', () => {
+  const html = previewModule.renderPreviewMarkdown([
+    '| 列 | 说明 |',
+    '| --- | --- |',
+    '| 比例 | 宽高比 $16:9$ |',
+    '| 分式 | 尺寸<br>$$\\frac{16}{9}$$ |',
+    ''
+  ].join('\n'))
+
+  assert.match(rowCells(html, 0)[1], /<span class="katex">/)
+  assert.match(rowCells(html, 1)[1], /markdown-math-block[\s\S]*katex-display/)
+})
+
+test('转义的美元号保持字面，不当成公式', () => {
+  const html = previewModule.renderPreviewMarkdown('价格 \\$100 元')
+
+  assert.equal(html.trim(), '<p>价格 $100 元</p>')
+  assert.doesNotMatch(html, /katex/)
+})
+
+test('公式内容首尾的空格按编辑器同一口径各剥一个', () => {
+  const html = previewModule.renderPreviewMarkdown('$ a $')
+
+  // 与 micromark 的 mathText padding 规则一致：两侧都是空格时各去一个。
+  assert.match(html, /<span class="mord mathnormal">a<\/span>/)
+})
+
+test('写错的公式不抛错，降级成 KaTeX 的错误标记', () => {
+  const html = previewModule.renderPreviewMarkdown('公式 $\\frac{1}{$ 结束')
+
+  assert.match(html, /class="katex-error"/)
+  assert.match(html, /结束<\/p>\s*$/)
+})
+
 test('预览渲染不污染其它模块用的全局 marked 实例', () => {
   const { marked } = require('marked')
 
@@ -178,4 +230,51 @@ test('预览渲染不污染其它模块用的全局 marked 实例', () => {
   // 嵌入卡片 / AI 面板 / 更新说明都直接用全局 marked，不能被这里的 breaks / tablecell 覆写影响。
   assert.equal(marked.parse('A\nB', { async: false }), '<p>A\nB</p>\n')
   assert.equal(marked.parse('| a |\n| --- |\n| b |', { async: false }).includes('<table>'), true)
+})
+
+test('嵌入卡片占位在预览里换成一张看得见的卡片', () => {
+  const html = previewModule.renderPreviewMarkdown('<div data-xynote-embed="note:abc-123"></div>')
+
+  assert.match(html, /class="markdown-embed-placeholder"/)
+  assert.match(html, /嵌入的笔记/)
+  // 关键：不能再把占位 div 原样吐出来 —— 那样渲染出来是个看不见的空块。
+  assert.doesNotMatch(html, /data-xynote-embed/)
+})
+
+test('嵌入卡片标题优先用实时解析的结果，占位里的旧标题只作兜底', () => {
+  const withStaleTitle = '<div data-xynote-embed="note:abc" title="改名之前的标题"></div>'
+
+  const resolved = previewModule.renderPreviewMarkdown(withStaleTitle, {
+    resolveEmbedTitle: () => '现在的标题'
+  })
+  assert.match(resolved, /现在的标题/)
+  assert.doesNotMatch(resolved, /改名之前的标题/)
+
+  // 解析不到（目标已删除 / 不在当前工作区）时，退回占位里写的那个。
+  const fallback = previewModule.renderPreviewMarkdown(withStaleTitle, {
+    resolveEmbedTitle: () => null
+  })
+  assert.match(fallback, /改名之前的标题/)
+})
+
+test('嵌入卡片查不到标题时给默认文案，不留空', () => {
+  const html = previewModule.renderPreviewMarkdown('<div data-xynote-embed="note:gone"></div>')
+
+  assert.match(html, /未命名笔记/)
+})
+
+test('卡片标题里的 HTML 会被转义，不能借笔记标题注入标签', () => {
+  const html = previewModule.renderPreviewMarkdown('<div data-xynote-embed="note:x"></div>', {
+    resolveEmbedTitle: () => '<img src=x onerror=alert(1)>'
+  })
+
+  assert.doesNotMatch(html, /<img/)
+  assert.match(html, /&lt;img/)
+})
+
+test('没有嵌入卡片的文档走快速路径，正文里的普通 HTML 块不被误伤', () => {
+  const html = previewModule.renderPreviewMarkdown('<div class="note">原样保留</div>')
+
+  assert.match(html, /<div class="note">原样保留<\/div>/)
+  assert.doesNotMatch(html, /markdown-embed-placeholder/)
 })

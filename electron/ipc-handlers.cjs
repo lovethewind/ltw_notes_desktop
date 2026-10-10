@@ -30,6 +30,8 @@ function registerAttachmentHandlers(ipcMain, domain) {
   ipcMain.handle("asset-management:repair-integrity", domain.repairIntegrity)
   ipcMain.handle("external-link:open", (_event, url) => domain.openExternalLink(url))
   ipcMain.handle("asset:save-image", (_event, input) => domain.saveImage(input || {}))
+  ipcMain.handle("image:copy", (_event, src) => domain.copyPreviewImage(src))
+  ipcMain.handle("image:save-as", (_event, src) => domain.savePreviewImageAs(src))
 }
 
 function registerNoteHandlers(ipcMain, domain) {
@@ -86,11 +88,14 @@ function registerLocalFileHandlers(ipcMain, domain) {
 
 function registerDataTransferHandlers(ipcMain, domain) {
   ipcMain.handle("data:export-note-markdown", (_event, noteId) => domain.exportNote(noteId))
+  ipcMain.handle("data:export-note-markdown-clean", (_event, noteId) => domain.exportNoteClean(noteId))
   ipcMain.handle("data:export-all-markdown", domain.exportAll)
   ipcMain.handle("data:export-selected-markdown", (_event, noteIds) => domain.exportSelected(noteIds))
   ipcMain.handle("data:export-backup", domain.exportBackup)
   ipcMain.handle("data:import-markdown", (_event, folderId) => domain.importMarkdown(folderId || null))
   ipcMain.handle("data:import-single-markdown", (_event, folderId) => domain.importSingleMarkdown(folderId || null))
+  ipcMain.handle("data:import-markdown-path", (_event, filePath, content, folderId) =>
+    domain.importMarkdownPath(filePath, folderId || null, content))
   ipcMain.handle("data:import-backup", domain.importBackup)
 }
 

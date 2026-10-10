@@ -27,6 +27,7 @@ import FolderPickerPopover from './components/FolderPickerPopover.vue'
 import type { GeneralSettingsResult } from './components/GeneralSettingsDialog.vue'
 import type { QuickOpenSelection } from './components/QuickOpenDialog.vue'
 import SearchExcerpt from './components/SearchExcerpt.vue'
+import ConflictDiffViewer from './components/ConflictDiffViewer.vue'
 import { matchesShortcut } from './utils/keyboard-shortcuts'
 import { OPEN_NOTE_EVENT, type OpenNoteEventDetail } from './utils/note-open-events'
 import {
@@ -202,6 +203,13 @@ const selectedConflictDetail = ref<NoteConflictPair | null>(null)
 const conflictDetailLoading = ref(false)
 const conflictResolving = ref(false)
 const conflictError = ref('')
+/**
+ * 冲突对比的展示方式。
+ *
+ * 默认走差异对比：冲突处理要回答的是「到底哪里不一样」，行级 diff 能直接给出答案；
+ * 富文本视图保留原样，供想看排版效果时切换（两份都是同一篇笔记，排版通常没差别）。
+ */
+const conflictViewMode = ref<'diff' | 'rich'>('diff')
 let conflictDetailRequestId = 0
 const generalSettingsVisible = ref(false)
 const globalGraphVisible = ref(false)
@@ -229,10 +237,13 @@ const markdownImportTargetFolderId = ref<string | null>(null)
 /**
  * 位置选择窗口当前服务的导入方式。
  *
- * 两种入口（单个文件 / 文件夹或 ZIP）共用同一个位置窗口，靠它决定底部按钮调哪个 IPC，
- * 也决定文案 —— 免得用户点「单个文件」却看到「文件夹」的说法。
+ * 三个入口共用同一个位置窗口，靠它决定底部按钮调哪个 IPC，也决定文案 ——
+ * 免得用户点「当前文件」却看到「文件夹」的说法：
+ *  - `single`：弹系统文件框挑一个文件；
+ *  - `folder`：弹系统文件框挑文件夹或 ZIP；
+ *  - `current-file`：文件已经开着（文件标签头部按钮），只问一句存到哪个文件夹。
  */
-const markdownImportTargetMode = ref<'single' | 'folder'>('folder')
+const markdownImportTargetMode = ref<'single' | 'folder' | 'current-file'>('folder')
 const duplicateNoteVisible = ref(false)
 const duplicateNoteBusy = ref(false)
 const duplicateNoteSource = ref<OfflineNote | null>(null)
@@ -1031,6 +1042,16 @@ async function exportCurrentNoteMarkdown(): Promise<void> {
 }
 
 /**
+ * 将当前笔记导出为纯净 Markdown（不含元数据与应用私有标签）。
+ *
+ * :return: 操作完成后的 Promise。
+ */
+async function exportCurrentNoteMarkdownClean(): Promise<void> {
+  if (!activeNoteId.value) return
+  await runDataTransfer(() => window.notesDesktop.exportNoteMarkdownClean(activeNoteId.value as string))
+}
+
+/**
  * 将全部未删除笔记导出为 Markdown ZIP。
  *
  * :return: 操作完成后的 Promise。
@@ -1051,13 +1072,26 @@ async function exportCompleteBackup(): Promise<void> {
 /**
  * 打开 Markdown 导入位置选择窗口。
  *
- * :param mode: 导入方式；'single' = 单个文件，'folder' = 文件夹或 ZIP。
+ * :param mode: 导入方式；'single' = 单个文件，'folder' = 文件夹或 ZIP，
+ *              'current-file' = 当前打开的文件标签。
  * :return: 无返回值。
  */
-function openMarkdownImportTarget(mode: 'single' | 'folder' = 'folder'): void {
+function openMarkdownImportTarget(mode: 'single' | 'folder' | 'current-file' = 'folder'): void {
   markdownImportTargetMode.value = mode
   markdownImportTargetFolderId.value = null
   markdownImportTargetVisible.value = true
+}
+
+/**
+ * 把当前文件标签里的文件导入笔记库（文件头部「导入到笔记」按钮）。
+ *
+ * 位置窗口只问「存到哪个文件夹」：文件已经开着，不必再去磁盘里找一遍。
+ *
+ * :return: 无返回值。
+ */
+function openActiveFileImportTarget(): void {
+  if (!activeFileDoc.value) return
+  openMarkdownImportTarget('current-file')
 }
 
 /**
@@ -1083,6 +1117,24 @@ async function importSingleMarkdownNote(): Promise<void> {
   const targetFolderId = markdownImportTargetFolderId.value
   markdownImportTargetVisible.value = false
   await runDataTransfer(() => window.notesDesktop.importSingleMarkdown(targetFolderId), true)
+}
+
+/**
+ * 导入「当前打开的文件标签」——正文取编辑器里的当前值（未保存的改动也算），
+ * 引用的本地图片按文件所在目录一并搬进笔记库。
+ *
+ * :return: 操作完成后的 Promise。
+ */
+async function importActiveFileNote(): Promise<void> {
+  const doc = activeFileDoc.value
+  if (!doc) return
+  const targetFolderId = markdownImportTargetFolderId.value
+  markdownImportTargetVisible.value = false
+  const { filePath, content } = doc
+  await runDataTransfer(
+    () => window.notesDesktop.importMarkdownPath(filePath, content, targetFolderId),
+    true
+  )
 }
 
 /**
@@ -4018,6 +4070,15 @@ onBeforeUnmount(() => {
                 {{ fileSaveStatusLabel }}
               </span>
               <button
+                class="editor-header-button is-import-note"
+                type="button"
+                aria-label="导入到笔记"
+                title="导入到笔记（把当前文件存进笔记库）"
+                @click="openActiveFileImportTarget"
+              >
+                <Icon icon="material-symbols:note-add-rounded" />
+              </button>
+              <button
                 class="editor-header-button is-save-as"
                 type="button"
                 aria-label="另存为"
@@ -4158,6 +4219,7 @@ onBeforeUnmount(() => {
               ref="markdownEditorRef"
               :document-id="activeFileDoc.filePath"
               :value="activeFileDoc.content"
+              :all-notes="workspace.notes"
               @change="updateFileDocContent"
             />
             <MarkdownVisualEditor
@@ -4669,26 +4731,57 @@ onBeforeUnmount(() => {
             </button>
           </aside>
 
-          <div v-if="conflictDetailLoading" class="history-empty">正在读取冲突完整正文…</div>
-          <div v-else-if="selectedConflictDetail" class="conflict-compare-grid">
-            <article class="conflict-version local">
-              <div class="conflict-version-heading">
-                <span><Icon icon="tabler:device-laptop" /></span>
-                <div><strong>本地冲突版本</strong><small>{{ selectedConflictDetail.conflict.title }}</small></div>
-              </div>
-              <div class="conflict-version-content">
-                <MarkdownVisualEditor :value="selectedConflictDetail.conflict.content" readonly :show-toolbar="false" :show-outline="false" />
-              </div>
-            </article>
-            <article class="conflict-version remote">
-              <div class="conflict-version-heading">
-                <span><Icon icon="tabler:cloud" /></span>
-                <div><strong>当前云端版本</strong><small>{{ selectedConflictDetail.original.title }}</small></div>
-              </div>
-              <div class="conflict-version-content">
-                <MarkdownVisualEditor :value="selectedConflictDetail.original.content" readonly :show-toolbar="false" :show-outline="false" />
-              </div>
-            </article>
+          <div class="conflict-detail">
+            <!--
+              对比方式切换：差异对比是默认视图。富文本视图按原实现保留，
+              两条路径读的是同一份内容，切换不会改动任何数据。
+            -->
+            <div class="conflict-view-switch" role="group" aria-label="对比方式">
+              <span>对比方式</span>
+              <button
+                type="button"
+                :class="{ 'is-active': conflictViewMode === 'diff' }"
+                :aria-pressed="conflictViewMode === 'diff'"
+                @click="conflictViewMode = 'diff'"
+              >
+                <Icon icon="tabler:git-compare" />差异对比
+              </button>
+              <button
+                type="button"
+                :class="{ 'is-active': conflictViewMode === 'rich' }"
+                :aria-pressed="conflictViewMode === 'rich'"
+                @click="conflictViewMode = 'rich'"
+              >
+                <Icon icon="tabler:layout-columns" />富文本
+              </button>
+            </div>
+
+            <div v-if="conflictDetailLoading" class="history-empty">正在读取冲突完整正文…</div>
+            <ConflictDiffViewer
+              v-else-if="selectedConflictDetail && conflictViewMode === 'diff'"
+              :left-content="selectedConflictDetail.conflict.content"
+              :right-content="selectedConflictDetail.original.content"
+            />
+            <div v-else-if="selectedConflictDetail" class="conflict-compare-grid">
+              <article class="conflict-version local">
+                <div class="conflict-version-heading">
+                  <span><Icon icon="tabler:device-laptop" /></span>
+                  <div><strong>本地冲突版本</strong><small>{{ selectedConflictDetail.conflict.title }}</small></div>
+                </div>
+                <div class="conflict-version-content">
+                  <MarkdownVisualEditor :value="selectedConflictDetail.conflict.content" readonly :show-toolbar="false" :show-outline="false" />
+                </div>
+              </article>
+              <article class="conflict-version remote">
+                <div class="conflict-version-heading">
+                  <span><Icon icon="tabler:cloud" /></span>
+                  <div><strong>当前云端版本</strong><small>{{ selectedConflictDetail.original.title }}</small></div>
+                </div>
+                <div class="conflict-version-content">
+                  <MarkdownVisualEditor :value="selectedConflictDetail.original.content" readonly :show-toolbar="false" :show-outline="false" />
+                </div>
+              </article>
+            </div>
           </div>
         </div>
 
@@ -4809,6 +4902,10 @@ onBeforeUnmount(() => {
             <Icon icon="tabler:file-export" />
             <span><strong>导出当前笔记</strong><small>单个 .md，资源保留原始地址</small></span>
           </button>
+          <button type="button" :disabled="dataTransferBusy || !activeNote" @click="exportCurrentNoteMarkdownClean">
+            <Icon icon="tabler:file-text" />
+            <span><strong>导出为纯净 Markdown</strong><small>去掉元数据与内嵌标签，给其他软件看</small></span>
+          </button>
           <button type="button" :disabled="dataTransferBusy" @click="exportAllNotesMarkdown">
             <Icon icon="tabler:folder-share" />
             <span><strong>导出通用 Markdown</strong><small>ZIP 内含 Markdown 与原始资源文件</small></span>
@@ -4900,9 +4997,14 @@ onBeforeUnmount(() => {
     <div v-if="markdownImportTargetVisible" class="dialog-backdrop import-target-backdrop" @click.self="markdownImportTargetVisible = false">
       <section class="folder-dialog import-target-dialog" role="dialog" aria-modal="true" aria-label="选择导入位置">
         <button class="dialog-close-button" type="button" aria-label="关闭导入位置窗口" @click="markdownImportTargetVisible = false"><Icon icon="tabler:x" /></button>
-        <div class="dialog-icon"><Icon :icon="markdownImportTargetMode === 'single' ? 'tabler:file-download' : 'tabler:folder-down'" /></div>
+        <div class="dialog-icon">
+          <Icon :icon="markdownImportTargetMode === 'folder' ? 'tabler:folder-down' : 'tabler:file-import'" />
+        </div>
         <h2>选择导入位置</h2>
-        <p v-if="markdownImportTargetMode === 'single'">单个文件导入不额外建文件夹，正文里引用的本地图片会一并搬进来。</p>
+        <p v-if="markdownImportTargetMode === 'current-file'">
+          把「{{ activeFileDoc?.fileName }}」存成笔记，正文里引用的本地图片会一并搬进来；文件本身不受影响。
+        </p>
+        <p v-else-if="markdownImportTargetMode === 'single'">单个文件导入不额外建文件夹，正文里引用的本地图片会一并搬进来。</p>
         <p v-else>来源同名文件夹已存在时会合并目录并新增笔记，不会覆盖原有笔记。</p>
         <div class="import-target-list" role="listbox" aria-label="Markdown 导入位置">
           <button
@@ -4930,7 +5032,13 @@ onBeforeUnmount(() => {
         <div>
           <button type="button" @click="markdownImportTargetVisible = false">取消</button>
           <button
-            v-if="markdownImportTargetMode === 'single'"
+            v-if="markdownImportTargetMode === 'current-file'"
+            class="primary"
+            type="button"
+            @click="importActiveFileNote"
+          >导入到笔记</button>
+          <button
+            v-else-if="markdownImportTargetMode === 'single'"
             class="primary"
             type="button"
             @click="importSingleMarkdownNote"

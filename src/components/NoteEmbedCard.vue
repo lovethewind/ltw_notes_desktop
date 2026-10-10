@@ -66,10 +66,10 @@
 <script setup lang="ts">
 import { computed, onMounted, ref, watch } from 'vue'
 import { Icon } from '@iconify/vue'
-import DOMPurify from 'dompurify'
 import { marked } from 'marked'
 import type { NoteFolder, OfflineNote } from '../types'
 import { dispatchOpenNote } from '../utils/note-open-events'
+import { sanitizePreviewHtml } from '../utils/preview-sanitize'
 
 const props = withDefaults(defineProps<{ noteId: string; title?: string | null }>(), {
   title: null
@@ -171,7 +171,7 @@ function toggleExpanded(): void {
 /**
  * 把被嵌笔记的 markdown 正文渲染为可安全插入的 HTML。
  * 先摘掉嵌套的嵌入卡片 HTML（展开视图不递归渲染，避免 A↔B 互相展开成环），
- * 再经 marked 解析、DOMPurify 清洗（与 useAppUpdate / AiAssistantPanel 同一套做法）。
+ * 再经 marked 解析、共用清洗入口（`sanitizePreviewHtml`，与两处预览同一套协议白名单）。
  *
  * :param raw: 笔记正文 markdown 原文。
  * :return: 清洗后的 HTML 字符串。
@@ -184,7 +184,7 @@ function renderNoteBody(raw: string): string {
     // DOMPurify 默认放行 data-* 属性，因此该标记能稳定穿过 sanitize，供样式精准命中。
     '\n\n<p data-xynote-embed-placeholder>此处原有一张嵌入卡片，请到原笔记中查看</p>\n\n'
   )
-  return DOMPurify.sanitize(marked.parse(withoutNested, { async: false }))
+  return sanitizePreviewHtml(marked.parse(withoutNested, { async: false }))
 }
 
 /**
