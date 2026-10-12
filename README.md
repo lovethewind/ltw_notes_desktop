@@ -130,7 +130,7 @@ npm run desktop:build:mac
 输出位置：
 
 ```text
-release/心悦笔记-<版本号>-arm64.dmg
+release/xinyue-notes-macos-<版本号>-arm64.dmg
 ```
 
 当前构建未配置 Apple Developer 签名和公证。首次打开时如被 macOS 拦截，可前往“系统设置 → 隐私与安全性”允许打开。正式分发前建议补充签名、公证和自动更新安装能力。

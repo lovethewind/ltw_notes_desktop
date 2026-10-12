@@ -47,7 +47,7 @@
   "build": {
     "appId": "cn.lovethewind.notes.offline",
     "productName": "心悦笔记",
-    "artifactName": "${productName}-${version}-${arch}.${ext}",
+    "artifactName": "xinyue-notes-macos-${version}-${arch}.${ext}",
     "protocols": [
       {
         "name": "心悦笔记浏览器登录",
