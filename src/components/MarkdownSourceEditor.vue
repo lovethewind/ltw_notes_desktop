@@ -14,6 +14,7 @@ import { defaultKeymap, history, historyKeymap, indentWithTab } from '@codemirro
 import { HighlightStyle, indentOnInput, syntaxHighlighting } from '@codemirror/language'
 import { markdown, markdownLanguage } from '@codemirror/lang-markdown'
 import { EditorState, StateEffect, StateField, Transaction } from '@codemirror/state'
+import { extractMarkdownOutline, type MarkdownOutlineItem } from '../utils/markdown-outline'
 import { renderPreviewMarkdown, resolvePreviewImageSource } from '../utils/markdown-preview'
 import { sanitizePreviewHtml } from '../utils/preview-sanitize'
 import {
@@ -213,6 +214,160 @@ function resolvePreviewHtml(): string {
 const previewHtml = computed(() => (mode.value === 'preview' ? resolvePreviewHtml() : ''))
 
 /**
+ * 大纲面板的开关偏好。
+ *
+ * ⚠️ 与笔记编辑器**共用**同一个键：外部文件与笔记是同一块编辑区里的两种标签，
+ * 用户不需要为它们各学一套开关 —— 在笔记里收起大纲，切到文件标签也是收起的。
+ */
+const OUTLINE_STORAGE_KEY = 'markdown-outline-open'
+
+/** 滚动高亮的提前量（与笔记编辑器同值）：标题顶进入「落点再往下一点」就算当前章节。 */
+const OUTLINE_ACTIVE_LEAD = 24
+
+/** 点击大纲项后的落点呼吸位（与笔记编辑器同值）。 */
+const OUTLINE_SCROLL_GAP = 14
+
+const outlineOpen = ref(true)
+const outlineItems = ref<MarkdownOutlineItem[]>([])
+const activeOutlineIndex = ref(0)
+
+/** 复制结果提示，短暂顶替顶栏的模式说明。 */
+const copyNotice = ref('')
+let copyNoticeTimer: ReturnType<typeof setTimeout> | undefined
+let outlineTimer: ReturnType<typeof setTimeout> | undefined
+
+/**
+ * 预览层里的标题节点。
+ *
+ * 口径必须与 `extractMarkdownOutline` 一致：表格单元格（块级渲染）与引用块里的 `h*`
+ * 是**渲染产物**，大纲里根本没有它们 —— 不过滤会让下标整体错位。
+ *
+ * :return: 按文档顺序排列的标题节点。
+ */
+function previewHeadings(): HTMLElement[] {
+  const container = previewScroller.value
+  if (!container) return []
+  return Array.from(container.querySelectorAll<HTMLElement>('h1, h2, h3, h4, h5, h6'))
+    .filter((heading) => !heading.closest('td, th, blockquote, li'))
+}
+
+/**
+ * 根据当前滚动位置更新高亮的大纲项。
+ *
+ * 两态各有一条取当前位置的路：预览态量标题 DOM 的矩形；源码态用「视口顶部对应的文档偏移」
+ * 反查 —— CodeMirror 里没有标题 DOM，量不到矩形。
+ *
+ * :return: 无返回值。
+ */
+function updateActiveOutline(): void {
+  if (mode.value === 'preview') {
+    const container = previewScroller.value
+    const headings = previewHeadings()
+    if (!container || !headings.length) return
+    const threshold = container.getBoundingClientRect().top + OUTLINE_ACTIVE_LEAD
+    let nextIndex = 0
+    headings.forEach((heading, index) => {
+      if (heading.getBoundingClientRect().top <= threshold) nextIndex = index
+    })
+    activeOutlineIndex.value = nextIndex
+    return
+  }
+  if (!view || !outlineItems.value.length) return
+  const position = view.lineBlockAtHeight(view.scrollDOM.scrollTop + OUTLINE_ACTIVE_LEAD).from
+  let nextIndex = 0
+  outlineItems.value.forEach((item, index) => {
+    if (item.offset <= position) nextIndex = index
+  })
+  activeOutlineIndex.value = nextIndex
+}
+
+/**
+ * 滚动到指定大纲项。
+ *
+ * 源码模式的落点是该标题行的行首，并把光标一并移过去 —— 跳过去就能接着改，
+ * 光标位置与看到的滚动位置一致。预览模式是只读的，只滚容器。
+ *
+ * :param index: 大纲项下标。
+ * :param behavior: 滚动行为；点击用 `smooth`。
+ * :return: 无返回值。
+ */
+function scrollToOutline(index: number, behavior: ScrollBehavior = 'smooth'): void {
+  const item = outlineItems.value[index]
+  if (!item) return
+  activeOutlineIndex.value = index
+  if (mode.value === 'preview') {
+    const container = previewScroller.value
+    const heading = previewHeadings()[index]
+    if (!container || !heading) return
+    const top = heading.getBoundingClientRect().top - container.getBoundingClientRect().top
+      + container.scrollTop - OUTLINE_SCROLL_GAP
+    container.scrollTo({ top: Math.max(0, top), behavior })
+    return
+  }
+  if (!view) return
+  const line = view.state.doc.lineAt(Math.min(item.offset, view.state.doc.length))
+  view.dispatch({
+    selection: { anchor: line.from },
+    effects: EditorView.scrollIntoView(line.from, { y: 'start', yMargin: OUTLINE_SCROLL_GAP })
+  })
+  view.focus()
+}
+
+/** 立即按当前正文重算大纲。 */
+function refreshOutline(): void {
+  outlineItems.value = extractMarkdownOutline(props.value)
+  if (activeOutlineIndex.value >= outlineItems.value.length) activeOutlineIndex.value = 0
+  void nextTick(updateActiveOutline)
+}
+
+/**
+ * 延迟重算大纲。
+ *
+ * 外部文件可以很大，逐键全量 lex 会挡住输入；防抖口径与笔记编辑器一致。
+ */
+function scheduleOutline(): void {
+  if (outlineTimer) clearTimeout(outlineTimer)
+  outlineTimer = setTimeout(() => {
+    outlineTimer = undefined
+    refreshOutline()
+  }, 120)
+}
+
+/** 切换大纲面板并保存偏好（与笔记共用同一个键）。 */
+function toggleOutline(): void {
+  outlineOpen.value = !outlineOpen.value
+  localStorage.setItem(OUTLINE_STORAGE_KEY, String(outlineOpen.value))
+  if (outlineOpen.value) void nextTick(updateActiveOutline)
+}
+
+/** 短暂显示一条顶栏提示。 */
+function showCopyNotice(message: string): void {
+  copyNotice.value = message
+  if (copyNoticeTimer) clearTimeout(copyNoticeTimer)
+  copyNoticeTimer = setTimeout(() => {
+    copyNoticeTimer = undefined
+    copyNotice.value = ''
+  }, 1800)
+}
+
+/**
+ * 把当前文件原文复制到剪贴板。
+ *
+ * 复制的是磁盘上的那份原文（`props.value`），不经任何解析 —— 与源码编辑器
+ * 「逐字符写回」的保真口径一致。
+ *
+ * :return: 异步操作完成后无返回值。
+ */
+async function copyMarkdown(): Promise<void> {
+  try {
+    await navigator.clipboard.writeText(props.value)
+    showCopyNotice('Markdown 已复制')
+  } catch {
+    showCopyNotice('复制失败，请检查剪贴板权限')
+  }
+}
+
+/**
  * 切换源码 / 预览。
  *
  * :param next: 目标模式。
@@ -372,10 +527,17 @@ defineExpose({ clearFindHighlight, findText, getScrollTop })
 onMounted(() => {
   if (!container.value) return
   view = new EditorView({ state: createState(props.value), parent: container.value })
+  // CodeMirror 自己滚（scroll 事件不冒泡，挂不到模板上），滚动时同步大纲高亮。
+  view.scrollDOM.addEventListener('scroll', updateActiveOutline, { passive: true })
+  outlineOpen.value = localStorage.getItem(OUTLINE_STORAGE_KEY) !== 'false'
+  refreshOutline()
 })
 
 onBeforeUnmount(() => {
+  if (outlineTimer) clearTimeout(outlineTimer)
+  if (copyNoticeTimer) clearTimeout(copyNoticeTimer)
   if (view) {
+    view.scrollDOM.removeEventListener('scroll', updateActiveOutline)
     // 每次输入都已经回传，这里只是兜底：万一有尚未上抛的字，切标签时不能丢。
     const latest = view.state.doc.toString()
     if (latest !== props.value) emit('change', latest, props.documentId)
@@ -387,6 +549,8 @@ onBeforeUnmount(() => {
 watch(
   () => props.value,
   (value) => {
+    // 正文一变，大纲就过期了；大文件全量 lex 会挡输入，所以放在防抖里。
+    scheduleOutline()
     if (!view) return
     const current = view.state.doc.toString()
     if (value === current) return
@@ -404,7 +568,32 @@ watch(
     <header class="markdown-source-editor__bar">
       <Icon :icon="mode === 'preview' ? 'material-symbols:visibility-outline' : 'material-symbols:code'" />
       <span class="markdown-source-editor__mode">{{ mode === 'preview' ? '预览模式' : '源码模式' }}</span>
-      <span class="markdown-source-editor__hint">{{ modeHint }}</span>
+      <span class="markdown-source-editor__hint">{{ copyNotice || modeHint }}</span>
+      <!--
+        大纲开关与「复制 Markdown」放在这条模式条上 —— 与笔记编辑器完全同构。
+        两者都是「只读正文」的操作，源码态与预览态都该按得到，所以不放 App 的文件标题栏。
+      -->
+      <button
+        type="button"
+        class="markdown-source-editor__outline"
+        :class="{ 'is-active': outlineOpen }"
+        :aria-pressed="outlineOpen"
+        aria-controls="source-editor-outline-panel"
+        :aria-label="outlineOpen ? '收起大纲' : '展开大纲'"
+        :title="outlineOpen ? '收起大纲' : '展开大纲'"
+        @click="toggleOutline"
+      >
+        <Icon icon="material-symbols:toc-rounded" />
+      </button>
+      <button
+        type="button"
+        class="markdown-source-editor__copy"
+        aria-label="复制 Markdown"
+        title="复制 Markdown"
+        @click="copyMarkdown"
+      >
+        <Icon icon="material-symbols:content-copy-outline-rounded" />
+      </button>
       <!--
         两种模式看的是同一份正文：源码模式负责写盘，预览只读渲染。
         来回切换不会改动文件，所以这里不需要「放弃/应用」之类的确认。
@@ -430,19 +619,59 @@ watch(
         </button>
       </div>
     </header>
-    <!-- 切去预览时只是收起，不卸载：销毁会连光标、选区与撤销栈一起丢掉。 -->
-    <div
-      ref="container"
-      class="markdown-source-editor__code"
-      :class="{ 'is-collapsed': mode === 'preview' }"
-    ></div>
-    <!-- 预览只读渲染，数据只从 props.value 来，不回流保存链路。 -->
-    <div
-      v-if="mode === 'preview'"
-      ref="previewScroller"
-      class="markdown-source-editor__preview markdown-rendered-doc"
-      v-html="previewHtml"
-    ></div>
+    <!--
+      正文区：源码 / 预览 + 大纲侧栏并排。模式条在上方横跨整宽，
+      与笔记编辑器的网格同构 —— 顶部只有一条横线，侧栏从模式条下沿才开始。
+    -->
+    <div class="markdown-source-editor__body">
+      <!-- 切去预览时只是收起，不卸载：销毁会连光标、选区与撤销栈一起丢掉。 -->
+      <div
+        ref="container"
+        class="markdown-source-editor__code"
+        :class="{ 'is-collapsed': mode === 'preview' }"
+      ></div>
+      <!-- 预览只读渲染，数据只从 props.value 来，不回流保存链路。 -->
+      <div
+        v-if="mode === 'preview'"
+        ref="previewScroller"
+        class="markdown-source-editor__preview markdown-rendered-doc"
+        @scroll.passive="updateActiveOutline"
+        v-html="previewHtml"
+      ></div>
+      <!--
+        大纲侧栏直接复用笔记侧栏那套全局样式（`.markdown-outline*`，见 src/style.css），
+        外观与笔记一致，不在组件里再写一份 —— 宽度由 `.markdown-source-editor` 给。
+      -->
+      <aside
+        v-if="outlineOpen"
+        id="source-editor-outline-panel"
+        class="markdown-outline markdown-source-editor__outline"
+        aria-label="文件大纲"
+      >
+        <header class="markdown-outline__header">
+          <span class="markdown-outline__title">大纲</span>
+          <button type="button" class="markdown-outline__close" aria-label="关闭大纲" @click="toggleOutline">
+            <Icon icon="material-symbols:close-rounded" />
+          </button>
+        </header>
+        <div class="markdown-outline__body">
+          <nav v-if="outlineItems.length" class="markdown-outline__list" aria-label="文档标题">
+            <button
+              v-for="item in outlineItems"
+              :key="`${item.index}-${item.text}`"
+              type="button"
+              class="markdown-outline-item"
+              :class="{ 'is-active': item.index === activeOutlineIndex }"
+              :style="{ '--outline-level': item.level }"
+              @click="scrollToOutline(item.index)"
+            >
+              {{ item.text }}
+            </button>
+          </nav>
+          <p v-else class="markdown-outline__empty">暂无大纲</p>
+        </div>
+      </aside>
+    </div>
     <!-- 图片交互的两个浮层自己会传送到 body，挂在这里只是为了随预览态一起装卸。 -->
     <PreviewImageBar
       v-if="imageBarVisible"
@@ -490,6 +719,8 @@ watch(
   --source-editor-marker: #93a3b8;
   --source-editor-find: rgba(255, 205, 92, .42);
   --source-editor-find-active: rgba(255, 158, 44, .62);
+  /* 大纲侧栏宽度：与笔记侧栏同档（1600px 以上一起放宽到 300px）。 */
+  --source-editor-outline-width: 270px;
   min-width: 0;
   min-height: 0;
   display: flex;
@@ -535,6 +766,36 @@ html[data-theme="dark"] .markdown-source-editor {
 .markdown-source-editor__bar svg { font-size: 15px; }
 .markdown-source-editor__mode { color: #6f8299; letter-spacing: .12em; }
 .markdown-source-editor__hint { min-width: 0; flex: 1; overflow: hidden; color: #a9b5c5; font-weight: 500; letter-spacing: 0; text-overflow: ellipsis; white-space: nowrap; }
+
+/* 模式条上的两个图标按钮（大纲开关 / 复制 Markdown）—— 与笔记模式条同一套外观。
+   合并成多行选择器后，靠正则锚「单行选择器」的断言会静默失效，所以这里改用类名断言守卫。 */
+.markdown-source-editor__outline,
+.markdown-source-editor__copy {
+  flex: 0 0 auto;
+  width: 26px;
+  height: 26px;
+  display: grid;
+  place-items: center;
+  margin-right: 2px;
+  border: 0;
+  border-radius: 7px;
+  background: none;
+  color: #7d8b9e;
+  cursor: pointer;
+}
+.markdown-source-editor__outline:hover,
+.markdown-source-editor__copy:hover { background: rgba(47, 128, 237, .09); color: #4a7fc1; }
+.markdown-source-editor__outline.is-active { background: rgba(47, 128, 237, .13); color: #2268c7; }
+
+/* 正文区：源码 / 预览与大纲侧栏并排；模式条在上方横跨整宽，与笔记的网格同构。 */
+.markdown-source-editor__body { min-height: 0; flex: 1; display: flex; }
+.markdown-source-editor__outline { flex: 0 0 var(--source-editor-outline-width); }
+
+/* 窄窗口下全局样式会把 .markdown-outline 变成浮层（见 src/style.css），
+   落点得改到模式条正下方，否则会盖住顶栏。 */
+@media (max-width: 1180px) { .markdown-source-editor .markdown-outline { top: 35px; } }
+@media (min-width: 1600px) { .markdown-source-editor { --source-editor-outline-width: 300px; } }
+
 .markdown-source-editor__code { min-height: 0; flex: 1; display: flex; }
 /* 切去预览时收起编辑器。用 display 而不是卸载：光标、选区、撤销栈都留在原处。 */
 .markdown-source-editor__code.is-collapsed { display: none; }
@@ -566,6 +827,11 @@ html[data-theme="dark"] .markdown-source-editor__modes { background: rgba(120, 1
 html[data-theme="dark"] .markdown-source-editor__mode-button { color: #8496ad; }
 html[data-theme="dark"] .markdown-source-editor__mode-button:hover { color: #9dc3f2; }
 html[data-theme="dark"] .markdown-source-editor__mode-button.is-active { background: #1b2b42; color: #a9cdf7; }
+html[data-theme="dark"] .markdown-source-editor__outline,
+html[data-theme="dark"] .markdown-source-editor__copy { color: #8496ad; }
+html[data-theme="dark"] .markdown-source-editor__outline:hover,
+html[data-theme="dark"] .markdown-source-editor__copy:hover { background: rgba(120, 168, 235, .14); color: #9dc3f2; }
+html[data-theme="dark"] .markdown-source-editor__outline.is-active { background: rgba(120, 168, 235, .2); color: #a9cdf7; }
 
 /* 预览区：只读渲染，自己滚动。
    文档元素本身的排版在 style.css 的 `.markdown-rendered-doc`（与笔记预览共用一份），

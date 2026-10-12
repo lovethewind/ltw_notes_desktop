@@ -276,6 +276,10 @@ function createCleanMarkdownDocument(note, options = {}) {
 /**
  * 按文件夹层级创建全部未删除笔记的 Markdown ZIP。
  *
+ * 文档体固定走 `createMarkdownDocument`（带 front matter 的迁移格式）—— 导出的 ZIP 要能再
+ * **导入回本应用**，标题与标签就得有所依凭。想给别人看、不需要回读的那一份走单个 `.md`
+ * 通道（`createCleanMarkdownDocument`），两者不要混。
+ *
  * @param {{ folders: Record<string, any>[], notes: Record<string, any>[] }} backup 备份数据。
  * @returns {Buffer} ZIP 文件内容。
  */
@@ -346,6 +350,28 @@ function createMarkdownZip(backup) {
 }
 
 /**
+ * 剥掉导出时拼进文件名的笔记 ID 后缀（`标题-a1b2c3d4.md` → `标题`）。
+ *
+ * `createMarkdownZip` 给每篇文件名追加 `-<笔记 ID 前 8 位>` 防重名（详见那里的 `fileName`），
+ * 没有元数据可依时 `parseMarkdownDocument` 会拿文件名当标题，于是库里就会出现
+ * 「标题-a1b2c3d4」这种带一串垃圾的标题。**只在 ZIP 通道剥**：
+ *   - 单文件导出用的是干净的 `标题.md`，没有后缀；
+ *   - 用户自己的文件夹里「会议-20241010.md」这类日期后缀不该被动（纯数字也命中 8 位十六进制）。
+ * 宁可漏剥一个真后缀，也不擅自改用户自己起的文件名。
+ *
+ * @param {unknown} value 文件名（不含扩展名）。
+ * @returns {string} 去掉 ID 后缀的名称；若去完为空（文件名本身就是那串 ID）则原样返回。
+ */
+function stripExportedIdSuffix(value) {
+  const name = String(value || "")
+  // `(?!\d{8}$)`：`会议-20241010.md` 这类纯数字日期后缀也长得像「8 位十六进制」，但那是用户
+  // 自己起的名字，改掉等于悄悄篡改标题。真正的笔记 ID 前 8 位来自 UUID、含字母的概率
+  // 约 97.7%，所以只认「至少含一个 a-f」的形式 —— 漏剥比误剥安全。
+  const stripped = name.replace(/-(?!\d{8}$)[0-9a-f]{8}$/i, "").trim()
+  return stripped || name
+}
+
+/**
  * 直接读取 Markdown ZIP 中的文档，并保留压缩包内部目录层级。
  *
  * @param {Buffer|string} source ZIP 文件内容或本地路径。
@@ -374,7 +400,9 @@ function collectMarkdownDocumentsFromZip(source) {
     if (![".md", ".markdown"].includes(extension)) continue
     const content = entry.getData().toString("utf8")
     const document = {
-      ...parseMarkdownDocument(content, fileName.slice(0, -extension.length)),
+      // 文件名兜底标题要先剥掉导出时追加的 ID 后缀，否则没有元数据的包会顶着
+      // 「标题-a1b2c3d4」进库（带 front matter 的包走元数据，不受影响）。
+      ...parseMarkdownDocument(content, stripExportedIdSuffix(fileName.slice(0, -extension.length))),
       folderPath: pathParts.slice(0, -1)
     }
     const resources = []
@@ -509,5 +537,8 @@ module.exports = {
   getMimeType,
   parsePortableBackupArchive,
   parseMarkdownDocument,
-  sanitizeFileName
+  sanitizeFileName,
+  stripExportedIdSuffix,
+  // 围栏口径只留这一份实现：纯净导出与「本机地址转网页地址」共用，避免两处判断漂移。
+  splitFencedCodeSegments
 }

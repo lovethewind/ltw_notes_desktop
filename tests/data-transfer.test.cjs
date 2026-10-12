@@ -13,7 +13,8 @@ const {
   extractLocalImageReferences,
   parsePortableBackupArchive,
   parseMarkdownDocument,
-  sanitizeFileName
+  sanitizeFileName,
+  stripExportedIdSuffix
 } = require("../electron/data-transfer.cjs")
 
 function sha256(value) {
@@ -458,4 +459,101 @@ test("纯净Markdown导出接线：IPC、preload、类型与面板入口齐全",
   // 面板入口与渲染层调用都要真的接上，否则按钮是死的。
   assert.match(read("src/App.vue"), /导出为纯净 Markdown/)
   assert.match(read("src/App.vue"), /window\.notesDesktop\.exportNoteMarkdownClean\(activeNoteId\.value as string\)/)
+})
+
+test("Markdown压缩包固定用可回读格式：带front matter，内部标签原样落盘", () => {
+  const backup = {
+    folders: [],
+    notes: [
+      {
+        id: "321c7925-0000-4000-8000-000000000000",
+        folderId: null,
+        title: "T",
+        content: ['<div data-xynote-embed="note:n2"></div>', "第一行<br />第二行"].join("\n"),
+        isDeleted: false,
+        tags: [{ name: "学习" }]
+      }
+    ]
+  }
+
+  const markdown = new AdmZip(createMarkdownZip(backup)).readAsText("未分类/T-321c7925.md")
+
+  // 导出的 ZIP 要能再导入回本应用，元数据与内部标签都得原样留着 —— 别再往纯净格式改。
+  assert.match(markdown, /^---\ntitle: "T"\ntags: \["学习"\]/)
+  assert.match(markdown, /data-xynote-embed="note:n2"/)
+  assert.match(markdown, /第一行<br \/>第二行/)
+})
+
+test("导出文件名里的笔记ID后缀会在回读时剥掉", () => {
+  // 真笔记 ID 的前 8 位来自 UUID，通常是随机十六进制。
+  assert.equal(stripExportedIdSuffix("测试-321c7925"), "测试")
+  assert.equal(stripExportedIdSuffix("T-a1b2c3d4"), "T")
+  // 日期后缀（20241010）也长得像 8 位十六进制，但那是用户自己起的名字，不能动。
+  assert.equal(stripExportedIdSuffix("会议-20241010"), "会议-20241010")
+  assert.equal(stripExportedIdSuffix("报告-final"), "报告-final")
+  assert.equal(stripExportedIdSuffix("周报-2026"), "周报-2026")
+  // 文件名本身就是那串 ID 时不能剥成空标题。
+  assert.equal(stripExportedIdSuffix("a1b2c3d4"), "a1b2c3d4")
+})
+
+test("导回ZIP：文件名兜底标题不带ID后缀，带元数据时仍以元数据为准", () => {
+  const zip = new AdmZip()
+  zip.addFile("未分类/测试-321c7925.md", Buffer.from("无元数据正文", "utf8"))
+  zip.addFile(
+    "未分类/另一次-aaaaaaaa.md",
+    Buffer.from('---\ntitle: "元数据标题"\ntags: []\n---\n有元数据正文', "utf8")
+  )
+
+  const byContent = new Map(
+    collectMarkdownDocumentsFromZip(zip.toBuffer()).map((doc) => [doc.content, doc])
+  )
+  // 没有元数据 → 拿文件名兜底，且必须先剥掉导出时追加的 ID 后缀
+  assert.equal(byContent.get("无元数据正文").title, "测试")
+  // 有元数据 → 元数据标题优先，文件名只是兜底
+  assert.equal(byContent.get("有元数据正文").title, "元数据标题")
+})
+
+test("批量导出接线：全部导出与右键导出所选都写可回读的 ZIP", () => {
+  const projectRoot = resolve(__dirname, "..")
+  const read = (relative) => readFileSync(resolve(projectRoot, relative), "utf8")
+  const mainSource = read("electron/main.cjs")
+
+  const allExport = mainSource.slice(
+    mainSource.indexOf("async function exportAllMarkdown"),
+    mainSource.indexOf("async function exportSelectedMarkdown")
+  )
+  const selectedExport = mainSource.slice(
+    mainSource.indexOf("async function exportSelectedMarkdown"),
+    mainSource.indexOf("async function exportFullBackup")
+  )
+  assert.ok(allExport && selectedExport, "两个批量导出函数都要在")
+  for (const source of [allExport, selectedExport]) {
+    // 写盘走带 front matter 的可回读通道：导出的 ZIP 必须能再导回来。
+    assert.match(source, /writeFile\(result\.filePath, createMarkdownZip\(backup\)\)/)
+  }
+  // 「纯净 ZIP」那层包装已删除 —— ZIP 只有可回读一种形态，别再让它长回来。
+  assert.doesNotMatch(mainSource, /createCleanMarkdownArchive/)
+})
+
+test("导入导出面板按语义分组，卡片不再常驻描边", () => {
+  const projectRoot = resolve(__dirname, "..")
+  const read = (relative) => readFileSync(resolve(projectRoot, relative), "utf8")
+  const appSource = read("src/App.vue")
+  const styleSource = read("src/style.css")
+
+  // 九个入口按「导入 / 导出 / 备份与恢复 / 工具」分开，顺序即分组顺序
+  assert.match(appSource, /class="data-transfer-groups"/)
+  assert.match(
+    appSource,
+    /<h3>导入<\/h3>[\s\S]*<h3>导出<\/h3>[\s\S]*<h3>备份与恢复<\/h3>[\s\S]*<h3>工具<\/h3>/
+  )
+  assert.match(appSource, /<strong>导出全部 Markdown<\/strong>/)
+
+  // 卡片常态透明无框，靠悬停浮起；组内奇数条目才拉满整行
+  assert.match(
+    styleSource,
+    /\.folder-dialog \.data-transfer-grid > button \{[^}]*border: 1px solid transparent[^}]*background: transparent/
+  )
+  assert.match(styleSource, /\.data-transfer-grid > button:last-child:nth-child\(odd\) \{ grid-column: 1 \/ -1; \}/)
+  assert.doesNotMatch(styleSource, /\.markdown-folder-import-action \{ grid-column: 1 \/ -1; \}/)
 })

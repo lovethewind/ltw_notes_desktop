@@ -886,6 +886,8 @@ html[data-theme="dark"] .markdown-rendered-doc {
 .milkdown-editor-root .milkdown .milkdown-link-preview > .link-preview > .link-display { display: none; }
 .markdown-outline { min-width: 0; min-height: 0; display: flex; flex-direction: column; overflow: hidden; border-left: 1px solid var(--line); background: rgba(249,252,255,.8); }
 .markdown-outline__header { flex: none; height: 54px; display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 0 10px 0 12px; border-bottom: 1px solid #e8eef5; background: rgba(249,252,255,.94); }
+/* 只放大纲一个视图的侧栏（本地文件标签）拿它当栏头标题；笔记侧栏栏头是两个页签。 */
+.markdown-outline__title { display: inline-flex; align-items: center; padding: 4px 2px; color: #315f96; font-size: 12px; font-weight: 650; letter-spacing: .02em; }
 .markdown-outline__tabs { display: inline-flex; gap: 2px; padding: 2px; border-radius: 9px; background: rgba(24,39,63,.05); }
 .markdown-outline__tab { display: inline-flex; align-items: center; gap: 4px; padding: 4px 9px; border: 0; border-radius: 7px; background: transparent; color: #718096; cursor: pointer; font-size: 12px; font-weight: 500; line-height: 18px; }
 .markdown-outline__tab svg { width: 15px; height: 15px; }
@@ -972,16 +974,26 @@ html[data-theme="dark"] .markdown-rendered-doc {
 .folder-dialog .general-settings-actions { margin-top: 14px; }
 .data-transfer-dialog { width: min(570px, calc(100vw - 40px)); }
 .global-graph-backdrop { z-index: 230; }
-.folder-dialog .data-transfer-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 4px; }
-.folder-dialog .data-transfer-grid > button { height: auto; min-height: 72px; display: flex; align-items: center; gap: 12px; border: 1px solid #dfe7f1; padding: 12px 14px; background: #f8fbff; color: #33445d; text-align: left; transition: border-color .14s ease, background .14s ease, transform .14s ease, box-shadow .14s ease; }
-.folder-dialog .data-transfer-grid > button:hover, .folder-dialog .data-transfer-grid > button:focus-visible { border-color: #9bc3f1; background: #f0f7ff; box-shadow: 0 8px 20px rgba(47,128,237,.1); transform: translateY(-1px); }
-.folder-dialog .data-transfer-grid > button:disabled { transform: none; }
-.data-transfer-grid > button > svg { flex: 0 0 auto; color: var(--blue); font-size: 25px; }
-.data-transfer-grid > button > span { min-width: 0; display: grid; gap: 4px; }
+.folder-dialog .data-transfer-groups { display: grid; gap: 13px; max-height: min(58vh, 480px); overflow-y: auto; padding-right: 3px; }
+.folder-dialog .data-transfer-group > h3 { margin: 0 0 5px; color: #9aa6b6; font-size: 11px; font-weight: 800; letter-spacing: .14em; }
+.folder-dialog .data-transfer-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
+.folder-dialog .data-transfer-grid > button { height: auto; min-height: 64px; display: flex; align-items: center; gap: 11px; border: 1px solid transparent; border-radius: 12px; padding: 10px 12px; background: transparent; color: #33445d; text-align: left; transition: border-color .14s ease, background .14s ease, transform .14s ease, box-shadow .14s ease; }
+.folder-dialog .data-transfer-grid > button:hover, .folder-dialog .data-transfer-grid > button:focus-visible { border-color: #aecdf0; background: #f1f8ff; box-shadow: 0 6px 16px rgba(47,128,237,.08); transform: translateY(-1px); }
+.folder-dialog .data-transfer-grid > button:disabled { transform: none; box-shadow: none; }
+/* 卡片不再常驻描边与底色：靠分组标题给结构，悬停时才浮起，避免一屏全是同级框。 */
+.folder-dialog .data-transfer-grid > button:last-child:nth-child(odd) { grid-column: 1 / -1; }
+.data-transfer-grid > button > svg { flex: 0 0 auto; color: #4a89db; font-size: 22px; }
+.data-transfer-grid > button > span { min-width: 0; display: grid; gap: 3px; }
 .data-transfer-grid strong { color: #263850; font-size: 13px; }
-.data-transfer-grid small { color: #8795a8; font-size: 10px; font-weight: 550; line-height: 1.35; }
-.data-transfer-grid .markdown-folder-import-action { grid-column: 1 / -1; }
+.data-transfer-grid small { color: #8b98aa; font-size: 11px; font-weight: 550; line-height: 1.4; }
 .folder-dialog p.data-transfer-message { margin: 14px 0 0; border-radius: 10px; padding: 9px 11px; background: #edf7ff; color: #3373ba; font-weight: 650; }
+.link-rewrite-confirm { margin-top: 12px; display: grid; gap: 10px; border: 1px solid #d8e6f7; border-radius: 10px; padding: 11px 13px; background: #f5faff; }
+.link-rewrite-confirm p { margin: 0; color: #33445d; font-size: 12px; font-weight: 650; line-height: 1.6; }
+.link-rewrite-confirm strong { color: var(--blue); }
+.link-rewrite-confirm-actions { display: flex; justify-content: flex-end; gap: 8px; }
+.link-rewrite-confirm-actions button { height: 30px; border: 1px solid #dfe7f1; border-radius: 8px; padding: 0 14px; background: #fff; color: #33445d; font-size: 12px; font-weight: 650; cursor: pointer; }
+.link-rewrite-confirm-actions button.primary { border-color: transparent; background: var(--blue); color: #fff; }
+.link-rewrite-confirm-actions button:disabled { opacity: .55; cursor: default; }
 .folder-dialog .data-transfer-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 14px; }
 .attachment-manager-backdrop { z-index: 225; padding: 20px; }
 .attachment-manager-dialog { width: min(980px, calc(100vw - 40px)); height: min(760px, calc(100vh - 40px)); min-height: 0; display: flex; flex-direction: column; overflow: hidden; border: 1px solid rgba(164,183,207,.38); border-radius: 22px; background: rgba(255,255,255,.98); box-shadow: 0 30px 90px rgba(22,42,70,.3); }
@@ -1549,6 +1561,14 @@ button:focus-visible { outline: 3px solid rgba(47,128,237,.22); outline-offset: 
   /* 链接气泡同理：只有投影需要暗色分支。 */
   .milkdown-editor-root .milkdown .milkdown-link-preview > .link-preview { box-shadow: 0 14px 38px rgba(0,0,0,.46), 0 2px 6px rgba(0,0,0,.3); }
   .milkdown-editor-root .milkdown .ProseMirror { color: #d9e5f5; }
+  /*
+    标题与表头在亮色块里用的是写死的深色（`.ProseMirror :is(h1..h6)` 的 #1f2d3d、
+    以及表头同色），暗色主题原先只覆写了正文 —— 深色字落在深背景上几乎看不见，
+    表现为「标题比正文还淡」。这里补上：颜色比正文（#d9e5f5）再亮一档，
+    让亮色下「标题比正文深」的层级方向在夜间镜像成「比正文亮」，与钉钉夜间一致。
+  */
+  .milkdown-editor-root .milkdown .ProseMirror :is(h1, h2, h3, h4, h5, h6) { color: #eef5ff; }
+  .milkdown-editor-root .milkdown .ProseMirror table thead th { color: #eef5ff; }
   .milkdown-editor-root .milkdown .milkdown-top-bar .top-bar-item:hover,
   .milkdown-editor-root .milkdown .milkdown-top-bar .top-bar-item:focus-visible,
   .milkdown-editor-root .milkdown .milkdown-top-bar .top-bar-item.active { background: #203753; color: #79aff3; }
@@ -1566,6 +1586,7 @@ button:focus-visible { outline: 3px solid rgba(47,128,237,.22); outline-offset: 
   .markdown-outline__tab { color: #92a4ba; }
   .markdown-outline__tab:hover { color: #c9d9ed; }
   .markdown-outline__tab.is-active { background: #203d61; color: #79aff3; box-shadow: none; }
+  .markdown-outline__title { color: #c9d9ed; }
   .relationship-panel__switch { background: rgba(255,255,255,.06); }
   .relationship-panel__switch-btn { color: #92a4ba; }
   .relationship-panel__switch-btn:hover { color: #c9d9ed; }
@@ -1588,11 +1609,17 @@ button:focus-visible { outline: 3px solid rgba(47,128,237,.22); outline-offset: 
   .folder-dialog .general-setting-switch.active { background: #4389df; }
   .folder-dialog .general-setting-select { border-color: #35506f; background: #172941; color: #e5effc; }
   :scope { --global-graph-bg: #101d30; --global-graph-border: #2a3c56; --global-graph-header: #14253c; }
-  .folder-dialog .data-transfer-grid > button { border-color: #2c405b; background: #14253c; color: #d5e1f0; }
-  .folder-dialog .data-transfer-grid > button:hover, .folder-dialog .data-transfer-grid > button:focus-visible { border-color: #416b99; background: #1b304c; }
+  .folder-dialog .data-transfer-group > h3 { color: #7b8ba0; }
+  .folder-dialog .data-transfer-grid > button { border-color: transparent; background: transparent; color: #d5e1f0; }
+  .folder-dialog .data-transfer-grid > button:hover, .folder-dialog .data-transfer-grid > button:focus-visible { border-color: #38587d; background: #1a2c45; }
+  .data-transfer-grid > button > svg { color: #6fa6e8; }
   .data-transfer-grid strong { color: #e5effc; }
   .data-transfer-grid small { color: #91a4bc; }
   .folder-dialog p.data-transfer-message { background: #183653; color: #9bc4f7; }
+  .link-rewrite-confirm { border-color: #2c405b; background: #14253c; }
+  .link-rewrite-confirm p { color: #d5e1f0; }
+  .link-rewrite-confirm-actions button { border-color: #2c405b; background: #1b304c; color: #d5e1f0; }
+  .link-rewrite-confirm-actions button.primary { border-color: transparent; background: var(--blue); color: #fff; }
   .attachment-manager-dialog { border-color: #30445f; background: #101d30; box-shadow: 0 30px 90px rgba(0,0,0,.55); }
   .attachment-manager-heading, .attachment-manager-dialog > footer { border-color: #2b3e58; background: #132238; }
   .attachment-manager-heading .dialog-icon { background: #272d4b; color: #aab9f4; }
@@ -1906,7 +1933,6 @@ button:focus-visible { outline: 3px solid rgba(47,128,237,.22); outline-offset: 
 
 @media (max-width: 620px) {
   .folder-dialog .data-transfer-grid { grid-template-columns: 1fr; }
-  .data-transfer-grid .markdown-folder-import-action { grid-column: auto; }
   .sync-center-dialog { padding: 20px 16px; }
   .sync-center-heading { grid-template-columns: 42px minmax(0, 1fr); }
   .sync-center-heading .dialog-icon { width: 42px; height: 42px; }

@@ -97,6 +97,8 @@ function registerDataTransferHandlers(ipcMain, domain) {
   ipcMain.handle("data:import-markdown-path", (_event, filePath, content, folderId) =>
     domain.importMarkdownPath(filePath, folderId || null, content))
   ipcMain.handle("data:import-backup", domain.importBackup)
+  ipcMain.handle("data:preview-local-note-link-rewrite", domain.previewLocalNoteLinkRewrite)
+  ipcMain.handle("data:rewrite-local-note-links", domain.rewriteLocalNoteLinks)
 }
 
 function registerBackupHandlers(ipcMain, domain) {

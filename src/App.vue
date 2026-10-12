@@ -54,6 +54,7 @@ import type {
   SyncResultChange,
   SyncSettingsView,
   LocalMarkdownFile,
+  LocalNoteLinkRewritePreview,
   SyncStatus,
   ThemeMode,
   WorkspaceData
@@ -226,6 +227,8 @@ const syncSaving = ref(false)
 const dataTransferVisible = ref(false)
 const dataTransferBusy = ref(false)
 const dataTransferMessage = ref('')
+/** 「本机笔记地址转网页地址」的预览结果；非空时面板显示二次确认。 */
+const linkRewritePreview = ref<LocalNoteLinkRewritePreview | null>(null)
 const databaseBackupStatus = reactive<DatabaseBackupStatus>({
   state: 'idle',
   message: '尚未创建备份',
@@ -988,6 +991,7 @@ async function toggleAiAssistant(): Promise<void> {
  */
 function openDataTransfer(): void {
   dataTransferMessage.value = ''
+  linkRewritePreview.value = null
   markdownImportTargetVisible.value = false
   dataTransferVisible.value = true
 }
@@ -1059,6 +1063,61 @@ async function exportCurrentNoteMarkdownClean(): Promise<void> {
 async function exportAllNotesMarkdown(): Promise<void> {
   await runDataTransfer(() => window.notesDesktop.exportAllMarkdown())
 }
+
+/**
+ * 扫描全库正文里的本机笔记地址，给出「转成网页地址」将影响的范围。
+ *
+ * 只读、不改库：结果落到 `linkRewritePreview`，面板据此显示二次确认。
+ * 之所以不让同步流程自动改写，是 spec 的既有决策「存量数据不清扫、不迁移」——
+ * 批量动用户正文的事必须由用户确认。
+ *
+ * :return: 操作完成后的 Promise。
+ */
+async function previewLocalNoteLinkRewrite(): Promise<void> {
+  if (dataTransferBusy.value) return
+  dataTransferBusy.value = true
+  dataTransferMessage.value = ''
+  actionError.value = ''
+  try {
+    await flushSave()
+    linkRewritePreview.value = await window.notesDesktop.previewLocalNoteLinkRewrite()
+  } catch (error) {
+    dataTransferMessage.value = error instanceof Error ? error.message : '扫描本机笔记地址失败'
+  } finally {
+    dataTransferBusy.value = false
+  }
+}
+
+/**
+ * 确认执行「本机笔记地址转网页地址」。
+ *
+ * 正文会被改写并推送云端，所以按数据变更处理：走 `runDataTransfer` 并刷新工作区
+ * （正文变了，列表摘要、关系面板与图谱都要跟着更新）。
+ *
+ * :return: 操作完成后的 Promise。
+ */
+async function confirmLocalNoteLinkRewrite(): Promise<void> {
+  linkRewritePreview.value = null
+  await runDataTransfer(() => window.notesDesktop.rewriteLocalNoteLinks(), true)
+}
+
+/**
+ * 把预览里「保持原样」的各条数与原因拼成一句话。
+ *
+ * 三种原因必须分开说：目标未同步是「等同步完再来一次」，目标不存在是「这条链接已经废了」，
+ * 两者对用户的下一步动作完全不同。无跳过项时返回空串，模板据此隐藏该句。
+ *
+ * :return: 形如「3 条的目标笔记尚未同步、1 条的目标笔记已不存在」的说明。
+ */
+const linkRewriteSkippedSummary = computed(() => {
+  const preview = linkRewritePreview.value
+  if (!preview) return ''
+  const parts: string[] = []
+  if (preview.unsyncedLinks) parts.push(`${preview.unsyncedLinks} 条的目标笔记尚未同步`)
+  if (preview.missingLinks) parts.push(`${preview.missingLinks} 条的目标笔记已不存在`)
+  if (preview.noWebBaseLinks) parts.push(`${preview.noWebBaseLinks} 条因未配置网页地址`)
+  return parts.join('、')
+})
 
 /**
  * 创建包含历史版本的完整备份。
@@ -4888,40 +4947,77 @@ onBeforeUnmount(() => {
         <button class="dialog-close-button" type="button" aria-label="关闭导入导出窗口" :disabled="dataTransferBusy" @click="dataTransferVisible = false"><Icon icon="tabler:x" /></button>
         <div class="dialog-icon"><Icon icon="tabler:archive" /></div>
         <h2>导入导出</h2>
-        <p>完整备份用于本应用恢复；通用 Markdown 用于其他软件，资源文件随 ZIP 保存。</p>
-        <div class="data-transfer-grid">
-          <button class="markdown-folder-import-action" type="button" :disabled="dataTransferBusy" @click="openMarkdownImportTarget('folder')">
-            <Icon icon="tabler:folder-down" />
-            <span><strong>导入 Markdown 文件夹或 ZIP</strong><small>恢复 ZIP 内相对资源并保留目录层级</small></span>
-          </button>
-          <button class="markdown-file-import-action" type="button" :disabled="dataTransferBusy" @click="openMarkdownImportTarget('single')">
-            <Icon icon="tabler:file-download" />
-            <span><strong>导入单个 Markdown 文件</strong><small>连图片一起搬进来，不额外建文件夹</small></span>
-          </button>
-          <button type="button" :disabled="dataTransferBusy || !activeNote" @click="exportCurrentNoteMarkdown">
-            <Icon icon="tabler:file-export" />
-            <span><strong>导出当前笔记</strong><small>单个 .md，资源保留原始地址</small></span>
-          </button>
-          <button type="button" :disabled="dataTransferBusy || !activeNote" @click="exportCurrentNoteMarkdownClean">
-            <Icon icon="tabler:file-text" />
-            <span><strong>导出为纯净 Markdown</strong><small>去掉元数据与内嵌标签，给其他软件看</small></span>
-          </button>
-          <button type="button" :disabled="dataTransferBusy" @click="exportAllNotesMarkdown">
-            <Icon icon="tabler:folder-share" />
-            <span><strong>导出通用 Markdown</strong><small>ZIP 内含 Markdown 与原始资源文件</small></span>
-          </button>
-          <button type="button" :disabled="dataTransferBusy" @click="importCompleteBackup">
-            <Icon icon="tabler:database-import" />
-            <span><strong>导入完整备份</strong><small>读取新版 .xynotes 并生成独立副本</small></span>
-          </button>
-          <button type="button" :disabled="dataTransferBusy" @click="exportCompleteBackup">
-            <Icon icon="tabler:database-export" />
-            <span><strong>创建完整备份</strong><small>原始附件随 .xynotes 完整保存</small></span>
-          </button>
-          <button type="button" :disabled="dataTransferBusy" @click="openDatabaseBackupManager">
-            <Icon icon="tabler:database-cog" />
-            <span><strong>自动备份管理</strong><small>查看、创建和恢复数据库与附件快照</small></span>
-          </button>
+        <p>完整备份用于本应用恢复；Markdown 导出按文件夹打包、图片随 ZIP 保存，并可再导入回本应用。</p>
+        <div class="data-transfer-groups">
+          <section class="data-transfer-group">
+            <h3>导入</h3>
+            <div class="data-transfer-grid">
+              <button class="markdown-folder-import-action" type="button" :disabled="dataTransferBusy" @click="openMarkdownImportTarget('folder')">
+                <Icon icon="tabler:folder-down" />
+                <span><strong>导入 Markdown 文件夹或 ZIP</strong><small>恢复 ZIP 内相对资源并保留目录层级</small></span>
+              </button>
+              <button class="markdown-file-import-action" type="button" :disabled="dataTransferBusy" @click="openMarkdownImportTarget('single')">
+                <Icon icon="tabler:file-download" />
+                <span><strong>导入单个 Markdown 文件</strong><small>连图片一起搬进来，不额外建文件夹</small></span>
+              </button>
+            </div>
+          </section>
+          <section class="data-transfer-group">
+            <h3>导出</h3>
+            <div class="data-transfer-grid">
+              <button type="button" :disabled="dataTransferBusy || !activeNote" @click="exportCurrentNoteMarkdown">
+                <Icon icon="tabler:file-export" />
+                <span><strong>导出当前笔记</strong><small>单个 .md，保留元数据与内部标签</small></span>
+              </button>
+              <button type="button" :disabled="dataTransferBusy || !activeNote" @click="exportCurrentNoteMarkdownClean">
+                <Icon icon="tabler:file-text" />
+                <span><strong>导出为纯净 Markdown</strong><small>去掉元数据与内嵌标签，给其他软件看</small></span>
+              </button>
+              <button type="button" :disabled="dataTransferBusy" @click="exportAllNotesMarkdown">
+                <Icon icon="tabler:folder-share" />
+                <span><strong>导出全部 Markdown</strong><small>全部笔记按文件夹打包，含元数据与图片，可导回</small></span>
+              </button>
+            </div>
+          </section>
+          <section class="data-transfer-group">
+            <h3>备份与恢复</h3>
+            <div class="data-transfer-grid">
+              <button type="button" :disabled="dataTransferBusy" @click="importCompleteBackup">
+                <Icon icon="tabler:database-import" />
+                <span><strong>导入完整备份</strong><small>读取新版 .xynotes 并生成独立副本</small></span>
+              </button>
+              <button type="button" :disabled="dataTransferBusy" @click="exportCompleteBackup">
+                <Icon icon="tabler:database-export" />
+                <span><strong>创建完整备份</strong><small>原始附件随 .xynotes 完整保存</small></span>
+              </button>
+              <button type="button" :disabled="dataTransferBusy" @click="openDatabaseBackupManager">
+                <Icon icon="tabler:database-cog" />
+                <span><strong>自动备份管理</strong><small>查看、创建和恢复数据库与附件快照</small></span>
+              </button>
+            </div>
+          </section>
+          <section class="data-transfer-group">
+            <h3>工具</h3>
+            <div class="data-transfer-grid">
+              <button class="local-link-rewrite-action" type="button" :disabled="dataTransferBusy" @click="previewLocalNoteLinkRewrite">
+                <Icon icon="tabler:link" />
+                <span><strong>本机地址转为线上地址</strong><small>把正文里的本机笔记链接换成网页可打开的地址</small></span>
+              </button>
+            </div>
+          </section>
+        </div>
+        <div v-if="linkRewritePreview" class="link-rewrite-confirm">
+          <p v-if="linkRewritePreview.convertibleLinks">
+            将改动 <strong>{{ linkRewritePreview.convertibleNotes }}</strong> 篇笔记中的
+            <strong>{{ linkRewritePreview.convertibleLinks }}</strong> 条链接<template v-if="linkRewriteSkippedSummary">；另有 {{ linkRewriteSkippedSummary }}，保持原样</template>。
+          </p>
+          <p v-else>
+            没有可转换的链接<template v-if="linkRewriteSkippedSummary">；{{ linkRewriteSkippedSummary }}</template>。
+          </p>
+          <div class="link-rewrite-confirm-actions">
+            <button type="button" :disabled="dataTransferBusy" @click="linkRewritePreview = null">取消</button>
+            <button class="primary" type="button" :disabled="dataTransferBusy || !linkRewritePreview.convertibleLinks" @click="confirmLocalNoteLinkRewrite">确认转换</button>
+          </div>
         </div>
         <p v-if="dataTransferMessage" class="data-transfer-message">{{ dataTransferMessage }}</p>
         <div class="data-transfer-actions">

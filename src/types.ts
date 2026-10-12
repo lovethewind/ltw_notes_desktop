@@ -204,6 +204,41 @@ export interface DataTransferResult {
   noteIds?: string[]
 }
 
+/**
+ * 「本机笔记地址转网页地址」的只读预览。
+ *
+ * 存在的理由：地址只在插入那一刻由 `buildNoteHref` 决定，存量与「先插链接、目标后同步」
+ * 的链接都不会自动回填。批量改写用户正文有风险，所以先给一份账再让用户确认。
+ */
+export interface LocalNoteLinkRewritePreview {
+  /** 参与扫描的未删除笔记数。 */
+  scannedNotes: number
+  /** 正文里含本机笔记地址的笔记数。 */
+  linkedNotes: number
+  /** 会被改动的笔记数。 */
+  convertibleNotes: number
+  /** 扫到的本机笔记地址总条数（不含围栏代码块内的）。 */
+  totalLinks: number
+  /** 能转成网页地址的条数。 */
+  convertibleLinks: number
+  /** 目标笔记已不存在（已删除）的条数。 */
+  missingLinks: number
+  /** 目标笔记尚未同步到云端（无 serverId）的条数。 */
+  unsyncedLinks: number
+  /** 因未配置网页地址而无法转换的条数。 */
+  noWebBaseLinks: number
+  /** 前几篇将被改动的笔记，用于展示样例。 */
+  samples: Array<{ noteId: string; title: string; changed: number }>
+}
+
+/** 「本机笔记地址转网页地址」的执行结果。 */
+export interface LocalNoteLinkRewriteResult extends DataTransferResult {
+  /** 实际被改动的笔记数。 */
+  noteCount: number
+  /** 实际被改写的链接条数。 */
+  linkCount: number
+}
+
 export interface DatabaseBackup {
   id: string
   createdAt: string
@@ -506,6 +541,10 @@ export interface NotesDesktopApi {
   exportAllMarkdown(): Promise<DataTransferResult>
   exportSelectedMarkdown(noteIds: string[]): Promise<DataTransferResult>
   exportFullBackup(): Promise<DataTransferResult>
+  /** 预览「本机笔记地址转网页地址」将改动的范围（只读，不改库）。 */
+  previewLocalNoteLinkRewrite(): Promise<LocalNoteLinkRewritePreview>
+  /** 手动把正文里仍使用本机地址的笔记链接改写成网页地址。 */
+  rewriteLocalNoteLinks(): Promise<LocalNoteLinkRewriteResult>
   importMarkdown(folderId: string | null): Promise<DataTransferResult>
   /** 导入单个 Markdown 文件（含其引用的本地图片），不建来源文件夹。 */
   importSingleMarkdown(folderId: string | null): Promise<DataTransferResult>

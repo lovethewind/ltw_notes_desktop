@@ -6,6 +6,7 @@ const {
   createNoteContentPreview,
   searchNotes: searchNotesDatabase
 } = require("./database-search.cjs")
+const { rewriteLocalNoteLinksInContent } = require("./local-note-links.cjs")
 
 const HISTORY_INTERVAL_MS = 5 * 60 * 1000
 const MAX_NOTE_CONTENT_BYTES = 15 * 1024 * 1024
@@ -1112,6 +1113,132 @@ function createRepository(database) {
       `).run()
     })
     rebuild()
+  }
+
+  /**
+   * 遍历全部未删除笔记，计算每篇正文里的本机地址能改写多少条。
+   *
+   * @param {string} webBaseUrl 网页版地址前缀。
+   * @returns {{
+   *   totals: {
+   *     scannedNotes: number, linkedNotes: number, totalLinks: number,
+   *     convertibleLinks: number, missingLinks: number, unsyncedLinks: number, noWebBaseLinks: number
+   *   },
+   *   affected: Array<{ id: string, title: string, content: string, changed: number }>
+   * }} 统计与待改写项。
+   */
+  function collectLocalNoteLinkRewrite(webBaseUrl) {
+    const rows = database.prepare("SELECT id, title, content FROM notes WHERE is_deleted = 0").all()
+    const findTarget = database.prepare(
+      "SELECT id, server_id FROM notes WHERE id = ? AND is_deleted = 0"
+    )
+    // 同一目标常被多篇（甚至同一篇多次）引用，缓存一次解析结果。
+    const targetCache = new Map()
+    const resolveTarget = (targetId) => {
+      if (targetCache.has(targetId)) return targetCache.get(targetId)
+      const row = findTarget.get(targetId)
+      const resolved = row ? { id: row.id, serverId: row.server_id } : null
+      targetCache.set(targetId, resolved)
+      return resolved
+    }
+    const totals = {
+      scannedNotes: rows.length,
+      linkedNotes: 0,
+      totalLinks: 0,
+      convertibleLinks: 0,
+      missingLinks: 0,
+      unsyncedLinks: 0,
+      noWebBaseLinks: 0
+    }
+    const affected = []
+    for (const row of rows) {
+      const outcome = rewriteLocalNoteLinksInContent(row.content, { resolveTarget, webBaseUrl })
+      if (!outcome.total) continue
+      totals.linkedNotes += 1
+      totals.totalLinks += outcome.total
+      totals.convertibleLinks += outcome.changed
+      totals.missingLinks += outcome.missing
+      totals.unsyncedLinks += outcome.unsynced
+      totals.noWebBaseLinks += outcome.noWebBase
+      if (outcome.changed > 0) {
+        affected.push({
+          id: row.id,
+          title: row.title || "（无标题）",
+          content: outcome.content,
+          changed: outcome.changed
+        })
+      }
+    }
+    return { totals, affected }
+  }
+
+  /**
+   * 扫描全库正文里仍使用本机地址的笔记链接，**只读**统计可转成网页地址的范围。
+   *
+   * 存在的意义：`buildNoteHref` 只在插入那一刻决定地址，历史链接与「先插链接、目标后同步」
+   * 的链接都不会回填（见 `docs/specs/2026-09-05-note-link-online-url.md` 的「存量不清扫」决策）。
+   * 这里把「要不要清扫」交给用户手动决定，先给一份可预览的账。
+   *
+   * @param {string} webBaseUrl 网页版地址前缀（来自同步设置）。
+   * @returns {{
+   *   scannedNotes: number, linkedNotes: number, convertibleNotes: number,
+   *   totalLinks: number, convertibleLinks: number,
+   *   missingLinks: number, unsyncedLinks: number, noWebBaseLinks: number,
+   *   samples: Array<{ noteId: string, title: string, changed: number }>
+   * }} 预览统计。
+   */
+  function previewLocalNoteLinkRewrite(webBaseUrl) {
+    const { totals, affected } = collectLocalNoteLinkRewrite(webBaseUrl)
+    return {
+      scannedNotes: totals.scannedNotes,
+      linkedNotes: totals.linkedNotes,
+      convertibleNotes: affected.length,
+      totalLinks: totals.totalLinks,
+      convertibleLinks: totals.convertibleLinks,
+      missingLinks: totals.missingLinks,
+      unsyncedLinks: totals.unsyncedLinks,
+      noWebBaseLinks: totals.noWebBaseLinks,
+      samples: affected.slice(0, 5).map((item) => ({
+        noteId: item.id,
+        title: item.title,
+        changed: item.changed
+      }))
+    }
+  }
+
+  /**
+   * 把全库正文里的本机笔记地址改写成网页版地址。
+   *
+   * ⚠️ 逐篇走 `updateNote` 而非直接 `UPDATE notes`：只有这条路径会一并处理历史版本、
+   * `dirty = 1`、`refreshNoteLinks` 与同步入队。**关系表必须跟着刷新**
+   * （note_links 硬规则第 2 条），否则改完正文后「关系」面板与图谱会停在旧数据上。
+   *
+   * 改写前后的引用关系不会漂：网页地址 `{web}/notes/{serverId}` 仍被
+   * `resolveNoteLinkTargetIds` 的 webLinkPattern 认回同一篇本地笔记。
+   *
+   * @param {string} webBaseUrl 网页版地址前缀（来自同步设置）。
+   * @returns {{
+   *   noteCount: number, linkCount: number,
+   *   missingLinks: number, unsyncedLinks: number, noWebBaseLinks: number,
+   *   changedNotes: Array<{ id: string, title: string, changed: number }>
+   * }} 实际改写结果。
+   */
+  function rewriteLocalNoteLinks(webBaseUrl) {
+    const { totals, affected } = collectLocalNoteLinkRewrite(webBaseUrl)
+    const changedNotes = []
+    for (const item of affected) {
+      const updated = updateNote(item.id, { content: item.content })
+      if (!updated) continue
+      changedNotes.push({ id: item.id, title: item.title, changed: item.changed })
+    }
+    return {
+      noteCount: changedNotes.length,
+      linkCount: changedNotes.reduce((sum, item) => sum + item.changed, 0),
+      missingLinks: totals.missingLinks,
+      unsyncedLinks: totals.unsyncedLinks,
+      noWebBaseLinks: totals.noWebBaseLinks,
+      changedNotes
+    }
   }
 
   /**
@@ -2445,6 +2572,7 @@ function createRepository(database) {
     getWorkspaceSession,
     saveWorkspaceSession,
     saveNoteViewState,
+    getNote,
     getNoteForEditing,
     searchNotes,
     createNote,
@@ -2455,6 +2583,8 @@ function createRepository(database) {
     getNoteOutlinks,
     getNoteGraph,
     getGlobalGraph,
+    previewLocalNoteLinkRewrite,
+    rewriteLocalNoteLinks,
     bulkUpdateNotes,
     listNoteConflicts,
     resolveNoteConflict,

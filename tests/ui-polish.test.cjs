@@ -337,3 +337,16 @@ test('资源右键菜单按渲染尺寸贴合视口并在小窗口内部滚动',
   assert.match(appSource, /ref="noteTabContextMenuElement"/)
   assert.match(styleSource, /\.resource-context-menu\s*\{[^}]*max-height:\s*calc\(100vh - 76px\)[^}]*overflow-y:\s*auto/)
 })
+
+test('夜间模式下编辑器标题与表头有暗色覆写', () => {
+  const styleSource = readFileSync(resolve(projectRoot, 'src/style.css'), 'utf8')
+
+  // 亮色块里这两处的颜色是写死的深色（#1f2d3d），暗色作用域必须各补一条覆写，
+  // 否则深色字落在深背景上几乎看不见 —— 表现就是「夜间模式下标题比正文还淡」。
+  assert.match(styleSource, /\.ProseMirror :is\(h1, h2, h3, h4, h5, h6\)\s*\{[^}]*color:\s*#1f2d3d/)
+  assert.match(styleSource, /\.ProseMirror table thead th\s*\{[^}]*color:\s*#1f2d3d/)
+
+  const darkScope = styleSource.slice(styleSource.indexOf('@scope (html[data-theme="dark"])'))
+  assert.match(darkScope, /:is\(h1, h2, h3, h4, h5, h6\)\s*\{[^}]*color:\s*#eef5ff/)
+  assert.match(darkScope, /table thead th\s*\{[^}]*color:\s*#eef5ff/)
+})

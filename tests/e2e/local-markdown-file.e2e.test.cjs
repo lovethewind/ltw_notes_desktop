@@ -635,3 +635,66 @@ test('预览模式下查找自动切回源码并高亮匹配项', { timeout: 60_
     await fs.rm(fileDir, { recursive: true, force: true })
   }
 })
+
+test('本地文件的大纲：源码模式点标题定位光标，预览模式切章节，全程不改动文件', { timeout: 60_000 }, async () => {
+  const userDataPath = await fs.mkdtemp(path.join(os.tmpdir(), 'xinyue-notes-file-outline-e2e-'))
+  const fileDir = await fs.mkdtemp(path.join(os.tmpdir(), 'xinyue-notes-md-outline-e2e-'))
+  const filePath = path.join(fileDir, '大纲测试.md')
+  // 章节之间塞足够多的正文，让「跳到第三章」是一次真实的滚动而不是原地不动。
+  const filler = (label) => Array.from({ length: 24 }, (_, index) => `${label}第 ${index + 1} 行正文`).join('\n\n')
+  const original = [
+    '# 第一章 开篇',
+    '',
+    filler('甲'),
+    '',
+    '## 第二章 展开',
+    '',
+    filler('乙'),
+    '',
+    '### 第三章 收尾',
+    ''
+  ].join('\n')
+  let application
+
+  try {
+    await fs.writeFile(filePath, original, 'utf8')
+    application = await launchApplication(userDataPath)
+    await stubFileDialogs(application, { openPath: filePath })
+    const { page } = application
+    await openMarkdownFile(page, filePath)
+
+    // 侧栏默认展开（偏好键与笔记共用，隔离数据目录里取的是默认值）。
+    const items = page.locator('.markdown-source-editor .markdown-outline-item')
+    await items.first().waitFor()
+    assert.deepEqual(
+      (await items.allInnerTexts()).map((text) => text.trim()),
+      ['第一章 开篇', '第二章 展开', '第三章 收尾']
+    )
+    // 层级要传下去：缩进靠 --outline-level，丢了三级标题会和一级一样平。
+    assert.match(await items.nth(2).getAttribute('style'), /--outline-level:\s*3/)
+
+    // 源码模式：点最后一项，光标必须真的落到那一行 —— 滚动位置与光标位置要一致。
+    await items.nth(2).click()
+    await page.waitForFunction(() =>
+      document.querySelector('.markdown-source-editor .cm-activeLine')?.textContent?.trim() === '### 第三章 收尾')
+
+    // 预览模式：同一份正文渲染出的标题也要能被大纲找到；点击只切高亮，不碰编辑区。
+    await modeButton(page, 1).click()
+    await page.locator('.markdown-source-editor__preview h3').waitFor()
+    await page.locator('.markdown-source-editor .markdown-outline-item').first().click()
+    await page.waitForFunction(() =>
+      document.querySelector('.markdown-source-editor .markdown-outline-item.is-active')?.textContent?.trim() === '第一章 开篇')
+
+    // 大纲与复制都是只读能力：翻遍章节也不能改动文件。
+    // ⚠️ 这里断言磁盘而不是 `readFileEditorText`：CodeMirror 只渲染视口内的行，
+    // 长文档读不全 —— 短文档才适合按 `.cm-line` 拼回全文。
+    await modeButton(page, 0).click()
+    await page.locator('.markdown-source-editor .cm-content').waitFor()
+    assert.equal(await fs.readFile(filePath, 'utf8'), original)
+    assert.equal(await saveStatus(page).innerText(), '已保存')
+  } finally {
+    if (application) await application.electronApplication.close().catch(() => {})
+    await fs.rm(userDataPath, { recursive: true, force: true })
+    await fs.rm(fileDir, { recursive: true, force: true })
+  }
+})

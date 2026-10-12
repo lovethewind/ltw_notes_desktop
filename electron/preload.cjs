@@ -224,6 +224,10 @@ contextBridge.exposeInMainWorld("notesDesktop", {
   exportAllMarkdown: () => ipcRenderer.invoke("data:export-all-markdown"),
   exportSelectedMarkdown: (noteIds) => ipcRenderer.invoke("data:export-selected-markdown", noteIds),
   exportFullBackup: () => ipcRenderer.invoke("data:export-backup"),
+  /** 预览「本机笔记地址转网页地址」将改动的范围（只读）。 */
+  previewLocalNoteLinkRewrite: () => ipcRenderer.invoke("data:preview-local-note-link-rewrite"),
+  /** 手动把正文里仍使用本机地址的笔记链接改写成网页地址。 */
+  rewriteLocalNoteLinks: () => ipcRenderer.invoke("data:rewrite-local-note-links"),
   importMarkdown: (folderId) => ipcRenderer.invoke("data:import-markdown", folderId),
   importSingleMarkdown: (folderId) => ipcRenderer.invoke("data:import-single-markdown", folderId),
   /** 把当前已打开的外部文件导入笔记库（正文由编辑器给出，可能含未保存的改动）。 */

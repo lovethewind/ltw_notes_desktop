@@ -1549,7 +1549,64 @@ async function exportNoteMarkdownClean(noteId) {
 }
 
 /**
+ * 描述被跳过的本机笔记地址条数与原因。
+ *
+ * @param {{ missingLinks: number, unsyncedLinks: number, noWebBaseLinks: number }} result 转换结果。
+ * @returns {string} 可直接拼进提示的说明文本。
+ */
+function describeSkippedLinkRewrite(result) {
+  const parts = []
+  if (result.unsyncedLinks) parts.push(`${result.unsyncedLinks} 条的目标笔记尚未同步`)
+  if (result.missingLinks) parts.push(`${result.missingLinks} 条的目标笔记已不存在`)
+  if (result.noWebBaseLinks) parts.push(`${result.noWebBaseLinks} 条因未配置网页地址`)
+  return `另有 ${parts.join("、")}，保持原样`
+}
+
+/**
+ * 预览「把正文里的本机笔记地址转成网页地址」会影响多少篇笔记与多少条链接。
+ *
+ * 纯读取，不改库 —— 让用户先看到账再决定要不要执行。
+ *
+ * @returns {{
+ *   scannedNotes: number, linkedNotes: number, convertibleNotes: number,
+ *   totalLinks: number, convertibleLinks: number,
+ *   missingLinks: number, unsyncedLinks: number, noWebBaseLinks: number
+ * }} 预览统计。
+ */
+function previewLocalNoteLinkRewrite() {
+  return repository.previewLocalNoteLinkRewrite(syncSettings.webUrl)
+}
+
+/**
+ * 把正文里仍使用本机地址的笔记链接改写成网页版地址。
+ *
+ * 为什么是手动触发而不是同步时自动改写：spec 的既有决策是「存量数据不清扫、不迁移」
+ * （`docs/specs/2026-09-05-note-link-online-url.md` L58/L66），任何批量改写用户正文的动作
+ * 都得由用户确认后执行。`buildNoteHref` 只保证「插入那一刻」地址正确，这条入口负责补上存量。
+ *
+ * @returns {{ canceled: boolean, message: string, noteCount: number, linkCount: number }} 转换结果。
+ */
+async function rewriteLocalNoteLinkAddresses() {
+  const result = repository.rewriteLocalNoteLinks(syncSettings.webUrl)
+  if (result.noteCount > 0) scheduleSync()
+  const skipped = result.missingLinks + result.unsyncedLinks + result.noWebBaseLinks
+  const headline = result.noteCount
+    ? `已转换 ${result.noteCount} 篇笔记中的 ${result.linkCount} 条链接`
+    : "没有需要转换的本机笔记地址"
+  return {
+    canceled: false,
+    message: skipped ? `${headline}；${describeSkippedLinkRewrite(result)}` : headline,
+    noteCount: result.noteCount,
+    linkCount: result.linkCount
+  }
+}
+
+/**
  * 将全部未删除笔记按文件夹层级导出为 Markdown ZIP。
+ *
+ * 文档体是带 front matter 的迁移格式 —— 导出的 ZIP 要能**再导入回本应用**，
+ * 标题与标签就得有所依凭（回读走「导入 Markdown 文件夹或 ZIP」）。
+ * 只想给别人看、不需要回读的那一份走单个 `.md` 的 `exportNoteMarkdownClean`，两条通道别混。
  *
  * @returns {Promise<Record<string, any>>} 导出结果。
  */
@@ -1570,12 +1627,16 @@ async function exportAllMarkdown() {
   const noteCount = backup.notes.filter((note) => !note.isDeleted).length
   return {
     canceled: false,
-    message: `已导出 ${noteCount} 篇 Markdown 笔记`,
+    message: `已导出 ${noteCount} 篇 Markdown 笔记，可再导入回本应用`,
     filePath: result.filePath
   }
 }
 
-/** 将用户选中的未删除笔记导出为 Markdown ZIP。 */
+/**
+ * 将用户选中的未删除笔记导出为 Markdown ZIP（右键「导出所选」走这条）。
+ *
+ * 与 `exportAllMarkdown` 同格式：带 front matter，导回来不丢标题与标签。
+ */
 async function exportSelectedMarkdown(noteIds) {
   const selectedIds = new Set(Array.isArray(noteIds) ? noteIds.filter((id) => typeof id === "string" && id) : [])
   if (!selectedIds.size) throw new Error("请先选择要导出的笔记")
@@ -1593,7 +1654,7 @@ async function exportSelectedMarkdown(noteIds) {
   await fs.promises.writeFile(result.filePath, createMarkdownZip(backup))
   return {
     canceled: false,
-    message: `已导出 ${backup.notes.length} 篇 Markdown 笔记`,
+    message: `已导出 ${backup.notes.length} 篇 Markdown 笔记，可再导入回本应用`,
     filePath: result.filePath
   }
 }
@@ -2469,7 +2530,9 @@ function registerIpcHandlers() {
       importMarkdown: importMarkdownFiles,
       importSingleMarkdown: importSingleMarkdownFile,
       importMarkdownPath: importMarkdownFromPath,
-      importBackup: importFullBackup
+      importBackup: importFullBackup,
+      previewLocalNoteLinkRewrite,
+      rewriteLocalNoteLinks: rewriteLocalNoteLinkAddresses
     },
     backups: {
       list: listCurrentDatabaseBackups,
