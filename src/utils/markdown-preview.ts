@@ -200,43 +200,125 @@ function renderPreviewCell(rawText: string, parser: Marked): string {
  * 编辑器拿它承载自定义块节点，好处是往返无损；但**预览渲染器不认识这个 div**，
  * 只会原样输出一个没有内容的空块 —— 嵌入的笔记在预览里等于凭空消失。
  * 这里把它换成一张可见的占位卡片，至少让读者知道「这里原本有一张卡片」。
+ * 卡片上带 `data-note-id`：预览层用事件委托接住点击 / 回车，把被嵌入的那篇笔记打开。
+ *
+ * ⚠️ 两个标识属性**任一存在**即算一张卡（口径与 `src/editor/xynote-embed.ts` 的 `isEmbedHtml` 一致）：
+ * - `data-xynote-embed`：本机 uuid，桌面端插入时写；
+ * - `data-xynote-embed-server`：服务端主键，**网页端插入的卡片只有它**。
+ * 只认前者会让这类卡片在预览里整块消失（渲染成一个零高度的空 div）。
  */
-const EMBED_PLACEHOLDER_PATTERN = /<div[^>]*\bdata-xynote-embed=["']note:([^"']+)["'][^>]*>\s*<\/div>/gi
+const EMBED_PLACEHOLDER_PATTERN = /<div[^>]*\bdata-xynote-embed(?:-server)?=["'][^"']*["'][^>]*>\s*<\/div>/gi
+
+/** 从占位 div 里取本机 ID（`note:` 之后的部分）；网页端插入的卡片没有这个属性。 */
+const EMBED_ID_PATTERN = /\bdata-xynote-embed=["']note:([^"']*)["']/i
+
+/** 从占位 div 里取跨端标识（服务端主键）。与 `data-xynote-embed` 是各自独立的属性。 */
+const EMBED_SERVER_PATTERN = /\bdata-xynote-embed-server=["']([^"']*)["']/i
 
 /** 从占位 div 里取插入时写在 `title` 属性上的标题（可能没有）。 */
 const EMBED_TITLE_PATTERN = /\btitle=["']([^"']*)["']/i
 
+/** 嵌入卡要展示的信息。字段都可缺省 —— 缺什么就不渲染什么。 */
+export interface PreviewEmbedMeta {
+  /** 标题。缺省时退回占位 div 上的 `title`，再退回「未命名笔记」。 */
+  title?: string | null
+  /** 所在文件夹名。空则不渲染这一行。 */
+  folderName?: string | null
+  /** 纯文本摘要（调用方已去记号并截断）。空则不渲染。 */
+  excerpt?: string | null
+  /** 已格式化好的日期（`YYYY.MM.DD`）。空则不渲染。 */
+  date?: string | null
+  /** 目标笔记已被删除（在回收站）。此时只给标题 + 提示，不给摘要与时间。 */
+  deleted?: boolean
+}
+
 /** 预览渲染需要的外部信息。 */
 export interface PreviewRenderOptions {
   /**
-   * 按笔记 ID 解析标题；查不到返回空。
+   * 按笔记 ID 解析嵌入卡的展示信息；查不到返回 null。
    *
-   * 本模块不认识笔记库，标题由调用方（编辑器组件）注入；取不到就退回「未命名嵌入笔记」。
+   * 本模块不认识笔记库：标题 / 文件夹 / 摘要 / 时间一律由调用方（编辑器组件）注入 ——
+   * 预览渲染是纯函数，只认这一份**同步**给到的数据（异步取详情会破坏纯函数契约）。
    */
-  resolveEmbedTitle?: (noteId: string) => string | null
+  resolveEmbedMeta?: (noteId: string) => PreviewEmbedMeta | null
 }
 
 /**
- * 渲染一张嵌入占位卡片。
+ * 预览卡上的三个图标（material-symbols，与编辑态 `NoteEmbedCard.vue` 同源同图）。
  *
- * :param noteId: 被嵌入的笔记 ID。
- * :param rawHtml: 原始占位 div（用于取出 `title` 属性）。
+ * 为什么是内联 SVG 而不是 `<Icon>`：预览正文是 `v-html` 出来的死 HTML，挂不上 Vue 组件，
+ * 只剩「拼字符串」这一条路。`fill="currentColor"` 让图形跟随文字颜色，换主题不用另写样式。
+ *
+ * 🔴 之前这里写着「不引入图标，因为 DOMPurify 不放行 svg」—— **那条判断是错的**，
+ * 已用项目同一份 dompurify 实测：默认配置完整保留 `svg` / `path` / `viewBox` / `fill` / `d`，
+ * 同时剥掉 `onload` / `<script>` / `on*`。所以既不必放宽清洗白名单，也没引入 XSS 面。
+ */
+const EMBED_ICON_FOLDER =
+  '<svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M4 20q-.825 0-1.412-.587T2 18V6q0-.825.588-1.412T4 4h5.175q.4 0 .763.15t.637.425L12 6h8q.825 0 1.413.588T22 8v10q0 .825-.587 1.413T20 20zm0-2h16V8h-8.825l-2-2H4zm0 0V6z"/></svg>'
+const EMBED_ICON_CLOCK =
+  '<svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M13 11.6V8q0-.425-.288-.712T12 7t-.712.288T11 8v3.975q0 .2.075.388t.225.337l3.3 3.3q.275.275.7.275T16 16t.275-.7t-.275-.7zM12 22q-2.075 0-3.9-.788t-3.175-2.137T2.788 15.9T2 12t.788-3.9t2.137-3.175T8.1 2.788T12 2t3.9.788t3.175 2.137T21.213 8.1T22 12t-.788 3.9t-2.137 3.175t-3.175 2.138T12 22"/></svg>'
+const EMBED_ICON_ARROW =
+  '<svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M16.175 13H5q-.425 0-.712-.288T4 12t.288-.712T5 11h11.175l-4.9-4.9q-.3-.3-.288-.7t.313-.7q.3-.275.7-.288t.7.288l6.6 6.6q.15.15.213.325t.062.375t-.062.375t-.213.325l-6.6 6.6q-.275.275-.687.275T11.3 19.3q-.3-.3-.3-.712t.3-.713z"/></svg>'
+
+/**
+ * 渲染一张嵌入卡片（信息与编辑态卡片对齐，**可点开**）。
+ *
+ * 卡片是死 HTML（预览正文走 `v-html`），点击由预览层事件委托接住，
+ * 目标笔记从 `data-note-id` 上取 —— 所以这个属性是功能的一部分，不能省。
+ * `role` / `tabindex` 让它可聚焦，预览层另接一个 keydown（Enter / 空格）保持键盘可达。
+ * 这些属性都在 DOMPurify 默认白名单里（`data-*` 由 `ALLOW_DATA_ATTR` 放行），清洗后不会丢。
+ *
+ * 信息层级与编辑态卡片（`NoteEmbedCard.vue`）一致：文件夹 → 标题 → 摘要 → 底行（时间）+ 箭头。
+ *
+ * :param rawHtml: 原始占位 div（用于取出目标键与 `title` 属性）。
  * :param options: 预览渲染选项。
  * :return: 卡片 HTML。
  */
 function renderEmbedPlaceholder(
-  noteId: string,
   rawHtml: string,
   options?: PreviewRenderOptions
 ): string {
+  // 目标键：本机 ID 优先，退回跨端标识。与调用方 `resolveEmbedMeta` 的匹配口径
+  // （`item.id === 键 || item.serverId === 键`）配合，两种卡片都能查得到。
+  const noteId = (EMBED_ID_PATTERN.exec(rawHtml)?.[1] ?? '').trim()
+    || (EMBED_SERVER_PATTERN.exec(rawHtml)?.[1] ?? '').trim()
   const inlineTitle = EMBED_TITLE_PATTERN.exec(rawHtml)?.[1]?.trim() ?? ''
+  const meta = options?.resolveEmbedMeta?.(noteId) ?? null
   // 实时查到的标题优先：占位 div 上的 `title` 是插入那一刻的快照，笔记改名后就过期了。
-  const resolved = options?.resolveEmbedTitle?.(noteId)?.trim() || inlineTitle || ''
+  const resolved = meta?.title?.trim() || inlineTitle || ''
   const title = escapeHtml(resolved || '未命名笔记')
+  // ⚠️ 属性值要把引号也转掉。当前捕获组是 `[^"']+`、本身不含引号，但属性边界
+  // 不该依赖正则的这一点 —— 将来放宽匹配就会破。
+  const noteRef = escapeHtml(noteId).replace(/"/g, '&quot;')
+  const folderName = meta?.folderName?.trim() ?? ''
+  const excerpt = meta?.excerpt?.trim() ?? ''
+  const date = meta?.date?.trim() ?? ''
+  const rows: string[] = []
+  if (folderName) {
+    rows.push(
+      `<span class="markdown-embed-placeholder__folder">${EMBED_ICON_FOLDER}${escapeHtml(folderName)}</span>`
+    )
+  }
+  rows.push(`<span class="markdown-embed-placeholder__title">${title}</span>`)
+  if (meta?.deleted) {
+    rows.push('<span class="markdown-embed-placeholder__excerpt">此笔记已被删除或移入回收站</span>')
+  } else if (excerpt) {
+    rows.push(`<span class="markdown-embed-placeholder__excerpt">${escapeHtml(excerpt)}</span>`)
+  }
+  // 底行只剩时间。原先无论有没有时间都恒定挂一个「嵌入的笔记」标签，
+  // 卡片补齐文件夹 / 标题 / 摘要之后它已纯属冗余 —— 卡片外观本身就说明了这段是什么。
+  // ⚠️ 回收站态没有时间：此时整行不渲染，别留一个零高度的空壳。
+  if (date && !meta?.deleted) {
+    const dateHtml = `<span class="markdown-embed-placeholder__date">${EMBED_ICON_CLOCK}${escapeHtml(date)}</span>`
+    rows.push(`<span class="markdown-embed-placeholder__foot">${dateHtml}</span>`)
+  }
   return [
-    '<div class="markdown-embed-placeholder">',
-    `<span class="markdown-embed-placeholder__title">${title}</span>`,
-    '<span class="markdown-embed-placeholder__meta">嵌入的笔记</span>',
+    `<div class="markdown-embed-placeholder" data-note-id="${noteRef}" role="button" tabindex="0" title="打开笔记">`,
+    `<span class="markdown-embed-placeholder__body">${rows.join('')}</span>`,
+    // 箭头 = 「这张卡能点开」的静止态暗示。上一轮只做 hover 描边，用户从静态截图上看
+    // 毫无变化（「没变化」反馈的根因）。aria-hidden：可点语义已由 role + title 承载，箭头纯装饰。
+    // 图形与编辑态 `__open` 按钮同款（`arrow-forward-rounded`），不再用字符 `→` 凑。
+    `<span class="markdown-embed-placeholder__action" aria-hidden="true">${EMBED_ICON_ARROW}</span>`,
     '</div>'
   ].join('')
 }
@@ -276,7 +358,7 @@ export function renderPreviewMarkdown(source: string, options?: PreviewRenderOpt
   const html = getPreviewParser().parse(source, { async: false }) as string
   // 绝大多数文档没有嵌入卡片，先做一次廉价的包含判断，不白跑一遍正则。
   if (!html.includes('data-xynote-embed')) return html
-  return html.replace(EMBED_PLACEHOLDER_PATTERN, (match: string, noteId: string) => (
-    renderEmbedPlaceholder(noteId, match, options)
+  return html.replace(EMBED_PLACEHOLDER_PATTERN, (match: string) => (
+    renderEmbedPlaceholder(match, options)
   ))
 }

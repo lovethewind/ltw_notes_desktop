@@ -107,7 +107,98 @@ function rewriteLocalNoteLinksInContent(content, options = {}) {
   return result
 }
 
+/**
+ * 嵌入卡的开标签形态（捕获组：1=到 data-xynote-embed 为止的前缀、2=引号、3=本机 ID、4=其余属性）。
+ *
+ * 与 `data-transfer.cjs` / `MarkdownVisualEditor.vue` 里识别嵌入卡的正则同口径：
+ * `<div … data-xynote-embed="note:<id>" …>`。属性值内含 `>` 的极端写法不支持
+ * （既有各处正则同样不支持），属已知边界。
+ */
+const EMBED_OPEN_TAG_PATTERN =
+  /<div\b((?:[^>]*?\s)?data-xynote-embed=(["'])note:([^"']+)\2)([^>]*)>/gi
+
+/** 判断一段开标签里是否已经有跨端标识属性。 */
+const EMBED_SERVER_ATTR_PATTERN = /\bdata-xynote-embed-server=/i
+
+/**
+ * 给正文里的嵌入卡片补上**跨端标识** `data-xynote-embed-server="{serverId}"`。
+ *
+ * 为什么需要它：嵌入卡以本机 uuid 承载（`data-xynote-embed="note:{localId}"`），网页端只认
+ * 服务端数字主键。新插入的卡片会直接带上跨端标识，而**存量卡片**没有，需要用户主动跑一次回填，
+ * 网页端才能渲染（否则只能降级成占位）。设计见
+ * docs/specs/2026-10-12-note-embed-web-render.md。
+ *
+ * 规则：
+ * - **只在缺失时补**：已有 `data-xynote-embed-server` 的卡片原样跳过（幂等，重复跑 changed=0）；
+ * - **不改** `data-xynote-embed` 的值（本地 ID 是桌面端的解析键，换掉卡片就失去目标）；
+ * - 目标查不到（已删除）→ 计入 `missing`；查得到但没同步 → 计入 `unsynced`；两者都原样保留；
+ * - **围栏代码块内原样跳过**（与链接改写同口径，宁可少改）；
+ * - 一条都没补上时，返回的 `content` 与入参**逐字节一致**。
+ *
+ * @param {string} content 笔记正文（Markdown 原文）。
+ * @param {{ resolveTarget?: (noteId: string) => { id: string, serverId: string | null } | null }} [options] 解析器。
+ * @returns {{
+ *   content: string,
+ *   total: number,
+ *   changed: number,
+ *   missing: number,
+ *   unsynced: number,
+ *   alreadyFilled: number,
+ *   changedTargets: string[]
+ * }} 回填结果。
+ */
+function fillEmbedServerIdsInContent(content, options = {}) {
+  const source = String(content || "")
+  const resolveTarget = options.resolveTarget
+  const result = {
+    content: source,
+    total: 0,
+    changed: 0,
+    missing: 0,
+    unsynced: 0,
+    alreadyFilled: 0,
+    changedTargets: []
+  }
+  // 快速预筛：绝大多数正文不含嵌入卡。
+  if (!source.includes("data-xynote-embed=")) return result
+
+  const changedTargets = new Set()
+  const filled = splitFencedCodeSegments(source)
+    .map((segment) => {
+      if (segment.code) return segment.text
+      return segment.text.replace(EMBED_OPEN_TAG_PATTERN, (match, prefix, quote, rawId, rest) => {
+        result.total += 1
+        if (EMBED_SERVER_ATTR_PATTERN.test(match)) {
+          result.alreadyFilled += 1
+          return match
+        }
+        const targetId = decodeLinkId(rawId)
+        const target = typeof resolveTarget === "function" ? resolveTarget(targetId) : null
+        if (!target) {
+          result.missing += 1
+          return match
+        }
+        if (!target.serverId) {
+          result.unsynced += 1
+          return match
+        }
+        result.changed += 1
+        changedTargets.add(targetId)
+        // 紧跟在 data-xynote-embed 之后插入，其余属性（title 等）原样保留；
+        // 引号沿用卡片原本的写法（单双引号都能被两端解析）。
+        return `<div${prefix} data-xynote-embed-server=${quote}${String(target.serverId)}${quote}${rest}>`
+      })
+    })
+    .join("\n")
+
+  if (result.changed === 0) return result
+  result.content = filled
+  result.changedTargets = [...changedTargets]
+  return result
+}
+
 module.exports = {
   LOCAL_NOTE_LINK_PATTERN,
-  rewriteLocalNoteLinksInContent
+  rewriteLocalNoteLinksInContent,
+  fillEmbedServerIdsInContent
 }

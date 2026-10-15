@@ -23,13 +23,23 @@ interface Props {
   leftLabel?: string
   /** 右侧列标题。 */
   rightLabel?: string
+  /**
+   * 列头图标。
+   *
+   * 默认值是冲突对比的语义（设备 / 云）；历史版本对比借用同一套视图，那里两侧都是
+   * 同一篇笔记的两个时间点，设备与云的图标会误导，所以做成可传入。
+   */
+  leftIcon?: string
+  rightIcon?: string
 }
 
 const props = withDefaults(defineProps<Props>(), {
   leftContent: '',
   rightContent: '',
   leftLabel: '本地冲突版本',
-  rightLabel: '当前云端版本'
+  rightLabel: '当前云端版本',
+  leftIcon: 'tabler:device-laptop',
+  rightIcon: 'tabler:cloud'
 })
 
 const scroller = ref<HTMLElement | null>(null)
@@ -122,12 +132,12 @@ watch(() => [props.leftContent, props.rightContent], () => {
     <div ref="scroller" class="conflict-diff__scroll">
       <div class="conflict-diff__columns">
         <div class="conflict-diff__column-head is-local">
-          <Icon icon="tabler:device-laptop" />
+          <Icon :icon="props.leftIcon" />
           <strong>{{ props.leftLabel }}</strong>
           <small>{{ leftLineCount }} 行</small>
         </div>
         <div class="conflict-diff__column-head is-remote">
-          <Icon icon="tabler:cloud" />
+          <Icon :icon="props.rightIcon" />
           <strong>{{ props.rightLabel }}</strong>
           <small>{{ rightLineCount }} 行</small>
         </div>

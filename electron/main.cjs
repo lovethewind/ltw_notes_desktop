@@ -1602,6 +1602,61 @@ async function rewriteLocalNoteLinkAddresses() {
 }
 
 /**
+ * 把「补嵌入卡跨端标识」预览里「保持原样」的条数与原因拼成一句话。
+ *
+ * 只有两种跳过原因（本地地址那条多一个「未配置网页地址」，嵌入卡不涉及网页地址配置）。
+ *
+ * :param {{ missingEmbeds: number, unsyncedEmbeds: number }} result 回填结果。
+ * :return: 形如「另有 2 张的目标笔记尚未同步，保持原样」的说明；无跳过项时返回空串。
+ */
+function describeSkippedEmbedFill(result) {
+  const parts = []
+  if (result.unsyncedEmbeds) parts.push(`${result.unsyncedEmbeds} 张的目标笔记尚未同步`)
+  if (result.missingEmbeds) parts.push(`${result.missingEmbeds} 张的目标笔记已不存在`)
+  if (!parts.length) return ""
+  return `另有 ${parts.join("、")}，保持原样`
+}
+
+/**
+ * 预览「给嵌入卡片补线上标识」会影响多少篇笔记与多少张卡片。
+ *
+ * 纯读取，不改库 —— 让用户先看到账再决定要不要执行。
+ *
+ * :return {{
+ *   scannedNotes: number, embeddedNotes: number, convertibleNotes: number,
+ *   totalEmbeds: number, fillableEmbeds: number,
+ *   missingEmbeds: number, unsyncedEmbeds: number, alreadyFilledEmbeds: number
+ * }} 预览统计。
+ */
+function previewEmbedServerIdFill() {
+  return repository.previewEmbedServerIdFill()
+}
+
+/**
+ * 给正文里的嵌入卡片补上跨端标识 `data-xynote-embed-server`。
+ *
+ * 为什么需要它：嵌入卡以本机 uuid 承载，网页端只认服务端数字主键，存量卡片在网页端
+ * 只能降级成占位。新插入的卡片已自动带上该属性，这条入口补齐历史数据。
+ * 与同步引擎无关（**同步依旧不改写正文**），属用户主动触发的存量清理。
+ *
+ * :return { canceled: boolean, message: string, noteCount: number, embedCount: number } 回填结果。
+ */
+async function fillEmbedServerIdsInNotes() {
+  const result = repository.fillEmbedServerIds()
+  if (result.noteCount > 0) scheduleSync()
+  const skipped = describeSkippedEmbedFill(result)
+  const headline = result.noteCount
+    ? `已为 ${result.noteCount} 篇笔记中的 ${result.embedCount} 张嵌入卡片补上线上标识`
+    : "没有需要补标识的嵌入卡片"
+  return {
+    canceled: false,
+    message: skipped ? `${headline}；${skipped}` : headline,
+    noteCount: result.noteCount,
+    embedCount: result.embedCount
+  }
+}
+
+/**
  * 将全部未删除笔记按文件夹层级导出为 Markdown ZIP。
  *
  * 文档体是带 front matter 的迁移格式 —— 导出的 ZIP 要能**再导入回本应用**，
@@ -2532,7 +2587,9 @@ function registerIpcHandlers() {
       importMarkdownPath: importMarkdownFromPath,
       importBackup: importFullBackup,
       previewLocalNoteLinkRewrite,
-      rewriteLocalNoteLinks: rewriteLocalNoteLinkAddresses
+      rewriteLocalNoteLinks: rewriteLocalNoteLinkAddresses,
+      previewEmbedServerIdFill,
+      fillEmbedServerIds: fillEmbedServerIdsInNotes
     },
     backups: {
       list: listCurrentDatabaseBackups,
@@ -2578,7 +2635,7 @@ function installMenu() {
           click: () => mainWindow?.webContents.send("general-settings:open")
         },
         {
-          label: "导入导出…",
+          label: "数据管理…",
           click: () => mainWindow?.webContents.send("data-transfer:open")
         },
         { type: "separator" },

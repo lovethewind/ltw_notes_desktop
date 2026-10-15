@@ -22,7 +22,7 @@
         <span v-if="excerpt && !expanded" class="note-embed-card__excerpt">{{ excerpt }}</span>
         <div class="note-embed-card__foot">
           <span class="note-embed-card__meta note-embed-card__meta--time">
-            <Icon icon="material-symbols:schedule-rounded" />{{ formatDate(updatedAt) }}
+            <Icon icon="material-symbols:schedule-rounded" />{{ formatNoteDate(updatedAt) }}
           </span>
           <!--
             纯提示，不是按钮：展开入口只有卡片主体（onCardClick）。平时隐藏、hover / 聚焦才淡入，
@@ -70,10 +70,22 @@ import { marked } from 'marked'
 import type { NoteFolder, OfflineNote } from '../types'
 import { dispatchOpenNote } from '../utils/note-open-events'
 import { sanitizePreviewHtml } from '../utils/preview-sanitize'
+import {
+  NOTE_EMBED_EXCERPT_LENGTH,
+  formatNoteDate,
+  stripNoteMarkdown
+} from '../utils/note-embed-meta'
 
-const props = withDefaults(defineProps<{ noteId: string; title?: string | null }>(), {
-  title: null
-})
+const props = withDefaults(
+  defineProps<{
+    /** 本机笔记 ID；网页端插入的卡片没有它（为空串）。 */
+    noteId: string
+    /** 跨端标识（服务端主键）；本机 ID 为空时靠它取数。 */
+    serverId?: string | null
+    title?: string | null
+  }>(),
+  { serverId: null, title: null }
+)
 
 /**
  * 卡片向宿主（nodeView）冒泡的交互事件。
@@ -101,9 +113,18 @@ const expanded = ref(false)
 const fullHtml = ref<string>('')
 
 /** 摘要固定截前 160 字，正文更长时才提供「展开全文」。 */
-const canExpand = computed(() => plainText.value.length > 160)
+const canExpand = computed(() => plainText.value.length > NOTE_EMBED_EXCERPT_LENGTH)
 
 const fallbackTitle = props.title && props.title.trim() ? props.title : ''
+
+/**
+ * 取数 / 打开笔记用的键：优先本机 ID，退回跨端标识。
+ *
+ * 网页端插入的卡片只写 `data-xynote-embed-server`（网页端没有本机 uuid），
+ * 同步到本机后 `noteId` 是空串 —— 此时必须用 serverId 取数，否则卡片一直显示「不存在」。
+ * `getNote` 内部对 serverId 也做了回落（见 electron/database.cjs），两条路都能命中。
+ */
+const lookupKey = computed(() => props.noteId || props.serverId || '')
 
 async function loadCard(): Promise<void> {
   loading.value = true
@@ -115,11 +136,15 @@ async function loadCard(): Promise<void> {
   rawContent.value = ''
   plainText.value = ''
   try {
+    if (!lookupKey.value) {
+      missing.value = true
+      return
+    }
     if (!folders.value.length) {
       const workspace = await window.notesDesktop.listWorkspace().catch(() => null)
       folders.value = workspace?.folders || []
     }
-    const target = await window.notesDesktop.getNote(props.noteId)
+    const target = await window.notesDesktop.getNote(lookupKey.value)
     if (!target) {
       missing.value = true
       return
@@ -133,25 +158,13 @@ async function loadCard(): Promise<void> {
     folderName.value = folders.value.find((f) => f.id === target.folderId)?.name || ''
     updatedAt.value = target.updatedAt || ''
     rawContent.value = target.content || ''
-    plainText.value = stripMarkdown(rawContent.value)
-    excerpt.value = plainText.value.slice(0, 160)
+    plainText.value = stripNoteMarkdown(rawContent.value)
+    excerpt.value = plainText.value.slice(0, NOTE_EMBED_EXCERPT_LENGTH)
   } catch {
     missing.value = true
   } finally {
     loading.value = false
   }
-}
-
-function stripMarkdown(raw: string): string {
-  // 轻量去 markdown 记号，仅用于摘要展示；不解析 data-xynote-embed，避免递归。
-  if (!raw) return ''
-  return raw
-    .replace(/!\[([^\]]*)\]\([^)]*\)/g, '$1') // 图片 → alt 文本
-    .replace(/\[([^\]]*)\]\([^)]*\)/g, '$1') // 链接 → 文本
-    .replace(/<[^>]+>/g, ' ') // 残留 HTML 标签 → 空格（含 data-xynote-embed 容器）
-    .replace(/[#>*_`~|-]{1,}/g, ' ') // markdown 记号
-    .replace(/\s+/g, ' ')
-    .trim()
 }
 
 /**
@@ -178,7 +191,8 @@ function toggleExpanded(): void {
  */
 function renderNoteBody(raw: string): string {
   const withoutNested = raw.replace(
-    /<div[^>]*data-xynote-embed=[^>]*>[\s\S]*?<\/div>/gi,
+    // 两个标识属性任一存在即算嵌套卡（网页端插入的卡片只有跨端标识）。
+    /<div[^>]*\bdata-xynote-embed(?:-server)?=[^>]*>[\s\S]*?<\/div>/gi,
     // 用带专属 data 标记的单行段落，而非 markdown 引用块：
     // 引用块 = blockquote(margin 8px) + 内层 p(margin 8px) 叠加，高度会翻倍且样式无法单独收敛。
     // DOMPurify 默认放行 data-* 属性，因此该标记能稳定穿过 sanitize，供样式精准命中。
@@ -205,12 +219,6 @@ function onFullClick(event: MouseEvent): void {
   })
 }
 
-function formatDate(value: string): string {
-  if (!value) return ''
-  const match = /^\d{4}-\d{2}-\d{2}/.exec(value)
-  return match ? match[0].replace(/-/g, '.') : ''
-}
-
 /**
  * 卡片主体（含标题/摘要/底部）的默认点击：优先展开 / 收起全文，
  * 不直接跳转，避免在展开区选字、滚动或只是想看一眼时误触打开笔记。
@@ -233,8 +241,10 @@ function onCardClick(): void {
  */
 function open(): void {
   if (loading.value || missing.value || deleted.value) return
+  if (!lookupKey.value) return
   // 在新标签页打开目标笔记，保留当前阅读上下文（由 App.vue 路由到 openNoteInNewTab）。
-  dispatchOpenNote(props.noteId, true)
+  // 键优先本机 ID；只有跨端标识时 App.vue 也会按 serverId 回落命中（见 handleOpenNoteEvent）。
+  dispatchOpenNote(lookupKey.value, true)
 }
 
 /**
@@ -260,7 +270,7 @@ function onContextMenu(event: MouseEvent): void {
   })
 }
 
-watch(() => props.noteId, loadCard)
+watch([() => props.noteId, () => props.serverId], loadCard)
 onMounted(loadCard)
 </script>
 

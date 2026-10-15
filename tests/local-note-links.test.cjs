@@ -5,7 +5,7 @@ const path = require("node:path")
 const test = require("node:test")
 const Database = require("better-sqlite3")
 const { openNotesDatabase } = require("../electron/database.cjs")
-const { rewriteLocalNoteLinksInContent } = require("../electron/local-note-links.cjs")
+const { fillEmbedServerIdsInContent, rewriteLocalNoteLinksInContent } = require("../electron/local-note-links.cjs")
 
 const WEB_BASE = "https://lovethewind.cn"
 
@@ -370,6 +370,289 @@ test("转换入口先预览再确认，正文改动后刷新工作区", () => {
   assert.match(app, /:disabled="dataTransferBusy \|\| !linkRewritePreview\.convertibleLinks"/)
   // 执行走 runDataTransfer 并带 refreshAfter，否则正文换了列表与关系面板还是旧的。
   assert.match(app, /await runDataTransfer\(\(\) => window\.notesDesktop\.rewriteLocalNoteLinks\(\), true\)/)
+  // 重新打开面板要清掉上一次的预览，避免残留的确认区（两条清理入口都要清）。
+  assert.match(
+    app,
+    /linkRewritePreview\.value = null\s*\n\s*embedFillPreview\.value = null\s*\n\s*markdownImportTargetVisible\.value = false/
+  )
+})
+
+// ── 存量嵌入卡补跨端标识（data-xynote-embed-server） ────────────────────────────
+// 契约与设计见 docs/specs/2026-10-12-note-embed-web-render.md。
+
+test("回填嵌入卡：目标已同步时补上跨端标识，且不动本机 ID", () => {
+  const source = '开头\n\n<div data-xynote-embed="note:note-a" title="接口文档"></div>\n\n结尾'
+  const result = fillEmbedServerIdsInContent(source, { resolveTarget: resolverFrom({ "note-a": "101" }) })
+
+  assert.equal(result.total, 1)
+  assert.equal(result.changed, 1)
+  assert.deepEqual(result.changedTargets, ["note-a"])
+  // 本机 ID 原样保留（桌面端解析键），其余属性顺序不变，新属性紧跟其后。
+  assert.match(
+    result.content,
+    /<div data-xynote-embed="note:note-a" data-xynote-embed-server="101" title="接口文档"><\/div>/
+  )
+})
+
+test("回填嵌入卡：已带跨端标识的卡片原样跳过（幂等）", () => {
+  const source = '<div data-xynote-embed="note:note-a" data-xynote-embed-server="101"></div>'
+  const first = fillEmbedServerIdsInContent(source, { resolveTarget: resolverFrom({ "note-a": "101" }) })
+
+  assert.equal(first.changed, 0)
+  assert.equal(first.alreadyFilled, 1)
+  // 幂等的判据是「再跑一次什么都不变」，不是「只跳过同值」。
+  assert.equal(first.content, source)
+})
+
+test("回填嵌入卡：目标未同步 / 已删除时原样保留并分类计数", () => {
+  const source = [
+    '<div data-xynote-embed="note:unsynced"></div>',
+    '<div data-xynote-embed="note:gone"></div>'
+  ].join("\n\n")
+  const result = fillEmbedServerIdsInContent(source, {
+    resolveTarget: resolverFrom({ unsynced: null })
+  })
+
+  assert.equal(result.total, 2)
+  assert.equal(result.changed, 0)
+  assert.equal(result.unsynced, 1)
+  assert.equal(result.missing, 1)
+  assert.equal(result.content, source)
+})
+
+test("回填嵌入卡：围栏代码块内的示例原样跳过", () => {
+  const source = [
+    "```html",
+    '<div data-xynote-embed="note:note-a"></div>',
+    "```",
+    "",
+    '<div data-xynote-embed="note:note-a"></div>'
+  ].join("\n")
+  const result = fillEmbedServerIdsInContent(source, { resolveTarget: resolverFrom({ "note-a": "101" }) })
+
+  // 代码块内那份不算命中，只有正文里那份被补。
+  assert.equal(result.total, 1)
+  assert.equal(result.changed, 1)
+  assert.equal((result.content.match(/data-xynote-embed-server/g) || []).length, 1)
+  assert.match(result.content, /```html\n<div data-xynote-embed="note:note-a"><\/div>\n```/)
+})
+
+test("回填嵌入卡：没有可补的卡片时正文逐字节一致", () => {
+  const source = "纯正文，没有嵌入卡。\n\n第二段。"
+  const result = fillEmbedServerIdsInContent(source, { resolveTarget: () => ({ id: "x", serverId: "1" }) })
+
+  assert.equal(result.content, source)
+  assert.equal(result.total, 0)
+  assert.equal(result.changed, 0)
+})
+
+test("回填嵌入卡：只带跨端标识的卡片（网页端插入）原样跳过", () => {
+  // 这类卡片没有 data-xynote-embed：回填以本机 ID 为锚点，既不该改动它，也不该计入统计。
+  const source = '<div data-xynote-embed-server="2081338921611808768" title="接口文档"></div>'
+  const result = fillEmbedServerIdsInContent(source, { resolveTarget: () => ({ id: "x", serverId: "101" }) })
+
+  assert.equal(result.total, 0)
+  assert.equal(result.changed, 0)
+  assert.equal(result.content, source)
+})
+
+test("回填嵌入卡：多张卡片按目标去重，单引号写法同样识别", () => {
+  const source = [
+    "<div data-xynote-embed='note:note-a'></div>",
+    '<div data-xynote-embed="note:note-b" title="B"></div>',
+    '<div data-xynote-embed="note:note-a"></div>'
+  ].join("\n\n")
+  const result = fillEmbedServerIdsInContent(source, {
+    resolveTarget: resolverFrom({ "note-a": "101", "note-b": "202" })
+  })
+
+  assert.equal(result.total, 3)
+  assert.equal(result.changed, 3)
+  assert.deepEqual(result.changedTargets.sort(), ["note-a", "note-b"])
+  assert.match(result.content, /data-xynote-embed='note:note-a' data-xynote-embed-server='101'/)
+  assert.match(result.content, /data-xynote-embed="note:note-b" data-xynote-embed-server="202" title="B"/)
+})
+
+test("桌面端契约：插入与序列化都带上跨端标识，且解析不依赖它", () => {
+  const root = path.resolve(__dirname, "..")
+  const embed = fs.readFileSync(path.join(root, "src/editor/xynote-embed.ts"), "utf8")
+
+  // 契约常量与序列化产出点。
+  assert.match(embed, /export const EMBED_SERVER_TAG = 'data-xynote-embed-server'/)
+  assert.match(embed, /export function parseEmbedServerId\(/)
+  assert.match(embed, /const serverAttr = serverId \? ` \$\{EMBED_SERVER_TAG\}="\$\{serverId\}"` : ''/)
+  // parseDOM / mdast 往返都要读回，否则重建一次卡片属性就丢。
+  assert.match(embed, /serverId: el\.getAttribute\(EMBED_SERVER_TAG\)/)
+  assert.match(embed, /serverId: \{ default: null as string \| null \}/)
+  assert.match(embed, /embedNode\.serverId = parseEmbedServerId\(raw\)/)
+  // 右键菜单需要把 serverId 带给渲染层（复制嵌入引用要用）。
+  assert.match(embed, /serverIdChanged/)
+})
+
+test("桌面端契约：transformer 必须把 title 也解析出来，否则编辑一次就抹掉", () => {
+  const root = path.resolve(__dirname, "..")
+  const embed = fs.readFileSync(path.join(root, "src/editor/xynote-embed.ts"), "utf8")
+
+  // 解析函数存在，且属性前要求空白边界（避免命中名字里带 title 的其它属性）。
+  assert.match(embed, /export function parseEmbedTitle\(/)
+  assert.match(embed, /\(\?:\^\|\\s\)title=/)
+  // 两处 transformer 分支都要取值。少任何一处，用户编辑一次正文保存，
+  // `title="..."` 就被整条抹掉 —— 桌面端卡片实时查库看不出异常，
+  // 受损的是网页端取数失败时的兜底标题（曾因此显示成「未命名笔记」）。
+  assert.match(embed, /node\.title = parseEmbedTitle\(raw\)/)
+  assert.match(embed, /embedNode\.title = parseEmbedTitle\(raw\)/)
+  // 序列化侧按 title 有无决定是否输出，与解析侧对称：缺一即把属性写没。
+  assert.match(embed, /const attr = title \? ` title="\$\{title\}"` : ''/)
+})
+
+test("桌面端契约：插入路径真的用上选择器给的 serverId，复制引用也带属性", () => {
+  const app = fs.readFileSync(
+    path.resolve(__dirname, "..", "src/components/MarkdownVisualEditor.vue"),
+    "utf8"
+  )
+  const events = fs.readFileSync(
+    path.resolve(__dirname, "..", "src/utils/note-open-events.ts"),
+    "utf8"
+  )
+
+  // 曾经是被丢弃的 `_serverId`：改回真实参数名并落进节点属性。
+  assert.match(app, /async function insertNoteEmbed\(noteId: string, serverId: string \| null, title: string\)/)
+  assert.doesNotMatch(app, /_serverId: string \| null/)
+  assert.match(app, /attrs: \{ noteId, title: title \|\| null, serverId: serverId \|\| null \}/)
+  // 卡片右键「复制嵌入引用」与插入同源。
+  assert.match(app, /const serverAttr = target\.serverId \? ` data-xynote-embed-server="\$\{target\.serverId\}"` : ''/)
+  assert.match(app, /serverId: detail\.serverId \?\? null/)
+  // 事件载荷类型必须带上该字段，否则渲染层拿不到。
+  assert.match(events, /serverId: string \| null/)
+})
+
+// ---------------------------------------------------------------------------
+// 仓库层：回填嵌入卡的预览与执行
+// ---------------------------------------------------------------------------
+
+test("仓库层回填嵌入卡：补标识并落库，嵌入关系不漂", () => {
+  withRepository((repository, helpers) => {
+    const folder = repository.createFolder("工作")
+    const target = repository.createNote(folder.id)
+    const source = repository.createNote(folder.id)
+    repository.updateNote(target.id, { title: "接口文档", content: "# 接口文档" })
+    repository.updateNote(source.id, {
+      title: "索引",
+      content: `索引\n\n<div data-xynote-embed="note:${target.id}" title="接口文档"></div>\n`
+    })
+    helpers.setServerId(target.id, "9001")
+
+    // 前提：嵌入本身就是一条引用关系（resolveNoteLinkTargetIds 认嵌入卡）。
+    assert.equal(
+      repository.getBacklinks(target.id).some((note) => note.id === source.id),
+      true
+    )
+
+    // 故意清空关系表，模拟「正文已变、关系陈旧」：执行走 updateNote 就必须把关系修回来。
+    helpers.clearNoteLinks()
+    assert.equal(repository.getBacklinks(target.id).length, 0)
+
+    const preview = repository.previewEmbedServerIdFill()
+    assert.equal(preview.convertibleNotes, 1)
+    assert.equal(preview.fillableEmbeds, 1)
+    assert.equal(preview.totalEmbeds, 1)
+    assert.equal(preview.unsyncedEmbeds, 0)
+    assert.equal(preview.missingEmbeds, 0)
+    assert.equal(preview.samples[0].noteId, source.id)
+
+    const result = repository.fillEmbedServerIds()
+    assert.equal(result.noteCount, 1)
+    assert.equal(result.embedCount, 1)
+    assert.match(
+      repository.getNote(source.id).content,
+      new RegExp(
+        `<div data-xynote-embed="note:${target.id}" data-xynote-embed-server="9001" title="接口文档"></div>`
+      )
+    )
+    // 补的是新属性、本机 ID 原样，所以这条引用关系必须还在。
+    assert.equal(
+      repository.getBacklinks(target.id).some((note) => note.id === source.id),
+      true
+    )
+
+    // 幂等：再跑一次没有任何可补的，且已被识别成「已带标识」。
+    assert.equal(repository.fillEmbedServerIds().noteCount, 0)
+    const again = repository.previewEmbedServerIdFill()
+    assert.equal(again.fillableEmbeds, 0)
+    assert.equal(again.alreadyFilledEmbeds, 1)
+  })
+})
+
+test("仓库层回填嵌入卡：目标未同步只报 unsynced，执行不动正文", () => {
+  withRepository((repository) => {
+    const folder = repository.createFolder("工作")
+    const target = repository.createNote(folder.id)
+    const source = repository.createNote(folder.id)
+    const original = `<div data-xynote-embed="note:${target.id}"></div>`
+    repository.updateNote(source.id, { content: original })
+
+    const preview = repository.previewEmbedServerIdFill()
+    assert.equal(preview.fillableEmbeds, 0)
+    assert.equal(preview.unsyncedEmbeds, 1)
+
+    assert.equal(repository.fillEmbedServerIds().noteCount, 0)
+    assert.equal(repository.getNote(source.id).content, original)
+  })
+})
+
+test("仓库层回填嵌入卡：全库无嵌入卡时逐字节不动", () => {
+  withRepository((repository) => {
+    const folder = repository.createFolder("工作")
+    const note = repository.createNote(folder.id)
+    const original = "# 只有普通正文\n\n没有卡片。\n"
+    repository.updateNote(note.id, { content: original })
+
+    assert.equal(repository.previewEmbedServerIdFill().totalEmbeds, 0)
+    assert.equal(repository.fillEmbedServerIds().noteCount, 0)
+    assert.equal(repository.getNote(note.id).content, original)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// 接线守卫：回填入口的 IPC / preload / types / UI 四处必须齐全
+// ---------------------------------------------------------------------------
+
+test("嵌入卡回填的接线四件套齐全", () => {
+  const root = path.resolve(__dirname, "..")
+  const preload = fs.readFileSync(path.resolve(root, "electron/preload.cjs"), "utf8")
+  const handlers = fs.readFileSync(path.resolve(root, "electron/ipc-handlers.cjs"), "utf8")
+  const main = fs.readFileSync(path.resolve(root, "electron/main.cjs"), "utf8")
+  const types = fs.readFileSync(path.resolve(root, "src/types.ts"), "utf8")
+  const app = fs.readFileSync(path.resolve(root, "src/App.vue"), "utf8")
+
+  // 通道名三处必须一致：preload 发、handlers 收，拼错就静默失效。
+  assert.match(preload, /"data:preview-embed-server-id-fill"/)
+  assert.match(preload, /"data:fill-embed-server-ids"/)
+  assert.match(handlers, /"data:preview-embed-server-id-fill"/)
+  assert.match(handlers, /"data:fill-embed-server-ids"/)
+
+  // 主进程必须真的调到仓库层；正文变了要推云端。
+  assert.match(main, /return repository\.previewEmbedServerIdFill\(\)/)
+  assert.match(main, /const result = repository\.fillEmbedServerIds\(\)\s*\n\s*if \(result\.noteCount > 0\) scheduleSync\(\)/)
+
+  assert.match(types, /previewEmbedServerIdFill\(\): Promise<EmbedServerIdFillPreview>/)
+  assert.match(types, /fillEmbedServerIds\(\): Promise<EmbedServerIdFillResult>/)
+
+  // 渲染层必须真的调到新 IPC，否则 UI 是死的。
+  assert.match(app, /window\.notesDesktop\.previewEmbedServerIdFill\(\)/)
+  assert.match(app, /window\.notesDesktop\.fillEmbedServerIds\(\)/)
+})
+
+test("嵌入卡回填入口先预览再确认，正文改动后刷新工作区", () => {
+  const app = fs.readFileSync(path.resolve(__dirname, "..", "src/App.vue"), "utf8")
+
+  // 按钮存在且被忙碌态挡住。
+  assert.match(app, /class="embed-server-fill-action"[^>]*:disabled="dataTransferBusy"/)
+  // 预览结果非空才显示确认区，且没有可补卡片时确认按钮不可点。
+  assert.match(app, /v-if="embedFillPreview" class="link-rewrite-confirm"/)
+  assert.match(app, /:disabled="dataTransferBusy \|\| !embedFillPreview\.fillableEmbeds"/)
+  // 执行走 runDataTransfer 并带 refreshAfter，否则正文换了列表与关系面板还是旧的。
+  assert.match(app, /await runDataTransfer\(\(\) => window\.notesDesktop\.fillEmbedServerIds\(\), true\)/)
   // 重新打开面板要清掉上一次的预览，避免残留的确认区。
-  assert.match(app, /linkRewritePreview\.value = null\s*\n\s*markdownImportTargetVisible\.value = false/)
+  assert.match(app, /embedFillPreview\.value = null\s*\n\s*markdownImportTargetVisible\.value = false/)
 })

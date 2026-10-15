@@ -123,18 +123,46 @@ test('顶部栏文案改为中性模式说明，预览样式仍以组件前缀�
   assert.doesNotMatch(text, /<style scoped>/)
 })
 
-test('嵌入卡片预览接线：两处预览都注入了标题解析器', () => {
-  // 外部文件预览：正文里可能带着从笔记复制来的嵌入占位，要靠工作区笔记列表还原标题。
+test('嵌入卡片预览接线：两处预览都注入了元信息解析器', () => {
+  // 外部文件预览：正文里可能带着从笔记复制来的嵌入占位，要靠工作区数据还原卡片信息。
   const sourceEditor = source()
-  assert.match(sourceEditor, /function resolveEmbedTitle\(noteId: string\): string \| null/)
-  assert.match(sourceEditor, /renderPreviewMarkdown\(props\.value, \{ resolveEmbedTitle \}\)/)
-  assert.match(sourceEditor, /allNotes\?: Array<\{ id: string, title: string \}>/)
+  assert.match(sourceEditor, /function resolveEmbedMeta\(noteId: string\): PreviewEmbedMeta \| null/)
+  assert.match(sourceEditor, /renderPreviewMarkdown\(props\.value, \{ resolveEmbedMeta \}\)/)
+  assert.match(sourceEditor, /allNotes\?: OfflineNote\[\]/)
+  assert.match(sourceEditor, /folders\?: NoteFolder\[\]/)
 
-  // 笔记预览：直接查编辑器已经拿到的 allNotes。
+  // 笔记预览：直接查编辑器已经拿到的 allNotes / folders。
   const visualEditor = readSource('src/components/MarkdownVisualEditor.vue')
-  assert.match(visualEditor, /function resolveEmbedTitle\(noteId: string\): string \| null/)
-  assert.match(visualEditor, /renderPreviewMarkdown\(contentValue\.value, \{ resolveEmbedTitle \}\)/)
+  assert.match(visualEditor, /function resolveEmbedMeta\(noteId: string\): PreviewEmbedMeta \| null/)
+  assert.match(visualEditor, /renderPreviewMarkdown\(contentValue\.value, \{ resolveEmbedMeta \}\)/)
 
-  // App 得把笔记列表交给外部文件预览，否则那条路径上永远查不到标题。
-  assert.match(readSource('src/App.vue'), /:all-notes="workspace\.notes"/)
+  // App 得把笔记列表与文件夹一起交给两处预览，否则卡片还原不出文件夹名。
+  const app = readSource('src/App.vue')
+  assert.match(app, /:all-notes="workspace\.notes"/)
+  assert.match(app, /:folders="workspace\.folders"/)
+})
+
+test('笔记预览里的嵌入占位卡可点开：事件委托 + 键盘入口', () => {
+  const visualEditor = readSource('src/components/MarkdownVisualEditor.vue')
+
+  // 预览正文是 v-html 的死 HTML，卡片挂不上 Vue 事件 —— 只能委托到正文容器上。
+  assert.match(visualEditor, /@click="handlePreviewEmbedClick"/)
+  assert.match(visualEditor, /@keydown="handlePreviewEmbedKeydown"/)
+  assert.match(visualEditor, /closest\('\.markdown-embed-placeholder'\)/)
+  assert.match(visualEditor, /getAttribute\('data-note-id'\)/)
+  // 与正文里的内部笔记链接同一语义：新标签页打开，不打断当前阅读位置。
+  assert.match(visualEditor, /dispatchOpenNote\(noteId, true\)/)
+  // `role="button"` 只负责可聚焦，div 不会因回车自己派发 click —— 键盘入口不能少。
+  assert.match(visualEditor, /event\.key !== 'Enter' && event\.key !== ' '/)
+  // 可点暗示只长在笔记预览上（占位卡样式是两处预览共用的）。
+  assert.match(visualEditor, /\.markdown-note-preview__doc \.markdown-embed-placeholder \{/)
+  // 静止态可点暗示（箭头）同样只长在笔记预览上 —— 外部文件预览的卡片点了没反应，不给假暗示。
+  assert.match(visualEditor, /\.markdown-note-preview__doc \.markdown-embed-placeholder__action \{/)
+})
+
+test('外部文件预览保持只读：卡片不开可点口子', () => {
+  const sourceEditor = source()
+
+  assert.doesNotMatch(sourceEditor, /markdown-embed-placeholder/)
+  assert.doesNotMatch(sourceEditor, /handlePreviewEmbedClick/)
 })

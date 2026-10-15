@@ -228,6 +228,10 @@ contextBridge.exposeInMainWorld("notesDesktop", {
   previewLocalNoteLinkRewrite: () => ipcRenderer.invoke("data:preview-local-note-link-rewrite"),
   /** 手动把正文里仍使用本机地址的笔记链接改写成网页地址。 */
   rewriteLocalNoteLinks: () => ipcRenderer.invoke("data:rewrite-local-note-links"),
+  /** 预览「给嵌入卡片补线上标识」将改动的范围（只读）。 */
+  previewEmbedServerIdFill: () => ipcRenderer.invoke("data:preview-embed-server-id-fill"),
+  /** 手动给正文里的嵌入卡片补上跨端标识，供网页端渲染成卡片。 */
+  fillEmbedServerIds: () => ipcRenderer.invoke("data:fill-embed-server-ids"),
   importMarkdown: (folderId) => ipcRenderer.invoke("data:import-markdown", folderId),
   importSingleMarkdown: (folderId) => ipcRenderer.invoke("data:import-single-markdown", folderId),
   /** 把当前已打开的外部文件导入笔记库（正文由编辑器给出，可能含未保存的改动）。 */
@@ -235,7 +239,7 @@ contextBridge.exposeInMainWorld("notesDesktop", {
     ipcRenderer.invoke("data:import-markdown-path", filePath, content, folderId),
   importFullBackup: () => ipcRenderer.invoke("data:import-backup"),
   /**
-   * 监听菜单栏打开导入导出窗口的请求。
+   * 监听菜单栏打开数据管理窗口的请求。
    *
    * @param {() => void} callback 打开窗口的回调。
    * @returns {() => void} 取消监听函数。

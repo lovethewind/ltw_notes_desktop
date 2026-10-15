@@ -6,7 +6,10 @@ const {
   createNoteContentPreview,
   searchNotes: searchNotesDatabase
 } = require("./database-search.cjs")
-const { rewriteLocalNoteLinksInContent } = require("./local-note-links.cjs")
+const {
+  rewriteLocalNoteLinksInContent,
+  fillEmbedServerIdsInContent
+} = require("./local-note-links.cjs")
 
 const HISTORY_INTERVAL_MS = 5 * 60 * 1000
 const MAX_NOTE_CONTENT_BYTES = 15 * 1024 * 1024
@@ -202,12 +205,24 @@ function createRepository(database) {
   /**
    * 获取单篇笔记。
    *
-   * @param {string} noteId 笔记 ID。
+   * 先按本机 ID 精确查；**未命中再按云端 `server_id` 回落一次**。
+   *
+   * 为什么需要回落：笔记嵌入卡片在网页端只能承载服务端数字主键（网页端没有本机 uuid
+   * 这回事），同步回来之后 `getNote(雪花 ID)` 按 `id` 查必然 0 行 —— 表现为「网页里插入的
+   * 笔记，在桌面端显示不存在」。本机以 `server_id` 映射同一篇笔记，故补这一路。
+   *
+   * 只认入参的字符串形态：雪花 ID 超出 JS 安全整数范围，若被当 number 传进来会丢精度。
+   *
+   * @param {string} noteId 笔记 ID（本机 uuid，或服务端数字主键）。
    * @returns {Record<string, any> | null} 笔记详情。
    */
   function getNote(noteId) {
-    const row = database.prepare("SELECT * FROM notes WHERE id = ?").get(noteId)
-    return row ? mapNote(row, selectTagsForNote.all(noteId)) : null
+    if (noteId === null || noteId === undefined || noteId === "") return null
+    const key = String(noteId)
+    let row = database.prepare("SELECT * FROM notes WHERE id = ?").get(key)
+    // 回落不带 is_deleted 条件：已删除的目标也要能查到，调用方才能区分「已删除」与「不存在」。
+    if (!row) row = database.prepare("SELECT * FROM notes WHERE server_id = ?").get(key)
+    return row ? mapNote(row, selectTagsForNote.all(row.id)) : null
   }
 
   /** 获取进入编辑器所需的完整笔记正文。 */
@@ -1026,28 +1041,34 @@ function createRepository(database) {
       const local = findLocalByServerId.get(match[1])
       if (local && local.id !== noteId) targetIds.add(local.id)
     }
-    // 笔记嵌入卡片：`<div data-xynote-embed="note:{noteId}">`（见 src/editor/xynote-embed.ts）。
+    // 笔记嵌入卡片：`<div data-xynote-embed="note:{noteId}" data-xynote-embed-server="{serverId}">`。
+    // 两个标识属性互为补充，**任一存在即算一张嵌入卡**（见 src/editor/xynote-embed.ts）：
+    // - `data-xynote-embed` 是本机 uuid（桌面端插入时写，值带 `note:` 前缀）；
+    // - `data-xynote-embed-server` 是服务端数字主键（网页端插入时只写它）。
     // 嵌入在语义上同样是「本篇引用了目标」，必须与普通链接一样写进 note_links，
     // 否则右侧「关系」列表与图谱会漏掉嵌入关系（历史实现只解析 URL 形式，故漏统计）。
-    const embedPattern = /data-xynote-embed=["']note:([^"']+)["']/g
-    while ((match = embedPattern.exec(content)) !== null) {
-      const raw = match[1]
+    const addEmbedTarget = (raw) => {
       let targetId = raw
       try {
         targetId = decodeURIComponent(raw)
       } catch {
         targetId = raw
       }
-      if (!targetId || targetId === noteId) continue
+      if (!targetId || targetId === noteId) return
       // 正常情况下就是本地笔记 ID；跨设备同步回来的嵌入可能带的是对端库里的 ID，
       // 此时按 server_id 回落一次，仍未命中说明目标笔记在本机不存在，直接丢弃。
       if (!findLocalById.get(targetId)) {
         const local = findLocalByServerId.get(targetId)
-        if (!local) continue
+        if (!local) return
         targetId = local.id
       }
       if (targetId !== noteId) targetIds.add(targetId)
     }
+    const embedPattern = /data-xynote-embed=["']note:([^"']+)["']/g
+    while ((match = embedPattern.exec(content)) !== null) addEmbedTarget(match[1])
+    // 只写跨端属性的卡片（网页端插入）走这一路；与上一路可能命中同一张卡，Set 天然去重。
+    const embedServerPattern = /data-xynote-embed-server=["']([^"']+)["']/g
+    while ((match = embedServerPattern.exec(content)) !== null) addEmbedTarget(match[1])
     return targetIds
   }
 
@@ -1087,7 +1108,8 @@ function createRepository(database) {
    *
    * 版本号语义：`note_links_version` 记录的**不是**表结构版本，而是
    * `resolveNoteLinkTargetIds` 的解析规则版本 —— 规则一变，旧库里的关系就是错的，
-   * 必须整表重建一次。当前版本 2（新增「笔记嵌入」来源）。
+   * 必须整表重建一次。当前版本 3（笔记嵌入新增 `data-xynote-embed-server` 来源：
+   * 网页端插入的卡片只写跨端属性，旧库按「只认 `data-xynote-embed`」解析会整条漏掉）。
    *
    * :return: 无返回值。
    */
@@ -1095,7 +1117,7 @@ function createRepository(database) {
     const version = database.prepare(
       "SELECT value FROM sync_state WHERE key = 'note_links_version'"
     ).get()?.value
-    if (version === "2") return
+    if (version === "3") return
     const rows = database.prepare("SELECT id, content FROM notes WHERE is_deleted = 0").all()
     const insertLink = database.prepare(
       "INSERT OR IGNORE INTO note_links(source_note_id, target_note_id) VALUES (?, ?)"
@@ -1108,7 +1130,7 @@ function createRepository(database) {
         }
       }
       database.prepare(`
-        INSERT INTO sync_state(key, value) VALUES ('note_links_version', '2')
+        INSERT INTO sync_state(key, value) VALUES ('note_links_version', '3')
         ON CONFLICT(key) DO UPDATE SET value = excluded.value
       `).run()
     })
@@ -1237,6 +1259,130 @@ function createRepository(database) {
       missingLinks: totals.missingLinks,
       unsyncedLinks: totals.unsyncedLinks,
       noWebBaseLinks: totals.noWebBaseLinks,
+      changedNotes
+    }
+  }
+
+  /**
+   * 扫描全库正文，收集需要补跨端标识的嵌入卡片（读操作，不落库）。
+   *
+   * 与 `collectLocalNoteLinkRewrite` 并列：那条处理 URL 链接、**明确不碰嵌入卡**，
+   * 这条只管嵌入卡。两者共用「按 id 查目标并缓存」的解析口径，但目标不同、互不替代。
+   *
+   * @returns {{
+   *   totals: {
+   *     scannedNotes: number, embeddedNotes: number, totalEmbeds: number,
+   *     fillableEmbeds: number, missingEmbeds: number, unsyncedEmbeds: number,
+   *     alreadyFilledEmbeds: number
+   *   },
+   *   affected: Array<{ id: string, title: string, content: string, changed: number }>
+   * }} 统计与待写入项（`affected[].content` 已是补好标识的新正文）。
+   */
+  function collectEmbedServerIdFill() {
+    const rows = database.prepare("SELECT id, title, content FROM notes WHERE is_deleted = 0").all()
+    const findTarget = database.prepare(
+      "SELECT id, server_id FROM notes WHERE id = ? AND is_deleted = 0"
+    )
+    // 同一目标常被多篇（甚至同一篇多次）嵌入，缓存一次解析结果。
+    const targetCache = new Map()
+    const resolveTarget = (targetId) => {
+      if (targetCache.has(targetId)) return targetCache.get(targetId)
+      const row = findTarget.get(targetId)
+      const resolved = row ? { id: row.id, serverId: row.server_id } : null
+      targetCache.set(targetId, resolved)
+      return resolved
+    }
+    const totals = {
+      scannedNotes: rows.length,
+      embeddedNotes: 0,
+      totalEmbeds: 0,
+      fillableEmbeds: 0,
+      missingEmbeds: 0,
+      unsyncedEmbeds: 0,
+      alreadyFilledEmbeds: 0
+    }
+    const affected = []
+    for (const row of rows) {
+      const outcome = fillEmbedServerIdsInContent(row.content, { resolveTarget })
+      if (!outcome.total) continue
+      totals.embeddedNotes += 1
+      totals.totalEmbeds += outcome.total
+      totals.fillableEmbeds += outcome.changed
+      totals.missingEmbeds += outcome.missing
+      totals.unsyncedEmbeds += outcome.unsynced
+      totals.alreadyFilledEmbeds += outcome.alreadyFilled
+      if (outcome.changed > 0) {
+        affected.push({
+          id: row.id,
+          title: row.title || "（无标题）",
+          content: outcome.content,
+          changed: outcome.changed
+        })
+      }
+    }
+    return { totals, affected }
+  }
+
+  /**
+   * 扫描全库正文里的嵌入卡片，**只读**统计有多少张缺跨端标识。
+   *
+   * 为什么需要人工触发：嵌入卡以本机 uuid 承载，网页端只认服务端数字主键。新插入的卡片
+   * 会直接带上跨端标识，**存量卡片**没有 —— 与「本机地址转为线上地址」同样属于存量清理，
+   * 由用户先看账再决定。设计见 docs/specs/2026-10-12-note-embed-web-render.md。
+   *
+   * @returns {{
+   *   scannedNotes: number, embeddedNotes: number, convertibleNotes: number,
+   *   totalEmbeds: number, fillableEmbeds: number,
+   *   missingEmbeds: number, unsyncedEmbeds: number, alreadyFilledEmbeds: number,
+   *   samples: Array<{ noteId: string, title: string, changed: number }>
+   * }} 预览统计。
+   */
+  function previewEmbedServerIdFill() {
+    const { totals, affected } = collectEmbedServerIdFill()
+    return {
+      scannedNotes: totals.scannedNotes,
+      embeddedNotes: totals.embeddedNotes,
+      convertibleNotes: affected.length,
+      totalEmbeds: totals.totalEmbeds,
+      fillableEmbeds: totals.fillableEmbeds,
+      missingEmbeds: totals.missingEmbeds,
+      unsyncedEmbeds: totals.unsyncedEmbeds,
+      alreadyFilledEmbeds: totals.alreadyFilledEmbeds,
+      samples: affected.slice(0, 5).map((item) => ({
+        noteId: item.id,
+        title: item.title,
+        changed: item.changed
+      }))
+    }
+  }
+
+  /**
+   * 给全库正文里的嵌入卡片补上跨端标识属性。
+   *
+   * ⚠️ 逐篇走 `updateNote` 而非直接 `UPDATE notes`：只有这条路径会一并处理历史版本、
+   * `dirty = 1`、`refreshNoteLinks` 与同步入队。补的是 `data-xynote-embed-server`，
+   * **不改** `data-xynote-embed`（本机 ID 是桌面端解析键），所以引用关系本身不变；
+   * 但正文既然落库就必须走同一条受控路径（note_links 硬规则第 2 条）。
+   *
+   * @returns {{
+   *   noteCount: number, embedCount: number,
+   *   missingEmbeds: number, unsyncedEmbeds: number,
+   *   changedNotes: Array<{ id: string, title: string, changed: number }>
+   * }} 实际回填结果。
+   */
+  function fillEmbedServerIds() {
+    const { totals, affected } = collectEmbedServerIdFill()
+    const changedNotes = []
+    for (const item of affected) {
+      const updated = updateNote(item.id, { content: item.content })
+      if (!updated) continue
+      changedNotes.push({ id: item.id, title: item.title, changed: item.changed })
+    }
+    return {
+      noteCount: changedNotes.length,
+      embedCount: changedNotes.reduce((sum, item) => sum + item.changed, 0),
+      missingEmbeds: totals.missingEmbeds,
+      unsyncedEmbeds: totals.unsyncedEmbeds,
       changedNotes
     }
   }
@@ -2585,6 +2731,8 @@ function createRepository(database) {
     getGlobalGraph,
     previewLocalNoteLinkRewrite,
     rewriteLocalNoteLinks,
+    previewEmbedServerIdFill,
+    fillEmbedServerIds,
     bulkUpdateNotes,
     listNoteConflicts,
     resolveNoteConflict,

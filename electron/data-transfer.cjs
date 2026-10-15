@@ -164,8 +164,20 @@ function parseMarkdownDocument(value, fallbackTitle) {
   }
 }
 
-/** 笔记嵌入卡片在正文里的载体（与 `src/editor/xynote-embed.ts` 写入的形式一致）。 */
-const EMBED_PLACEHOLDER_PATTERN = /<div[^>]*\bdata-xynote-embed=["']note:([^"']+)["'][^>]*>\s*<\/div>/gi
+/**
+ * 笔记嵌入卡片在正文里的载体（与 `src/editor/xynote-embed.ts` 写入的形式一致）。
+ *
+ * ⚠️ 两个标识属性**任一存在**即算一张卡（口径与 `isEmbedHtml` 一致）：
+ * `data-xynote-embed` 是本机 uuid（桌面端插入时写），`data-xynote-embed-server` 是服务端主键
+ * （**网页端插入的卡片只有它**）。只认前者会让这类卡片在纯净导出时降级不掉、原样留在文件里。
+ */
+const EMBED_PLACEHOLDER_PATTERN = /<div[^>]*\bdata-xynote-embed(?:-server)?=["'][^"']*["'][^>]*>\s*<\/div>/gi
+
+/** 占位 div 上的本机 ID（`note:` 之后的部分）。网页端插入的卡片没有这个属性。 */
+const EMBED_ID_PATTERN = /\bdata-xynote-embed=["']note:([^"']*)["']/i
+
+/** 占位 div 上的跨端标识（服务端数字主键）。与 `data-xynote-embed` 是各自独立的属性。 */
+const EMBED_SERVER_PATTERN = /\bdata-xynote-embed-server=["']([^"']*)["']/i
 
 /** 占位 div 上可能写着标题的属性。 */
 const EMBED_TITLE_PATTERN = /\btitle=["']([^"']*)["']/i
@@ -218,12 +230,15 @@ function splitFencedCodeSegments(markdown) {
 /**
  * 把一张嵌入卡片降级成一行可读的引用。
  *
- * @param {string} noteId 被嵌入的笔记 ID。
- * @param {string} rawHtml 原始占位 div（用于取出 `title` 属性）。
+ * @param {string} rawHtml 原始占位 div（用于取出目标键与 `title` 属性）。
  * @param {(noteId: string) => (Record<string, any> | null)} [resolveEmbed] 标题/地址解析器。
  * @returns {string} 一行引用文本。
  */
-function renderPortableEmbed(noteId, rawHtml, resolveEmbed) {
+function renderPortableEmbed(rawHtml, resolveEmbed) {
+  // 目标键：本机 ID 优先，退回跨端标识（网页端插入的卡片只带它）。
+  const noteId = ((EMBED_ID_PATTERN.exec(rawHtml) || [])[1]
+    || (EMBED_SERVER_PATTERN.exec(rawHtml) || [])[1]
+    || "").trim()
   const inlineTitle = (EMBED_TITLE_PATTERN.exec(rawHtml) || [])[1]
   const resolved = typeof resolveEmbed === "function" ? resolveEmbed(noteId) : null
   const title = String((resolved && resolved.title) || inlineTitle || "").trim() || "未命名笔记"
@@ -240,7 +255,7 @@ function renderPortableEmbed(noteId, rawHtml, resolveEmbed) {
  */
 function degradeApplicationMarkup(text, resolveEmbed) {
   return String(text)
-    .replace(EMBED_PLACEHOLDER_PATTERN, (match, noteId) => renderPortableEmbed(noteId, match, resolveEmbed))
+    .replace(EMBED_PLACEHOLDER_PATTERN, (match) => renderPortableEmbed(match, resolveEmbed))
     .replace(FONT_SIZE_SPAN_PATTERN, "$1")
     .replace(HARD_BREAK_PATTERN, "\n")
     // 硬换行变成真换行后，原本靠多个 <br /> 撑出的空行会堆成长串，收一下。

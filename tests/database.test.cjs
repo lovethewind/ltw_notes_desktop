@@ -1227,6 +1227,82 @@ test("笔记嵌入卡片与普通链接一样计入引用关系", () => {
   })
 })
 
+test("嵌入卡片只带跨端标识时同样计入引用关系（网页端插入的卡片）", () => {
+  withRepository((repository) => {
+    const now = new Date().toISOString()
+    const remoteNote = (clientId, serverId, title, content) => ({
+      clientId,
+      serverId,
+      folderClientId: null,
+      title,
+      content,
+      isPinned: false,
+      isDeleted: false,
+      deletedTime: null,
+      deletedByFolderClientId: null,
+      tagClientIds: [],
+      createdAt: now,
+      updatedAt: now
+    })
+
+    repository.applySyncResult({
+      snapshot: {
+        folders: [],
+        tags: [],
+        notes: [
+          // 网页端插入的卡片只有 data-xynote-embed-server（网页端没有本机 uuid）。
+          remoteNote("remote-a", "9001", "A", '<div data-xynote-embed-server="9002" title="B"></div>'),
+          remoteNote("remote-b", "9002", "B", "B 正文")
+        ]
+      }
+    })
+
+    // 解析规则必须认这个来源，否则关系表与图谱会整条漏掉「网页里建立的嵌入」。
+    assert.deepEqual(repository.getNoteOutlinks("remote-a").map((item) => item.id), ["remote-b"])
+    assert.deepEqual(repository.getBacklinks("remote-b").map((item) => item.id), ["remote-a"])
+  })
+})
+
+test("getNote 按 server_id 回落，让网页端插入的嵌入卡片取得到目标", () => {
+  withRepository((repository) => {
+    const now = new Date().toISOString()
+
+    repository.applySyncResult({
+      snapshot: {
+        folders: [],
+        tags: [],
+        notes: [{
+          clientId: "remote-interview",
+          serverId: "2081338921611808768",
+          folderClientId: null,
+          title: "面试题-python",
+          content: "正文",
+          isPinned: false,
+          isDeleted: false,
+          deletedTime: null,
+          deletedByFolderClientId: null,
+          tagClientIds: [],
+          createdAt: now,
+          updatedAt: now
+        }]
+      }
+    })
+
+    // 实测场景：卡片带的是雪花主键，按本机 id 查是 0 行 → 卡片显示「此笔记不存在」。
+    const byServerId = repository.getNote("2081338921611808768")
+    assert.ok(byServerId, "按 server_id 必须能查到目标笔记")
+    assert.equal(byServerId.title, "面试题-python")
+    assert.equal(byServerId.serverId, "2081338921611808768")
+
+    // 本机 ID 一路照常命中。
+    assert.equal(repository.getNote(byServerId.id).title, "面试题-python")
+
+    // 两个键都不匹配、或键本身为空时仍返回 null（不能退化成「随便给一篇」）。
+    assert.equal(repository.getNote("not-a-real-key"), null)
+    assert.equal(repository.getNote(""), null)
+  })
+})
+
 test("嵌入自身或嵌入不存在、已删除的笔记都不产生关系边", () => {
   withRepository((repository) => {
     const source = repository.createNote(null)

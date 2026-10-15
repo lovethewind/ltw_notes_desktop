@@ -341,7 +341,7 @@ test("导入当前文件：不弹文件框、正文取编辑器当前值、位�
   assert.match(appSource, /const \{ filePath, content \} = doc/)
 })
 
-test("导入导出面板提供「单个 Markdown 文件」入口，且位置窗口按入口切换动作", () => {
+test("数据管理面板提供「单个 Markdown 文件」入口，且位置窗口按入口切换动作", () => {
   const appSource = readFileSync(resolve(__dirname, "../src/App.vue"), "utf8")
 
   // 面板里两个入口都要在，且各自带上正确的模式
@@ -396,6 +396,30 @@ test("纯净Markdown导出：解析不到目标时退回纯文本引用，不留
   )
 
   assert.match(document, /> 嵌入的笔记：未命名笔记/)
+  assert.doesNotMatch(document, /data-xynote-embed/)
+})
+
+test("纯净Markdown导出：只带跨端标识的嵌入卡（网页端插入）同样降级成引用", () => {
+  const content = [
+    "开头",
+    "",
+    '<div data-xynote-embed-server="2081338921611808768" title="接口文档"></div>',
+    "",
+    "结尾"
+  ].join("\n")
+  const document = createCleanMarkdownDocument(
+    { title: "含嵌入", content },
+    {
+      // 解析器的入参是卡片上的目标键：这类卡片只有跨端标识。
+      resolveEmbed: (key) => (
+        key === "2081338921611808768"
+          ? { title: "被嵌入的笔记", url: "https://lovethewind.cn/notes/2081338921611808768" }
+          : null
+      )
+    }
+  )
+
+  assert.match(document, /> 嵌入的笔记：\[被嵌入的笔记\]\(https:\/\/lovethewind\.cn\/notes\/2081338921611808768\)/)
   assert.doesNotMatch(document, /data-xynote-embed/)
 })
 
@@ -535,17 +559,22 @@ test("批量导出接线：全部导出与右键导出所选都写可回读的 Z
   assert.doesNotMatch(mainSource, /createCleanMarkdownArchive/)
 })
 
-test("导入导出面板按语义分组，卡片不再常驻描边", () => {
+test("数据管理面板按语义分组，卡片不再常驻描边", () => {
   const projectRoot = resolve(__dirname, "..")
   const read = (relative) => readFileSync(resolve(projectRoot, relative), "utf8")
   const appSource = read("src/App.vue")
   const styleSource = read("src/style.css")
 
-  // 九个入口按「导入 / 导出 / 备份与恢复 / 工具」分开，顺序即分组顺序
+  // 面板名与顶栏入口必须一致：这里的「修复」类工具不是数据进出，
+  // 面板已从「导入导出」改名「数据管理」，别退回旧名。
+  assert.match(appSource, /<h2>数据管理<\/h2>/)
+  assert.match(appSource, /data-tooltip="数据管理"/)
+
+  // 九个入口按「导入 / 导出 / 备份与恢复 / 数据修复」分开，顺序即分组顺序
   assert.match(appSource, /class="data-transfer-groups"/)
   assert.match(
     appSource,
-    /<h3>导入<\/h3>[\s\S]*<h3>导出<\/h3>[\s\S]*<h3>备份与恢复<\/h3>[\s\S]*<h3>工具<\/h3>/
+    /<h3>导入<\/h3>[\s\S]*<h3>导出<\/h3>[\s\S]*<h3>备份与恢复<\/h3>[\s\S]*<h3>数据修复<\/h3>/
   )
   assert.match(appSource, /<strong>导出全部 Markdown<\/strong>/)
 

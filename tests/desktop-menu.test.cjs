@@ -32,12 +32,12 @@ test('桌面菜单使用中文系统操作标签', () => {
   for (const label of expectedLabels) assert.match(mainSource, new RegExp(`label: "${label}"`))
 })
 
-test('桌面菜单可以通知主页面打开导入导出窗口', () => {
+test('桌面菜单可以通知主页面打开数据管理窗口', () => {
   const mainSource = readFileSync(resolve(projectRoot, 'electron/main.cjs'), 'utf8')
   const preloadSource = readFileSync(resolve(projectRoot, 'electron/preload.cjs'), 'utf8')
   const appSource = readFileSync(resolve(projectRoot, 'src/App.vue'), 'utf8')
 
-  assert.match(mainSource, /label: "导入导出…"[\s\S]*?data-transfer:open/)
+  assert.match(mainSource, /label: "数据管理…"[\s\S]*?data-transfer:open/)
   assert.match(preloadSource, /onOpenDataTransfer[\s\S]*?ipcRenderer\.on\("data-transfer:open"/)
   assert.match(appSource, /onOpenDataTransfer\(openDataTransfer\)/)
 })

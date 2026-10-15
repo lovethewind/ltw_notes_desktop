@@ -39,6 +39,8 @@ export const EMBED_CARD_MENU_EVENT = 'xynote:embed-card-menu'
 export interface EmbedCardMenuEventDetail {
   noteId: string
   title: string | null
+  /** 目标笔记的云端 serverId（未同步为 null）；「复制嵌入引用」据此带上跨端标识。 */
+  serverId: string | null
   /** 卡片节点在文档中的位置（ProseMirror NodeView getPos()），-1 表示不可用。 */
   pos: number
   x: number

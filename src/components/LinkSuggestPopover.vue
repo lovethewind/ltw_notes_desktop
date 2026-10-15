@@ -20,9 +20,16 @@
           @click="choose(note)"
         >
           <Icon class="link-suggest__item-icon" icon="material-symbols:description-rounded" />
-          <span class="link-suggest__title">{{ note.title || '（无标题）' }}</span>
-          <span v-if="note.tags.length" class="link-suggest__tags">
-            {{ note.tags.map((tag) => tag.name).join('、') }}
+          <span class="link-suggest__body">
+            <span class="link-suggest__head">
+              <span class="link-suggest__title">{{ note.title || '（无标题）' }}</span>
+              <span v-if="note.tags.length" class="link-suggest__tags">
+                {{ note.tags.map((tag) => tag.name).join('、') }}
+              </span>
+            </span>
+            <span v-if="note.content" class="link-suggest__excerpt">
+              <SearchExcerpt :content="note.content" :keyword="keyword" />
+            </span>
           </span>
         </button>
       </div>
@@ -35,13 +42,21 @@
 import { Icon } from '@iconify/vue'
 import { computed, nextTick, onBeforeUnmount, ref, watch, type CSSProperties } from 'vue'
 import type { OfflineNote } from '../types'
+import SearchExcerpt from './SearchExcerpt.vue'
 
-const props = defineProps<{
+const props = withDefaults(defineProps<{
   visible: boolean
   coords: { left: number, top: number, bottom: number }
   items: OfflineNote[]
   activeIndex: number
-}>()
+  /**
+   * 当前 `[[` 之后已输入的关键词。
+   *
+   * 只用于高亮摘要里的命中片段（空串表示「最近更新」列表，此时 `SearchExcerpt`
+   * 走普通摘要分支）。
+   */
+  keyword?: string
+}>(), { keyword: '' })
 
 const emit = defineEmits<{
   (event: 'hover', index: number): void
@@ -50,7 +65,14 @@ const emit = defineEmits<{
 
 const GAP = 6
 const MARGIN = 8
-const MAX_HEIGHT = 300
+/**
+ * 浮层高度上限。
+ *
+ * 条目是「标题 + 正文摘要」两行（约 46px），400px 大约能看到 8 条，
+ * 其余靠滚动 —— 候选上限是 20 / 50 条（见 `MarkdownVisualEditor` 的
+ * `LINK_SUGGEST_RECENT_LIMIT` / `LINK_SUGGEST_SEARCH_LIMIT`），必然要滚。
+ */
+const MAX_HEIGHT = 400
 const MIN_HEIGHT = 60
 
 const rootRef = ref<HTMLElement | null>(null)
@@ -93,6 +115,29 @@ function layout(): void {
   ready.value = true
 }
 
+/**
+ * 让键盘选中的条目滚进浮层的可视范围。
+ *
+ * 只改浮层自己的 `scrollTop`，**不用 `scrollIntoView`** —— 浮层是
+ * `position: fixed` 的 Teleport 节点，`scrollIntoView` 会连带滚动文档，
+ * 把用户正在编辑的正文位置带跑。新条目从下方进入时最少滚到刚好露出。
+ *
+ * :return: 无返回值。
+ */
+function scrollActiveIntoView(): void {
+  const root = rootRef.value
+  if (!root) return
+  const active = root.querySelectorAll<HTMLElement>('.link-suggest__item')[props.activeIndex]
+  if (!active) return
+  const rootRect = root.getBoundingClientRect()
+  const rect = active.getBoundingClientRect()
+  if (rect.top < rootRect.top) {
+    root.scrollTop -= rootRect.top - rect.top
+  } else if (rect.bottom > rootRect.bottom) {
+    root.scrollTop += rect.bottom - rootRect.bottom
+  }
+}
+
 /** 浮层出现后测量尺寸并监听高度变化，随时重算位置。 */
 function observe(): void {
   const el = rootRef.value
@@ -126,6 +171,25 @@ watch(
   { deep: true },
 )
 
+// 候选换了（重新搜索）就从顶部重新看起，再让选中项就位。
+watch(
+  () => props.items,
+  () => {
+    if (!props.visible) return
+    void nextTick(() => {
+      if (rootRef.value) rootRef.value.scrollTop = 0
+      scrollActiveIntoView()
+    })
+  },
+)
+
+watch(
+  () => props.activeIndex,
+  () => {
+    if (props.visible) void nextTick(scrollActiveIntoView)
+  },
+)
+
 onBeforeUnmount(() => {
   observer?.disconnect()
   observer = undefined
@@ -140,9 +204,17 @@ function choose(note: OfflineNote): void {
 .link-suggest {
   position: fixed;
   z-index: 1200;
-  min-width: 220px;
-  max-width: 320px;
-  max-height: 300px;
+  min-width: 240px;
+  max-width: 340px;
+  max-height: 400px;
+  /*
+    🔴 `overflow-x` 必须显式写成 hidden。只声明 `overflow-y: auto` 时，CSS 会把
+    「另一个方向」的 `visible` 计算成 `auto` —— 于是标题/标签的 `white-space: nowrap`
+    一旦撑宽内容，浮层底部就冒出一条横向滚动条（用户报过）。
+    真正治本的是下面 `.link-suggest__body` 的 `min-width: 0`：flex 项的默认
+    `min-width: auto` 不允许收缩到内容宽度以下，nowrap 文本因此能顶开父级。
+  */
+  overflow-x: hidden;
   overflow-y: auto;
   padding: 6px;
   border: 1px solid var(--line, #dce5f0);
@@ -153,13 +225,24 @@ function choose(note: OfflineNote): void {
 
 .link-suggest__list {
   display: grid;
+  /*
+    🔴 `minmax(0, 1fr)` 不能省。grid 的自动轨道取**内容**宽度，而 grid item 的
+    默认 `min-width: auto` 不允许收缩 —— 条目里 `white-space: nowrap` 的标题 /
+    摘要就会把轨道顶出容器（实测改前溢 4px、加摘要后溢 36px），
+    配合上面 `.link-suggest` 的 `overflow-x` 就是那条横向滚动条。
+  */
+  grid-template-columns: minmax(0, 1fr);
   gap: 2px;
 }
 
 .link-suggest__item {
   display: flex;
-  align-items: baseline;
+  box-sizing: border-box;
+  align-items: flex-start;
   gap: 8px;
+  width: 100%;
+  /* grid item 的自动最小尺寸同样要放开，否则上面的 minmax(0, 1fr) 也拦不住内部 nowrap 文本。 */
+  min-width: 0;
   padding: 7px 9px;
   border: 0;
   border-radius: 7px;
@@ -176,17 +259,34 @@ function choose(note: OfflineNote): void {
 .link-suggest__item-icon {
   width: 14px;
   height: 14px;
+  margin-top: 1px;
   color: var(--blue);
   flex-shrink: 0;
-  align-self: center;
 }
 
 .link-suggest__item.is-active .link-suggest__item-icon {
   color: #fff;
 }
 
+/* 标题行 + 摘要行的纵向容器；`min-width: 0` 是横向滚动条的治本项。 */
+.link-suggest__body {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 0;
+}
+
+.link-suggest__head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  min-width: 0;
+}
+
 .link-suggest__title {
   flex: 1;
+  min-width: 0;
   overflow: hidden;
   font-size: 13px;
   text-overflow: ellipsis;
@@ -194,6 +294,7 @@ function choose(note: OfflineNote): void {
 }
 
 .link-suggest__tags {
+  flex: 0 1 auto;
   max-width: 40%;
   overflow: hidden;
   font-size: 10px;
@@ -203,8 +304,36 @@ function choose(note: OfflineNote): void {
   color: var(--muted, #78869b);
 }
 
-.link-suggest__item.is-active .link-suggest__tags {
-  color: rgba(255, 255, 255, 0.8);
+/*
+  正文摘要：候选数据里的 `content` 本来就是摘要（空关键词 = 最近更新摘要，
+  有关键词 = 命中上下文，都由 `listWorkspace` / `searchNotes` 预处理），
+  这里只负责裁剪与配色。
+*/
+.link-suggest__excerpt {
+  overflow: hidden;
+  font-size: 11px;
+  line-height: 15px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--muted, #78869b);
+}
+
+.link-suggest__item.is-active .link-suggest__tags,
+.link-suggest__item.is-active .link-suggest__excerpt {
+  color: rgba(255, 255, 255, 0.82);
+}
+
+/* 命中高亮来自 `SearchExcerpt`（全局是黄底），这里换成与浮层同一套蓝。 */
+.link-suggest__excerpt :deep(mark) {
+  border-radius: 3px;
+  padding: 0 1px;
+  background: rgb(47 128 237 / 18%);
+  color: inherit;
+}
+
+.link-suggest__item.is-active .link-suggest__excerpt :deep(mark) {
+  background: rgb(255 255 255 / 30%);
+  color: #fff;
 }
 
 .link-suggest__empty {

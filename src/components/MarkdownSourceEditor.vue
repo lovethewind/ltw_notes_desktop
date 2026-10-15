@@ -16,6 +16,13 @@ import { markdown, markdownLanguage } from '@codemirror/lang-markdown'
 import { EditorState, StateEffect, StateField, Transaction } from '@codemirror/state'
 import { extractMarkdownOutline, type MarkdownOutlineItem } from '../utils/markdown-outline'
 import { renderPreviewMarkdown, resolvePreviewImageSource } from '../utils/markdown-preview'
+import type { PreviewEmbedMeta } from '../utils/markdown-preview'
+import type { NoteFolder, OfflineNote } from '../types'
+import {
+  NOTE_EMBED_EXCERPT_LENGTH,
+  formatNoteDate,
+  stripNoteMarkdown
+} from '../utils/note-embed-meta'
 import { sanitizePreviewHtml } from '../utils/preview-sanitize'
 import {
   Decoration,
@@ -41,12 +48,14 @@ interface Props {
   /** 磁盘上的 Markdown 原文。 */
   value?: string
   /**
-   * 工作区笔记列表（只用到 `id` 与 `title`）。
+   * 工作区笔记列表（用到 `id` / `title` / `folderId` / `content` / `updatedAt` / `isDeleted`）。
    *
    * 外部文件本身不属于笔记库，但正文里可能带着从笔记复制来的嵌入卡片占位，
    * 预览时靠它把占位还原成一张看得见的卡片。
    */
-  allNotes?: Array<{ id: string, title: string }>
+  allNotes?: OfflineNote[]
+  /** 工作区文件夹列表：把嵌入卡的 `folderId` 还原成文件夹名。 */
+  folders?: NoteFolder[]
 }
 
 interface FindMatches {
@@ -56,7 +65,7 @@ interface FindMatches {
   active: number
 }
 
-const props = withDefaults(defineProps<Props>(), { documentId: '', value: '', allNotes: () => [] })
+const props = withDefaults(defineProps<Props>(), { documentId: '', value: '', allNotes: () => [], folders: () => [] })
 
 const emit = defineEmits<{
   (event: 'change', value: string, documentId: string): void
@@ -178,16 +187,27 @@ const sourceHighlight = HighlightStyle.define([
 ])
 
 /**
- * 解析预览里嵌入卡片的标题。
+ * 解析预览里嵌入卡片的展示信息（标题 / 文件夹 / 摘要 / 时间）。
  *
  * 外部文件不属于笔记库，但正文里可能带着从笔记复制来的嵌入卡片占位；
- * 从 props.allNotes 回查真实标题，查不到就交给渲染模块退回默认文案。
+ * 从 props.allNotes 回查，查不到就交给渲染模块退回默认文案。
  *
- * :param noteId: 被嵌入的笔记 ID。
- * :return: 笔记标题；查不到返回 null。
+ * ⚠️ 与笔记预览同口径：摘要是列表里的纯文本预览（库侧只存 `content_prefix`），不是全文。
+ *
+ * :param noteId: 卡片上的目标键 —— 本机 ID，或（网页端插入的卡片）跨端标识。
+ * :return: 卡片展示信息；查不到返回 null。
  */
-function resolveEmbedTitle(noteId: string): string | null {
-  return props.allNotes.find((note) => note.id === noteId)?.title ?? null
+function resolveEmbedMeta(noteId: string): PreviewEmbedMeta | null {
+  // 两个键都要匹配：桌面端插入的卡片带本机 ID，网页端插入的卡片只带服务端主键。
+  const note = props.allNotes.find((item) => item.id === noteId || item.serverId === noteId)
+  if (!note) return null
+  return {
+    title: note.title,
+    folderName: props.folders.find((folder) => folder.id === note.folderId)?.name ?? '',
+    excerpt: stripNoteMarkdown(note.content || '').slice(0, NOTE_EMBED_EXCERPT_LENGTH),
+    date: formatNoteDate(note.updatedAt || ''),
+    deleted: note.isDeleted
+  }
 }
 
 /**
@@ -199,7 +219,7 @@ function resolveEmbedTitle(noteId: string): string | null {
  */
 function resolvePreviewHtml(): string {
   const parsed = new DOMParser().parseFromString(
-    renderPreviewMarkdown(props.value, { resolveEmbedTitle }),
+    renderPreviewMarkdown(props.value, { resolveEmbedMeta }),
     'text/html'
   )
   for (const image of parsed.querySelectorAll('img')) {

@@ -458,8 +458,9 @@ test("嵌入卡片右键菜单链路接线完整", () => {
   assert.match(editorSource, /menuItem\('embedUnwrap', '转换为链接'/)
   assert.match(editorSource, /menuItem\('embedDelete', '删除卡片'/)
   assert.match(editorSource, /async function runEmbedCardCommand\(action: string\)/)
-  // 转换为链接：查 serverId 生成真实线上地址（与插入链接一致）
-  assert.match(editorSource, /buildNoteHref\(target\.noteId, note\?\.serverId \?\? null\)/)
+  // 转换为链接：查 serverId 生成真实线上地址（与插入链接一致）。
+  // 键优先本机 ID；网页端插入的卡片只有跨端标识，回落到的 note.id 才是本机 uuid。
+  assert.match(editorSource, /buildNoteHref\(note\?\.id \?\? target\.noteId, note\?\.serverId \?\? null\)/)
   // 删除卡片：定位到卡片节点后整块删除
   assert.match(editorSource, /node\.type\.name !== 'xynoteEmbed'/)
   assert.match(editorSource, /tr\.delete\(target\.pos, target\.pos \+ node\.nodeSize\)/)
@@ -471,10 +472,12 @@ test("嵌入卡片展开全文接线完整", () => {
 
   // 1) 展开态是组件内部视图状态，不动文档；摘要仍在时截前 160 字
   assert.match(cardSource, /const expanded = ref\(false\)/)
-  assert.match(cardSource, /const canExpand = computed\(\(\) => plainText\.value\.length > 160\)/)
-  assert.match(cardSource, /plainText\.value = stripMarkdown\(rawContent\.value\)/)
-  assert.match(cardSource, /excerpt\.value = plainText\.value\.slice\(0, 160\)/)
+  assert.match(cardSource, /const canExpand = computed\(\(\) => plainText\.value\.length > NOTE_EMBED_EXCERPT_LENGTH\)/)
+  assert.match(cardSource, /plainText\.value = stripNoteMarkdown\(rawContent\.value\)/)
+  assert.match(cardSource, /excerpt\.value = plainText\.value\.slice\(0, NOTE_EMBED_EXCERPT_LENGTH\)/)
   assert.match(cardSource, /rawContent\.value = target\.content \|\| ''/)
+  // 摘要与日期走共用真源：预览态占位卡用同一份，否则同一张卡两个模式会显示不同的摘要。
+  assert.match(cardSource, /from '\.\.\/utils\/note-embed-meta'/)
 
   // 2) 懒渲染：首次展开才解析 markdown，避免每张卡片加载即解析
   assert.match(cardSource, /if \(!expanded\.value && !fullHtml\.value\)/)
@@ -489,8 +492,9 @@ test("嵌入卡片展开全文接线完整", () => {
 
   // 3) 递归防护：展开视图里摘掉嵌套嵌入卡片 HTML，换成不可递归的**单行占位**（防 A↔B 成环）。
   //    用带 data 标记的 <p> 而非 markdown 引用块——引用块的 blockquote(margin) 套 p(margin)
-  //    会叠出双倍高度，且样式无法单独收敛
-  assert.match(cardSource, /data-xynote-embed=/)
+  //    会叠出双倍高度，且样式无法单独收敛。
+  //    匹配式必须同时覆盖两个标识属性：网页端插入的卡片只有 `data-xynote-embed-server`。
+  assert.match(cardSource, /data-xynote-embed\(\?:-server\)\?=/)
   assert.match(cardSource, /data-xynote-embed-placeholder/)
   assert.match(cardSource, /请到原笔记中查看/)
   assert.doesNotMatch(cardSource, /> 此处原有一张嵌入卡片/)

@@ -236,25 +236,118 @@ test('嵌入卡片占位在预览里换成一张看得见的卡片', () => {
   const html = previewModule.renderPreviewMarkdown('<div data-xynote-embed="note:abc-123"></div>')
 
   assert.match(html, /class="markdown-embed-placeholder"/)
-  assert.match(html, /嵌入的笔记/)
+  // 卡片外观（左边框 + 背景 + 圆角）自己就说明这是嵌入内容，不再另挂「嵌入的笔记」标签。
+  assert.doesNotMatch(html, /嵌入的笔记/)
   // 关键：不能再把占位 div 原样吐出来 —— 那样渲染出来是个看不见的空块。
   assert.doesNotMatch(html, /data-xynote-embed/)
+})
+
+test('占位卡带着目标笔记 ID，预览层的事件委托靠它打开', () => {
+  const html = previewModule.renderPreviewMarkdown('<div data-xynote-embed="note:abc-123"></div>')
+
+  // 属性丢了就等于卡片点不开 —— 这是功能的一部分，不是装饰。
+  assert.match(html, /<div class="markdown-embed-placeholder" data-note-id="abc-123" role="button" tabindex="0" title="打开笔记">/)
+})
+
+test('只有跨端标识的嵌入卡（网页端插入）同样渲染成可点卡片', () => {
+  // 网页端没有本机 uuid，插入的卡片只写 data-xynote-embed-server。
+  // 只认 data-xynote-embed 会让这类卡片在预览里整块消失（渲染成一个零高度的空 div）。
+  const html = previewModule.renderPreviewMarkdown(
+    '<div data-xynote-embed-server="2081338921611808768" title="插入时的标题"></div>',
+    { resolveEmbedMeta: () => ({ title: '实时标题', excerpt: '被嵌入笔记的摘要' }) }
+  )
+
+  assert.match(html, /class="markdown-embed-placeholder"/)
+  assert.doesNotMatch(html, /data-xynote-embed/)
+  // 目标键取跨端标识 —— 预览层的事件委托靠它打开被嵌入的笔记。
+  assert.match(html, /data-note-id="2081338921611808768"/)
+  assert.match(html, /实时标题/)
+  assert.match(html, /被嵌入笔记的摘要/)
+})
+
+test('两个标识都在时目标键取本机 ID（桌面端插入的卡片）', () => {
+  const html = previewModule.renderPreviewMarkdown(
+    '<div data-xynote-embed="note:local-uuid" data-xynote-embed-server="9001" title="T"></div>'
+  )
+
+  assert.match(html, /data-note-id="local-uuid"/)
+})
+
+test('占位卡带静止态可点暗示：箭头不靠 hover 就看得见', () => {
+  const html = previewModule.renderPreviewMarkdown('<div data-xynote-embed="note:abc-123"></div>')
+
+  // 上一轮只做 hover 描边 + cursor，用户静态截图下反馈「没变化」——箭头必须在静止态就在。
+  // 形状与编辑态打开按钮同款（material-symbols arrow-forward-rounded），是内联 SVG 而非字符。
+  assert.match(html, /class="markdown-embed-placeholder__action" aria-hidden="true"><svg/)
+  // 可点语义已由 role="button" + title 承载，箭头纯装饰，不进无障碍树。
+  assert.match(html, /aria-hidden="true"/)
 })
 
 test('嵌入卡片标题优先用实时解析的结果，占位里的旧标题只作兜底', () => {
   const withStaleTitle = '<div data-xynote-embed="note:abc" title="改名之前的标题"></div>'
 
   const resolved = previewModule.renderPreviewMarkdown(withStaleTitle, {
-    resolveEmbedTitle: () => '现在的标题'
+    resolveEmbedMeta: () => ({ title: '现在的标题' })
   })
   assert.match(resolved, /现在的标题/)
   assert.doesNotMatch(resolved, /改名之前的标题/)
 
   // 解析不到（目标已删除 / 不在当前工作区）时，退回占位里写的那个。
   const fallback = previewModule.renderPreviewMarkdown(withStaleTitle, {
-    resolveEmbedTitle: () => null
+    resolveEmbedMeta: () => null
   })
   assert.match(fallback, /改名之前的标题/)
+})
+
+test('占位卡展示与编辑态卡片同层级的信息：文件夹 / 标题 / 摘要 / 时间', () => {
+  const html = previewModule.renderPreviewMarkdown('<div data-xynote-embed="note:abc"></div>', {
+    resolveEmbedMeta: () => ({
+      title: 'Django Web 四',
+      folderName: '学习笔记',
+      excerpt: '这是被嵌入笔记的纯文本摘要',
+      date: '2026.10.13'
+    })
+  })
+
+  // 文件夹 / 时间前各带一个 material-symbols 图标（内联 SVG，与编辑态卡片同款）。
+  assert.match(html, /class="markdown-embed-placeholder__folder"><svg[\s\S]*?<\/svg>学习笔记</)
+  assert.match(html, /class="markdown-embed-placeholder__title">Django Web 四</)
+  assert.match(html, /class="markdown-embed-placeholder__excerpt">这是被嵌入笔记的纯文本摘要</)
+  assert.match(html, /class="markdown-embed-placeholder__date"><svg[\s\S]*?<\/svg>2026\.10\.13</)
+  // 底行的 `__foot` 只包时间一项；「嵌入的笔记」标签已去掉，连空壳都不该留。
+  assert.match(html, /class="markdown-embed-placeholder__foot">/)
+  assert.doesNotMatch(html, /markdown-embed-placeholder__meta/)
+})
+
+test('占位卡缺什么就不渲染什么：没有文件夹 / 摘要 / 时间时不留空块', () => {
+  const html = previewModule.renderPreviewMarkdown('<div data-xynote-embed="note:abc"></div>', {
+    resolveEmbedMeta: () => ({ title: '只有标题' })
+  })
+
+  assert.match(html, /class="markdown-embed-placeholder__title">只有标题</)
+  assert.doesNotMatch(html, /markdown-embed-placeholder__folder/)
+  assert.doesNotMatch(html, /markdown-embed-placeholder__excerpt/)
+  assert.doesNotMatch(html, /markdown-embed-placeholder__date/)
+  // 没有文件夹 / 时间就不该有对应图标 —— 整张卡只剩箭头那一个 svg。
+  assert.equal((html.match(/<svg/g) || []).length, 1)
+})
+
+test('目标笔记在回收站时，占位卡给提示而不是摘要与时间', () => {
+  const html = previewModule.renderPreviewMarkdown('<div data-xynote-embed="note:abc"></div>', {
+    resolveEmbedMeta: () => ({
+      title: '已删除的笔记',
+      excerpt: '不该出现的摘要',
+      date: '2026.10.13',
+      deleted: true
+    })
+  })
+
+  assert.match(html, /class="markdown-embed-placeholder__title">已删除的笔记</)
+  assert.match(html, /此笔记已被删除或移入回收站/)
+  assert.doesNotMatch(html, /不该出现的摘要/)
+  assert.doesNotMatch(html, /markdown-embed-placeholder__date/)
+  // 时间与「嵌入的笔记」标签都没有了 → 底行整行不该渲染，别留空壳。
+  assert.doesNotMatch(html, /markdown-embed-placeholder__foot/)
 })
 
 test('嵌入卡片查不到标题时给默认文案，不留空', () => {
@@ -263,13 +356,19 @@ test('嵌入卡片查不到标题时给默认文案，不留空', () => {
   assert.match(html, /未命名笔记/)
 })
 
-test('卡片标题里的 HTML 会被转义，不能借笔记标题注入标签', () => {
+test('卡片各字段里的 HTML 都会被转义，不能借笔记内容注入标签', () => {
   const html = previewModule.renderPreviewMarkdown('<div data-xynote-embed="note:x"></div>', {
-    resolveEmbedTitle: () => '<img src=x onerror=alert(1)>'
+    resolveEmbedMeta: () => ({
+      title: '<img src=x onerror=alert(1)>',
+      folderName: '<b>文件夹</b>',
+      excerpt: '<script>alert(1)</script>'
+    })
   })
 
   assert.doesNotMatch(html, /<img/)
+  assert.doesNotMatch(html, /<script/)
   assert.match(html, /&lt;img/)
+  assert.match(html, /&lt;script/)
 })
 
 test('没有嵌入卡片的文档走快速路径，正文里的普通 HTML 块不被误伤', () => {

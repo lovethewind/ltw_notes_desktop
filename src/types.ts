@@ -239,6 +239,43 @@ export interface LocalNoteLinkRewriteResult extends DataTransferResult {
   linkCount: number
 }
 
+/**
+ * 「给嵌入卡片补线上标识」的预览统计。
+ *
+ * 嵌入卡的两个标识属性互为补充：桌面端插入写本机 uuid（`data-xynote-embed="note:{localId}"`），
+ * 目标已同步时再补上跨端标识 `data-xynote-embed-server`；网页端插入则只能写后者。
+ * 本统计针对**存量桌面端卡片**（有本机 uuid、缺跨端标识），需要用户先看这份账再决定是否补。
+ * 设计见 docs/specs/2026-10-12-note-embed-web-render.md。
+ */
+export interface EmbedServerIdFillPreview {
+  /** 参与扫描的未删除笔记数。 */
+  scannedNotes: number
+  /** 正文里含嵌入卡片的笔记数。 */
+  embeddedNotes: number
+  /** 会被改动的笔记数。 */
+  convertibleNotes: number
+  /** 扫到的嵌入卡片总张数（不含围栏代码块内的）。 */
+  totalEmbeds: number
+  /** 能补上跨端标识的张数。 */
+  fillableEmbeds: number
+  /** 目标笔记已不存在（已删除）的张数。 */
+  missingEmbeds: number
+  /** 目标笔记尚未同步到云端（无 serverId）的张数。 */
+  unsyncedEmbeds: number
+  /** 已经带跨端标识、无需改动的张数。 */
+  alreadyFilledEmbeds: number
+  /** 前几篇将被改动的笔记，用于展示样例。 */
+  samples: Array<{ noteId: string; title: string; changed: number }>
+}
+
+/** 「给嵌入卡片补线上标识」的执行结果。 */
+export interface EmbedServerIdFillResult extends DataTransferResult {
+  /** 实际被改动的笔记数。 */
+  noteCount: number
+  /** 实际补上标识的卡片张数。 */
+  embedCount: number
+}
+
 export interface DatabaseBackup {
   id: string
   createdAt: string
@@ -545,6 +582,10 @@ export interface NotesDesktopApi {
   previewLocalNoteLinkRewrite(): Promise<LocalNoteLinkRewritePreview>
   /** 手动把正文里仍使用本机地址的笔记链接改写成网页地址。 */
   rewriteLocalNoteLinks(): Promise<LocalNoteLinkRewriteResult>
+  /** 预览「给嵌入卡片补线上标识」将改动的范围（只读，不改库）。 */
+  previewEmbedServerIdFill(): Promise<EmbedServerIdFillPreview>
+  /** 手动给正文里的嵌入卡片补上跨端标识，供网页端渲染成卡片。 */
+  fillEmbedServerIds(): Promise<EmbedServerIdFillResult>
   importMarkdown(folderId: string | null): Promise<DataTransferResult>
   /** 导入单个 Markdown 文件（含其引用的本地图片），不建来源文件夹。 */
   importSingleMarkdown(folderId: string | null): Promise<DataTransferResult>
@@ -555,7 +596,7 @@ export interface NotesDesktopApi {
    */
   importMarkdownPath(filePath: string, content: string, folderId: string | null): Promise<DataTransferResult>
   importFullBackup(): Promise<DataTransferResult>
-  /** 监听菜单栏打开导入导出窗口的请求。 */
+  /** 监听菜单栏打开数据管理窗口的请求。 */
   onOpenDataTransfer(callback: () => void): () => void
   listDatabaseBackups(): Promise<DatabaseBackup[]>
   /** 获取当前档案的备份状态。 */

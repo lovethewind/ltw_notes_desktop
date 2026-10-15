@@ -121,7 +121,12 @@
         class="markdown-note-preview__body"
         @scroll.passive="updateActiveOutline"
       >
-        <div class="markdown-note-preview__doc markdown-rendered-doc" v-html="previewHtml"></div>
+        <div
+          class="markdown-note-preview__doc markdown-rendered-doc"
+          v-html="previewHtml"
+          @click="handlePreviewEmbedClick"
+          @keydown="handlePreviewEmbedKeydown"
+        ></div>
       </div>
     </section>
     <!--
@@ -254,6 +259,7 @@
       :coords="linkSuggestCoords"
       :items="linkSuggestItems"
       :active-index="linkSuggestIndex"
+      :keyword="linkSuggestQuery"
       @hover="linkSuggestHover"
       @select="insertNoteLinkFromPos"
     />
@@ -293,14 +299,23 @@ import { DEFAULT_BODY_FONT_SIZE, FONT_SCALE_STEPS, isBlankText, isDefaultFontSiz
 import { Icon } from '@iconify/vue'
 import { computed, defineAsyncComponent, h, nextTick, onBeforeUnmount, onMounted, ref, render, watch } from 'vue'
 import { extractMarkdownOutline, type MarkdownOutlineItem } from '../utils/markdown-outline'
-import { renderPreviewMarkdown, resolvePreviewImageSource } from '../utils/markdown-preview'
+import {
+  renderPreviewMarkdown,
+  resolvePreviewImageSource,
+  type PreviewEmbedMeta
+} from '../utils/markdown-preview'
+import {
+  NOTE_EMBED_EXCERPT_LENGTH,
+  formatNoteDate,
+  stripNoteMarkdown
+} from '../utils/note-embed-meta'
 import { sanitizePreviewHtml } from '../utils/preview-sanitize'
 import { resolvePreviewImageElement } from '../utils/preview-image-tools'
 import { formatJsonCode } from '../utils/json-code-formatter.js'
 import type { NoteFolder, OfflineNote } from '../types'
 import NoteLinkPicker from './NoteLinkPicker.vue'
 import EditorContextMenu from './EditorContextMenu.vue'
-import type { EditorContextMenuGroup } from './EditorContextMenu.vue'
+import type { EditorContextMenuGroup, EditorContextMenuItem } from './EditorContextMenu.vue'
 import BacklinksPanel from './BacklinksPanel.vue'
 import LinkSuggestPopover from './LinkSuggestPopover.vue'
 import PreviewImageBar from './PreviewImageBar.vue'
@@ -468,6 +483,19 @@ const linkSuggestQuery = ref('')
 const linkSuggestCoords = ref<{ left: number, top: number, bottom: number }>({ left: 0, top: 0, bottom: 0 })
 const linkSuggestStart = ref<number | null>(null)
 let linkSuggestTimer: ReturnType<typeof setTimeout> | undefined
+
+/**
+ * `[[` 补全的候选条数上限。
+ *
+ * 空关键词时取「最近更新」多少条、有关键词时最多取多少条命中。
+ * 这两个数字决定用户在浮层里能翻到多少笔记 —— 早先两处都写死 `8`，
+ * 而 `LinkSuggestPopover` 的浮层本来就有滚动条与 `max-height`，
+ * 有搜索词那支更是先 `searchNotes(limit: 50)` 拿到 50 条再砍成 8 条，
+ * 等于白取 42 条。
+ */
+const LINK_SUGGEST_RECENT_LIMIT = 20
+const LINK_SUGGEST_SEARCH_LIMIT = 50
+
 const imageContextMenuElement = ref<HTMLDivElement | null>(null)
 const contentValue = ref(props.value)
 const outlineItems = ref<MarkdownOutlineItem[]>([])
@@ -543,6 +571,7 @@ const editorContextMenu = ref({
 const embedContextTarget = ref<{
   noteId: string
   title: string | null
+  serverId: string | null
   pos: number
   available: boolean
 } | null>(null)
@@ -929,10 +958,8 @@ function closeEditorContextMenu(): void {
 }
 
 /** 便捷构造单个菜单项（默认可用）。 */
-function menuItem(action: string, label: string, opts: { icon?: string, disabled?: boolean, danger?: boolean } = {}): {
-  action: string, label: string, icon?: string, disabled?: boolean, danger?: boolean
-} {
-  return { action, label, icon: opts.icon, disabled: opts.disabled, danger: opts.danger }
+function menuItem(action: string, label: string, opts: { icon?: string, disabled?: boolean, danger?: boolean; children?: EditorContextMenuItem[] } = {}): EditorContextMenuItem {
+  return { action, label, icon: opts.icon, disabled: opts.disabled, danger: opts.danger, children: opts.children }
 }
 
 /**
@@ -968,15 +995,24 @@ function buildEditorContextGroups(view: ProseMirrorView): EditorContextMenuGroup
       ]
     },
     {
+      // 块类型 8 项收进二级菜单：平铺时它们独占整个菜单 586px 里的一半以上，
+      // 而顶栏工具栏本来就有全套按钮 —— 右键菜单没必要把工具栏再抄一遍。
+      // 禁用判断挂在父项上：父项禁用即整组不出现，子项不再各自判断。
       items: [
-        menuItem('paragraph', '正文', { icon: 'material-symbols:notes-rounded', disabled: !canEdit }),
-        menuItem('h1', '一级标题', { icon: 'material-symbols:title', disabled: !canEdit }),
-        menuItem('h2', '二级标题', { icon: 'material-symbols:title', disabled: !canEdit }),
-        menuItem('h3', '三级标题', { icon: 'material-symbols:title', disabled: !canEdit }),
-        menuItem('quote', '引用', { icon: 'material-symbols:format-quote-rounded', disabled: !canEdit }),
-        menuItem('bulletList', '无序列表', { icon: 'material-symbols:format-list-bulleted-rounded', disabled: !canEdit }),
-        menuItem('orderedList', '有序列表', { icon: 'material-symbols:format-list-numbered-rounded', disabled: !canEdit }),
-        menuItem('codeBlock', '代码块', { icon: 'material-symbols:code-rounded', disabled: !canEdit })
+        menuItem('blockType', '段落样式', {
+          icon: 'material-symbols:format-align-left',
+          disabled: !canEdit,
+          children: [
+            menuItem('paragraph', '正文', { icon: 'material-symbols:notes-rounded' }),
+            menuItem('h1', '一级标题', { icon: 'material-symbols:title' }),
+            menuItem('h2', '二级标题', { icon: 'material-symbols:title' }),
+            menuItem('h3', '三级标题', { icon: 'material-symbols:title' }),
+            menuItem('quote', '引用', { icon: 'material-symbols:format-quote-rounded' }),
+            menuItem('bulletList', '无序列表', { icon: 'material-symbols:format-list-bulleted-rounded' }),
+            menuItem('orderedList', '有序列表', { icon: 'material-symbols:format-list-numbered-rounded' }),
+            menuItem('codeBlock', '代码块', { icon: 'material-symbols:code-rounded' })
+          ]
+        })
       ]
     },
     ...(props.noteLibraryEnabled
@@ -1062,6 +1098,7 @@ function handleEmbedCardMenu(event: Event): void {
   embedContextTarget.value = {
     noteId: detail.noteId,
     title: detail.title,
+    serverId: detail.serverId ?? null,
     pos: detail.pos,
     available: detail.available
   }
@@ -1165,14 +1202,19 @@ async function runEmbedCardCommand(action: string): Promise<void> {
   embedContextTarget.value = null
   if (!target || !editor || !editorReady) return
   // 打开笔记：新标签页打开目标（与点击卡片一致）
+  // 键优先本机 ID；网页端插入的卡片只有跨端标识，App.vue 的 handleOpenNoteEvent 会按 serverId 回落命中。
   if (action === 'embedOpen') {
-    dispatchOpenNote(target.noteId, true)
+    dispatchOpenNote(target.noteId || target.serverId || '', true)
     return
   }
   // 复制嵌入引用：复制 markdown 源码，粘回任意笔记仍是嵌入卡片
   if (action === 'embedCopyRef') {
     const titleAttr = target.title ? ` title="${target.title.replace(/"/g, '&quot;')}"` : ''
-    const ref = `<div data-xynote-embed="note:${target.noteId}"${titleAttr}></div>`
+    // 与序列化同源：属性顺序固定「本机标识 → 跨端标识 → 标题」，缺值的属性一律不输出 ——
+    // 本机 ID 为空（网页端插入的卡片）时写出 `note:` 空值只会污染正文。
+    const idAttr = target.noteId ? ` data-xynote-embed="note:${target.noteId}"` : ''
+    const serverAttr = target.serverId ? ` data-xynote-embed-server="${target.serverId}"` : ''
+    const ref = `<div${idAttr}${serverAttr}${titleAttr}></div>`
     try {
       await navigator.clipboard.writeText(ref)
       showFeedback('已复制嵌入引用')
@@ -1195,8 +1237,12 @@ async function runEmbedCardCommand(action: string): Promise<void> {
   }
   // 转换为链接：块节点换成含笔记链接的段落（查 serverId 生成线上地址，查不到回落本地）
   if (action === 'embedUnwrap') {
-    const note = await window.notesDesktop.getNote(target.noteId).catch(() => null)
-    const href = buildNoteHref(target.noteId, note?.serverId ?? null)
+    // 目标键优先本机 ID；网页端插入的卡片只有跨端标识（repository.getNote 内部会按 server_id 回落）。
+    const note = await window.notesDesktop
+      .getNote(target.noteId || target.serverId || '')
+      .catch(() => null)
+    // 回落到的笔记 id 才是本机 uuid —— 缺 serverId 时 buildNoteHref 要靠它写内部链接。
+    const href = buildNoteHref(note?.id ?? target.noteId, note?.serverId ?? null)
     const label = target.title || note?.title || '笔记链接'
     editor.editor.action((ctx) => {
       const view = ctx.get(editorViewCtx)
@@ -1604,16 +1650,28 @@ function syncPreviewReadonly(): void {
 }
 
 /**
- * 解析预览里嵌入卡片的标题。
+ * 解析预览里嵌入卡片的展示信息（标题 / 文件夹 / 摘要 / 时间）。
  *
  * 占位 div 的 `title` 属性只有「带标题插入」时才有，实际多数卡片没写，
- * 因此这里按 ID 回查工作区笔记列表 —— 渲染模块本身不认识笔记库，标题只能由这边注入。
+ * 因此这里按 ID 回查工作区笔记列表 —— 渲染模块本身不认识笔记库，信息只能由这边注入。
  *
- * :param noteId: 被嵌入的笔记 ID。
- * :return: 笔记标题；查不到返回 null。
+ * ⚠️ 摘要是「列表里的纯文本预览」（库侧只存 `content_prefix`，不是全文），
+ * 与编辑卡（异步取全文再截断）**同口径但不保证逐字相同**；标题 / 文件夹 / 时间是精确的。
+ *
+ * :param noteId: 卡片上的目标键 —— 本机 ID，或（网页端插入的卡片）跨端标识。
+ * :return: 卡片展示信息；查不到返回 null。
  */
-function resolveEmbedTitle(noteId: string): string | null {
-  return props.allNotes.find((note) => note.id === noteId)?.title ?? null
+function resolveEmbedMeta(noteId: string): PreviewEmbedMeta | null {
+  // 两个键都要匹配：桌面端插入的卡片带本机 ID，网页端插入的卡片只带服务端主键。
+  const note = props.allNotes.find((item) => item.id === noteId || item.serverId === noteId)
+  if (!note) return null
+  return {
+    title: note.title,
+    folderName: props.folders.find((folder) => folder.id === note.folderId)?.name ?? '',
+    excerpt: stripNoteMarkdown(note.content || '').slice(0, NOTE_EMBED_EXCERPT_LENGTH),
+    date: formatNoteDate(note.updatedAt || ''),
+    deleted: note.isDeleted
+  }
 }
 
 /**
@@ -1627,7 +1685,7 @@ function resolveEmbedTitle(noteId: string): string | null {
 function resolvePreviewHtml(): string {
   // 笔记正文没有磁盘路径：传空串，相对路径原样返回（`file:` 与网络地址仍会归一）。
   const parsed = new DOMParser().parseFromString(
-    renderPreviewMarkdown(contentValue.value, { resolveEmbedTitle }),
+    renderPreviewMarkdown(contentValue.value, { resolveEmbedMeta }),
     'text/html'
   )
   for (const image of parsed.querySelectorAll('img')) {
@@ -1640,6 +1698,53 @@ function resolvePreviewHtml(): string {
 
 /** 只在预览态渲染：关着的时候这个 computed 不被任何渲染读取，也不会白跑一遍解析。 */
 const previewHtml = computed(() => (previewMode.value ? resolvePreviewHtml() : ''))
+
+/**
+ * 从事件目标里认出嵌入占位卡，取出它指向的笔记 ID。
+ *
+ * 预览正文是 `v-html` 出来的死 HTML，卡片挂不上 Vue 事件（同预览图片，见
+ * `usePreviewImageTools`），只能事件委托；目标 ID 由渲染模块写在 `data-note-id` 上
+ * （见 `utils/markdown-preview.ts` 的 `renderEmbedPlaceholder`）。
+ *
+ * :param target: 事件目标节点。
+ * :return: 目标笔记 ID；点到别处返回 null。
+ */
+function resolvePreviewEmbedNoteId(target: EventTarget | null): string | null {
+  if (!(target instanceof Element)) return null
+  return target.closest('.markdown-embed-placeholder')?.getAttribute('data-note-id') || null
+}
+
+/**
+ * 预览里点嵌入占位卡 → 打开被嵌入的那篇笔记。
+ *
+ * 打开语义与正文里的内部笔记链接一致：**新标签页**，不打断当前阅读位置。
+ *
+ * :param event: 原生 click 事件。
+ * :return: 无返回值。
+ */
+function handlePreviewEmbedClick(event: MouseEvent): void {
+  if (event.button !== 0) return
+  const noteId = resolvePreviewEmbedNoteId(event.target)
+  if (!noteId) return
+  event.preventDefault()
+  window.getSelection()?.removeAllRanges()
+  dispatchOpenNote(noteId, true)
+}
+
+/**
+ * 卡片的键盘入口：`role="button"` + `tabindex="0"` 只是让它可聚焦，
+ * div 不会因回车自动派发 click，这里补上 —— 否则就是一个「看起来能按、按不动」的假按钮。
+ *
+ * :param event: 原生 keydown 事件。
+ * :return: 无返回值。
+ */
+function handlePreviewEmbedKeydown(event: KeyboardEvent): void {
+  if (event.key !== 'Enter' && event.key !== ' ') return
+  const noteId = resolvePreviewEmbedNoteId(event.target)
+  if (!noteId) return
+  event.preventDefault()
+  dispatchOpenNote(noteId, true)
+}
 
 /**
  * 切到编辑 / 预览模式。
@@ -1995,16 +2100,17 @@ function openNoteEmbedPicker(): void {
  * 将选中的笔记以嵌入卡片形式插入当前光标所在块。
  *
  * 复用 noteEmbed 自定义块节点（src/editor/xynote-embed.ts）：markdown 以
- * `<div data-xynote-embed="note:<id>" title="..."></div>` 承载，往返无损；
- * 渲染阶段由 nodeView 呈现为真实卡片。
+ * `<div data-xynote-embed="note:<id>" data-xynote-embed-server="<serverId>" title="..."></div>`
+ * 承载，往返无损；渲染阶段由 nodeView 呈现为真实卡片。
  *
- * :param noteId: 目标笔记 ID。
- * :param _serverId: 目标笔记云端 serverId（嵌入卡片以本地 note:<id> 存储，此项不使用，仅为对齐
- *   NoteLinkPicker 的 select 载荷签名）。
+ * :param noteId: 目标笔记 ID（桌面端解析键，始终写本机 ID）。
+ * :param serverId: 目标笔记云端 serverId；**有则写进跨端属性供网页端解析**，
+ *   未同步时传 null（此时网页端只能降级占位）。详见
+ *   docs/specs/2026-10-12-note-embed-web-render.md。
  * :param title: 卡片兜底标题（markdown title 属性，可空）。
  * :return: 无返回值。
  */
-async function insertNoteEmbed(noteId: string, _serverId: string | null, title: string): Promise<void> {
+async function insertNoteEmbed(noteId: string, serverId: string | null, title: string): Promise<void> {
   noteEmbedPickerVisible.value = false
   if (!editor || !editorReady || props.readonly) return
   if (!noteId) {
@@ -2022,7 +2128,8 @@ async function insertNoteEmbed(noteId: string, _serverId: string | null, title: 
       commands.call(clearTextInCurrentBlockCommand.key)
       commands.call(addBlockTypeCommand.key, {
         nodeType: embedType,
-        attrs: { noteId, title: title || null }
+        // serverId 归一化为 null：选择器在「目标未同步」时可能给空串。
+        attrs: { noteId, title: title || null, serverId: serverId || null }
       })
       view.focus()
     })
@@ -2208,9 +2315,9 @@ async function runLinkSuggestSearch(query: string): Promise<void> {
         linkSuggestItems.value = (workspace.notes || [])
           .filter((note) => !note.isDeleted)
           .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))
-          .slice(0, 8)
+          .slice(0, LINK_SUGGEST_RECENT_LIMIT)
       } else {
-        const notes = await window.notesDesktop.searchNotes(text, { limit: 50 })
+        const notes = await window.notesDesktop.searchNotes(text, { limit: LINK_SUGGEST_SEARCH_LIMIT })
         const query = text.toLowerCase()
         linkSuggestItems.value = notes
           .filter((note) => !note.isDeleted)
@@ -2220,7 +2327,7 @@ async function runLinkSuggestSearch(query: string): Promise<void> {
             if (A !== B) return A - B
             return b.updatedAt.localeCompare(a.updatedAt)
           })
-          .slice(0, 8)
+          .slice(0, LINK_SUGGEST_SEARCH_LIMIT)
       }
       if (linkSuggestIndex.value >= linkSuggestItems.value.length) linkSuggestIndex.value = 0
     } catch {
@@ -3595,6 +3702,43 @@ onBeforeUnmount(() => {
 }
 /* 图片可点击进全屏（交互挂在容器的事件委托上），光标要给出提示。 */
 .markdown-note-preview__doc img { cursor: zoom-in; }
+/*
+  嵌入占位卡同理：点一下打开被嵌入的那篇笔记（`handlePreviewEmbedClick`）。
+  只在这里补可点暗示 —— 占位卡是两处预览共用的渲染（外部文件预览也长这样），
+  但只有笔记预览接了打开动作，不能把光标改到全局那份样式里。
+*/
+.markdown-note-preview__doc .markdown-embed-placeholder {
+  cursor: pointer;
+  transition: border-color 0.15s ease;
+}
+.markdown-note-preview__doc .markdown-embed-placeholder:hover,
+.markdown-note-preview__doc .markdown-embed-placeholder:focus-visible {
+  border-color: var(--rendered-doc-link);
+}
+.markdown-note-preview__doc .markdown-embed-placeholder:focus-visible {
+  outline: 2px solid var(--rendered-doc-link);
+  outline-offset: 2px;
+}
+/*
+  箭头的静止态可点暗示。与上面的 cursor/hover 同作用域（只限笔记预览）——
+  外部文件预览的占位卡不可点，不给它一个假暗示。
+  图形是渲染层拼进来的内联 SVG（死 HTML 挂不上 Vue 组件），尺寸因此写在 svg 上、不再走 font-size。
+*/
+.markdown-note-preview__doc .markdown-embed-placeholder__action {
+  flex: 0 0 auto;
+  display: inline-flex;
+  color: var(--rendered-doc-link);
+  line-height: 1;
+  transition: transform 0.15s ease;
+}
+.markdown-note-preview__doc .markdown-embed-placeholder__action svg {
+  width: 18px;
+  height: 18px;
+}
+.markdown-note-preview__doc .markdown-embed-placeholder:hover .markdown-embed-placeholder__action,
+.markdown-note-preview__doc .markdown-embed-placeholder:focus-visible .markdown-embed-placeholder__action {
+  transform: translateX(2px);
+}
 /*
   编辑态的图片块同样能点进全屏。只改 img：Crepe 的缩放手柄（row-resize）与图注按钮
   是 wrapper 的兄弟/子节点而非 img，各自的光标不受影响。

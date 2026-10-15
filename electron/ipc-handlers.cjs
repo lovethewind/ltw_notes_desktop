@@ -99,6 +99,8 @@ function registerDataTransferHandlers(ipcMain, domain) {
   ipcMain.handle("data:import-backup", domain.importBackup)
   ipcMain.handle("data:preview-local-note-link-rewrite", domain.previewLocalNoteLinkRewrite)
   ipcMain.handle("data:rewrite-local-note-links", domain.rewriteLocalNoteLinks)
+  ipcMain.handle("data:preview-embed-server-id-fill", domain.previewEmbedServerIdFill)
+  ipcMain.handle("data:fill-embed-server-ids", domain.fillEmbedServerIds)
 }
 
 function registerBackupHandlers(ipcMain, domain) {

@@ -55,6 +55,7 @@ import type {
   SyncSettingsView,
   LocalMarkdownFile,
   LocalNoteLinkRewritePreview,
+  EmbedServerIdFillPreview,
   SyncStatus,
   ThemeMode,
   WorkspaceData
@@ -229,6 +230,8 @@ const dataTransferBusy = ref(false)
 const dataTransferMessage = ref('')
 /** 「本机笔记地址转网页地址」的预览结果；非空时面板显示二次确认。 */
 const linkRewritePreview = ref<LocalNoteLinkRewritePreview | null>(null)
+/** 「嵌入卡片补线上标识」的预览结果；非空时面板显示二次确认。 */
+const embedFillPreview = ref<EmbedServerIdFillPreview | null>(null)
 const databaseBackupStatus = reactive<DatabaseBackupStatus>({
   state: 'idle',
   message: '尚未创建备份',
@@ -985,19 +988,20 @@ async function toggleAiAssistant(): Promise<void> {
 }
 
 /**
- * 打开导入导出数据管理窗口。
+ * 打开数据管理窗口。
  *
  * :return: 无返回值。
  */
 function openDataTransfer(): void {
   dataTransferMessage.value = ''
   linkRewritePreview.value = null
+  embedFillPreview.value = null
   markdownImportTargetVisible.value = false
   dataTransferVisible.value = true
 }
 
 /**
- * 执行导入导出操作并刷新受影响的工作区。
+ * 执行数据传输操作并刷新受影响的工作区。
  *
  * :param operation: 待执行的数据操作。
  * :param refreshAfter: 完成后是否刷新工作区。
@@ -1029,7 +1033,7 @@ async function runDataTransfer(
       }
     }
   } catch (error) {
-    dataTransferMessage.value = error instanceof Error ? error.message : '导入导出失败'
+    dataTransferMessage.value = error instanceof Error ? error.message : '操作失败'
   } finally {
     dataTransferBusy.value = false
   }
@@ -1116,6 +1120,59 @@ const linkRewriteSkippedSummary = computed(() => {
   if (preview.unsyncedLinks) parts.push(`${preview.unsyncedLinks} 条的目标笔记尚未同步`)
   if (preview.missingLinks) parts.push(`${preview.missingLinks} 条的目标笔记已不存在`)
   if (preview.noWebBaseLinks) parts.push(`${preview.noWebBaseLinks} 条因未配置网页地址`)
+  return parts.join('、')
+})
+
+/**
+ * 扫描全库正文里的嵌入卡片，给出「补线上标识」将影响的范围。
+ *
+ * 只读、不改库：结果落到 `embedFillPreview`，面板据此显示二次确认。嵌入卡以本机 uuid
+ * 承载，网页端只认服务端数字主键 —— 新插入的卡片已自动带上跨端标识，这条入口补存量。
+ *
+ * :return: 操作完成后的 Promise。
+ */
+async function previewEmbedServerIdFill(): Promise<void> {
+  if (dataTransferBusy.value) return
+  dataTransferBusy.value = true
+  dataTransferMessage.value = ''
+  actionError.value = ''
+  try {
+    await flushSave()
+    embedFillPreview.value = await window.notesDesktop.previewEmbedServerIdFill()
+  } catch (error) {
+    dataTransferMessage.value = error instanceof Error ? error.message : '扫描嵌入卡片失败'
+  } finally {
+    dataTransferBusy.value = false
+  }
+}
+
+/**
+ * 确认执行「给嵌入卡片补线上标识」。
+ *
+ * 正文会被改写并推送云端，所以按数据变更处理：走 `runDataTransfer` 并刷新工作区
+ * （正文变了，列表摘要、关系面板与图谱都要跟着更新）。
+ *
+ * :return: 操作完成后的 Promise。
+ */
+async function confirmEmbedServerIdFill(): Promise<void> {
+  embedFillPreview.value = null
+  await runDataTransfer(() => window.notesDesktop.fillEmbedServerIds(), true)
+}
+
+/**
+ * 把嵌入卡回填预览里「保持原样」的各条数与原因拼成一句话。
+ *
+ * 只有两种原因，且对用户的下一步动作不同：目标未同步是「等同步完再来一次」，
+ * 目标不存在是「这张卡片已经废了」。无跳过项时返回空串，模板据此隐藏该句。
+ *
+ * :return: 形如「3 张的目标笔记尚未同步、1 张的目标笔记已不存在」的说明。
+ */
+const embedFillSkippedSummary = computed(() => {
+  const preview = embedFillPreview.value
+  if (!preview) return ''
+  const parts: string[] = []
+  if (preview.unsyncedEmbeds) parts.push(`${preview.unsyncedEmbeds} 张的目标笔记尚未同步`)
+  if (preview.missingEmbeds) parts.push(`${preview.missingEmbeds} 张的目标笔记已不存在`)
   return parts.join('、')
 })
 
@@ -3691,11 +3748,11 @@ onBeforeUnmount(() => {
         <button
           class="data-transfer-button"
           type="button"
-          aria-label="导入导出"
-          data-tooltip="导入导出"
+          aria-label="数据管理"
+          data-tooltip="数据管理"
           @click.stop="openDataTransfer"
         >
-          <Icon icon="tabler:package-import" />
+          <Icon icon="tabler:database" />
         </button>
         <button
           class="attachment-manager-button"
@@ -4279,6 +4336,7 @@ onBeforeUnmount(() => {
               :document-id="activeFileDoc.filePath"
               :value="activeFileDoc.content"
               :all-notes="workspace.notes"
+              :folders="workspace.folders"
               @change="updateFileDocContent"
             />
             <MarkdownVisualEditor
@@ -4943,11 +5001,11 @@ onBeforeUnmount(() => {
     </div>
 
     <div v-if="dataTransferVisible" class="dialog-backdrop" @click.self="!dataTransferBusy && (dataTransferVisible = false)">
-      <section class="folder-dialog data-transfer-dialog" role="dialog" aria-modal="true" aria-label="导入导出">
-        <button class="dialog-close-button" type="button" aria-label="关闭导入导出窗口" :disabled="dataTransferBusy" @click="dataTransferVisible = false"><Icon icon="tabler:x" /></button>
+      <section class="folder-dialog data-transfer-dialog" role="dialog" aria-modal="true" aria-label="数据管理">
+        <button class="dialog-close-button" type="button" aria-label="关闭数据管理窗口" :disabled="dataTransferBusy" @click="dataTransferVisible = false"><Icon icon="tabler:x" /></button>
         <div class="dialog-icon"><Icon icon="tabler:archive" /></div>
-        <h2>导入导出</h2>
-        <p>完整备份用于本应用恢复；Markdown 导出按文件夹打包、图片随 ZIP 保存，并可再导入回本应用。</p>
+        <h2>数据管理</h2>
+        <p>完整备份用于本应用恢复；Markdown 导出按文件夹打包、图片随 ZIP 保存，并可再导入回本应用。数据修复用于把本地历史内容补齐成网页端可用的形态。</p>
         <div class="data-transfer-groups">
           <section class="data-transfer-group">
             <h3>导入</h3>
@@ -4997,11 +5055,15 @@ onBeforeUnmount(() => {
             </div>
           </section>
           <section class="data-transfer-group">
-            <h3>工具</h3>
+            <h3>数据修复</h3>
             <div class="data-transfer-grid">
               <button class="local-link-rewrite-action" type="button" :disabled="dataTransferBusy" @click="previewLocalNoteLinkRewrite">
                 <Icon icon="tabler:link" />
                 <span><strong>本机地址转为线上地址</strong><small>把正文里的本机笔记链接换成网页可打开的地址</small></span>
+              </button>
+              <button class="embed-server-fill-action" type="button" :disabled="dataTransferBusy" @click="previewEmbedServerIdFill">
+                <Icon icon="tabler:cards" />
+                <span><strong>嵌入卡片补线上标识</strong><small>给老卡片补上网页端能识别的标识，之后网页端才显示成卡片</small></span>
               </button>
             </div>
           </section>
@@ -5017,6 +5079,19 @@ onBeforeUnmount(() => {
           <div class="link-rewrite-confirm-actions">
             <button type="button" :disabled="dataTransferBusy" @click="linkRewritePreview = null">取消</button>
             <button class="primary" type="button" :disabled="dataTransferBusy || !linkRewritePreview.convertibleLinks" @click="confirmLocalNoteLinkRewrite">确认转换</button>
+          </div>
+        </div>
+        <div v-if="embedFillPreview" class="link-rewrite-confirm">
+          <p v-if="embedFillPreview.fillableEmbeds">
+            将改动 <strong>{{ embedFillPreview.convertibleNotes }}</strong> 篇笔记中的
+            <strong>{{ embedFillPreview.fillableEmbeds }}</strong> 张嵌入卡片<template v-if="embedFillSkippedSummary">；另有 {{ embedFillSkippedSummary }}，保持原样</template>。
+          </p>
+          <p v-else>
+            没有需要补标识的嵌入卡片<template v-if="embedFillSkippedSummary">；{{ embedFillSkippedSummary }}</template>。
+          </p>
+          <div class="link-rewrite-confirm-actions">
+            <button type="button" :disabled="dataTransferBusy" @click="embedFillPreview = null">取消</button>
+            <button class="primary" type="button" :disabled="dataTransferBusy || !embedFillPreview.fillableEmbeds" @click="confirmEmbedServerIdFill">确认补齐</button>
           </div>
         </div>
         <p v-if="dataTransferMessage" class="data-transfer-message">{{ dataTransferMessage }}</p>

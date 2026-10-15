@@ -412,7 +412,7 @@ body.is-link-modifier-active .milkdown-editor-root a[href] { cursor: pointer; }
 .tag-picker-empty { margin: 14px 0; color: #96a2b2; font-size: 10px; text-align: center; }
 .create-tag-inline { width: 100%; height: 36px; display: flex; align-items: center; gap: 8px; margin-top: 6px; border: 0; border-top: 1px solid #e8eef5; padding: 5px 9px 0; background: transparent; color: var(--blue); cursor: pointer; font-size: 11px; font-weight: 750; text-align: left; }
 
-.history-dialog { width: min(880px, calc(100vw - 56px)); height: min(620px, calc(100vh - 70px)); display: flex; flex-direction: column; overflow: hidden; border: 1px solid var(--line); border-radius: 18px; background: var(--surface-solid); box-shadow: 0 28px 80px rgba(18,36,61,.24); }
+.history-dialog { width: min(1120px, calc(100vw - 56px)); height: min(780px, calc(100vh - 44px)); display: flex; flex-direction: column; overflow: hidden; border: 1px solid var(--line); border-radius: 18px; background: var(--surface-solid); box-shadow: 0 28px 80px rgba(18,36,61,.24); }
 .history-dialog > header { min-height: 64px; display: flex; align-items: center; justify-content: space-between; border-bottom: 1px solid var(--line); padding: 0 18px; }
 .history-dialog > header > div { display: flex; align-items: center; gap: 10px; }
 .history-dialog > header > div > svg { color: var(--blue); font-size: 23px; }
@@ -430,7 +430,27 @@ body.is-link-modifier-active .milkdown-editor-root a[href] { cursor: pointer; }
 .history-list small { color: #7f8da1; font-size: 11px; line-height: 1.45; }
 .history-list time { color: #929fb0; font-size: 10px; }
 .history-preview { min-width: 0; min-height: 0; display: flex; flex-direction: column; overflow: hidden; }
-.history-preview h3 { flex: 0 0 auto; margin: 0; padding: 22px 26px 10px; color: var(--ink); font-size: 20px; }
+.history-preview-head { flex: 0 0 auto; display: flex; align-items: center; justify-content: space-between; gap: 14px; padding: 12px 22px 8px 26px; }
+.history-preview h3 { min-width: 0; flex: 1; margin: 0; overflow: hidden; color: var(--ink); font-size: 16px; line-height: 1.35; text-overflow: ellipsis; white-space: nowrap; }
+.history-view-switch { flex: 0 0 auto; display: flex; align-items: center; gap: 5px; }
+.history-view-switch button { height: 32px; display: inline-flex; align-items: center; gap: 5px; border: 1px solid #dbe4ee; border-radius: 9px; padding: 0 14px; background: #f5f8fb; color: #5b7089; cursor: pointer; font-size: 12px; font-weight: 700; }
+.history-view-switch button:hover, .history-view-switch button:focus-visible { border-color: #9fc4ee; background: #edf5ff; color: #2f75c5; }
+.history-view-switch button.is-active { border-color: transparent; background: linear-gradient(135deg, var(--teal), var(--blue)); color: #fff; box-shadow: 0 6px 14px rgba(47,128,237,.22); }
+.history-view-switch button svg { font-size: 16px; }
+.history-diff { min-width: 0; min-height: 0; flex: 1; display: flex; flex-direction: column; overflow: hidden; }
+.history-diff-hint { flex: 0 0 auto; margin: 8px 16px 0; border-radius: 9px; padding: 7px 11px; background: rgba(47,128,237,.08); color: #5b7089; font-size: 10px; font-weight: 700; }
+.history-diff .conflict-diff { margin-top: 8px; margin-bottom: 18px; }
+/* 统计条（「共 N 处差异」+ 上一处/下一处）只是元信息、不承载正文：历史弹窗里压薄一档，
+   把高度让给下面的对比内容。
+   🔴 只加在 `.history-diff` 下 —— `.conflict-diff*` 与冲突中心共享，那边维持原样。 */
+.history-diff .conflict-diff__bar { min-height: 30px; padding: 4px 10px; }
+.history-diff .conflict-diff__nav button { height: 22px; padding: 0 8px; }
+/* 历史版本的对比行比冲突中心要松一档：冲突中心一屏要尽量多放行以便人工核对，
+   这里更偏阅读，行贴着分隔线会挤。只加在 `.history-diff` 下，冲突中心不受影响。 */
+.history-diff .conflict-diff__column-head { min-height: 36px; }
+.history-diff .conflict-diff__cell { padding: 3px 12px 3px 0; }
+.history-diff .conflict-diff__no { font-size: 11px; }
+.history-diff .conflict-diff__text { min-height: 1.8em; font-size: 12px; line-height: 1.8; }
 .history-editor-preview { min-width: 0; min-height: 0; flex: 1; display: flex; overflow: hidden; }
 .history-editor-preview > .milkdown-editor-shell { min-height: 0; flex: 1; }
 .history-empty { flex: 1; display: grid; place-items: center; color: #8b98aa; font-size: 11px; }
@@ -577,6 +597,26 @@ html[data-theme="dark"] .markdown-rendered-doc {
   padding: 10px 12px;
   background: var(--rendered-doc-panel);
 }
+/* 信息列：文件夹 → 标题 → 摘要 → 底行。与编辑态卡片（NoteEmbedCard）同层级。 */
+.markdown-rendered-doc .markdown-embed-placeholder__body {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  flex: 1 1 auto;
+  min-width: 0;
+}
+/* 图标 + 文字同一套排版：编辑态的 `__meta` 也是 inline-flex + 3px gap。 */
+.markdown-rendered-doc .markdown-embed-placeholder__folder {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  color: var(--rendered-doc-quote);
+  font-size: 12px;
+  line-height: 1.4;
+}
+.markdown-rendered-doc .markdown-embed-placeholder__folder svg {
+  flex: 0 0 auto;
+}
 .markdown-rendered-doc .markdown-embed-placeholder__title {
   min-width: 0;
   overflow: hidden;
@@ -585,11 +625,31 @@ html[data-theme="dark"] .markdown-rendered-doc {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-.markdown-rendered-doc .markdown-embed-placeholder__meta {
-  flex: 0 0 auto;
-  margin-left: auto;
+/* 摘要固定两行：编辑态是 160 字 + 可展开，预览是死 HTML 做不了展开，用多行截断收口。 */
+.markdown-rendered-doc .markdown-embed-placeholder__excerpt {
+  display: -webkit-box;
+  overflow: hidden;
+  color: var(--rendered-doc-quote);
+  font-size: 13px;
+  line-height: 1.5;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+}
+.markdown-rendered-doc .markdown-embed-placeholder__foot {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 2px;
+}
+.markdown-rendered-doc .markdown-embed-placeholder__date {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
   color: var(--rendered-doc-quote);
   font-size: 12px;
+}
+.markdown-rendered-doc .markdown-embed-placeholder__date svg {
+  flex: 0 0 auto;
 }
 .milkdown-editor-shell {
   --markdown-content-width: 920px;
@@ -1769,6 +1829,9 @@ button:focus-visible { outline: 3px solid rgba(47,128,237,.22); outline-offset: 
   .conflict-view-switch > span { color: #899ab0; }
   .conflict-view-switch button { border-color: #30445f; background: #1a2b43; color: #b6c5d8; }
   .conflict-view-switch button:hover, .conflict-view-switch button:focus-visible { border-color: #4779ad; background: #203c59; color: #a4ceff; }
+  .history-view-switch button { border-color: #30445f; background: #1a2b43; color: #b6c5d8; }
+  .history-view-switch button:hover, .history-view-switch button:focus-visible { border-color: #4779ad; background: #203c59; color: #a4ceff; }
+  .history-diff-hint { background: rgba(47,128,237,.14); color: #9db0c6; }
   .conflict-diff { border-color: #2b3e58; background: #101d30; box-shadow: 0 5px 18px rgba(0,0,0,.35); }
   .conflict-diff__bar { border-color: #2b3e58; }
   .conflict-diff__stat { color: #e4ad58; }

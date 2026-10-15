@@ -6,7 +6,12 @@
  *   设计见 docs/specs/2026-09-03-note-embed-card.md「T2 落地设计」。
  *
  * markdown 表达（标准 HTML，往返无损、网页端可安全退化）：
- *   `<div data-xynote-embed="note:<id>" title="..."></div>`
+ *   `<div data-xynote-embed="note:<id>" data-xynote-embed-server="<serverId>" title="..."></div>`
+ *   —— `data-xynote-embed` 是**本机 uuid**（桌面端插入时写），`data-xynote-embed-server` 是
+ *      **跨端标识**（服务端主键）。两个属性互为补充，**任一存在即算一张嵌入卡**：
+ *      桌面端插入写前者（目标已同步时再补上后者），网页端插入只能写后者。
+ *      缺值的属性一律不输出（不写 `note:` 空值）。
+ *      设计见 docs/specs/2026-10-12-note-embed-web-render.md。
  *
  * 注意：若删除本文件，须同时移除 MarkdownVisualEditor.vue createEditor 里的
  *   `crepe.addFeature(installXynoteEmbedFeature)` 一行，方可整体回退。
@@ -19,12 +24,68 @@ import { dispatchEmbedCardMenu } from '../utils/note-open-events'
 
 /** 嵌入的 HTML 标记前缀：`<div data-xynote-embed="note:<id>">` */
 export const EMBED_TAG = 'data-xynote-embed'
+/**
+ * 嵌入卡的**跨端标识**属性：`data-xynote-embed-server="<serverId>"`。
+ *
+ * `data-xynote-embed` 是本机 uuid，本属性是服务端数字主键；网页端只认本属性。
+ * 目标笔记没有 serverId（尚未同步）时**不输出本属性**，网页端据此降级成占位卡片。
+ * 详见 docs/specs/2026-10-12-note-embed-web-render.md。
+ */
+export const EMBED_SERVER_TAG = 'data-xynote-embed-server'
 export const EMBED_MDAST_TYPE = 'xynoteEmbed'
 
 /** 从 html 文本里解析出 noteId（无匹配返回 null） */
 export function parseEmbedHtml(raw: string): string | null {
   const m = /data-xynote-embed=["']note:([^"']+)["']/.exec(raw)
   return m ? m[1] : null
+}
+
+/**
+ * 从 html 文本里解析出跨端标识 serverId（无匹配返回 null）。
+ *
+ * ⚠️ 属性名不能写成 `data-xynote-embed-server` 被 `data-xynote-embed` 的正则误吞：
+ * 前者是独立属性，取值不含 `note:` 前缀。
+ *
+ * @param raw 承载嵌入卡的 html 原文。
+ * @returns 服务端笔记主键；老卡片（无该属性）返回 null。
+ */
+export function parseEmbedServerId(raw: string): string | null {
+  const m = /data-xynote-embed-server=["']([^"']+)["']/.exec(raw)
+  return m ? m[1] : null
+}
+
+/**
+ * 从 html 文本里解析出**标题快照**（无该属性返回 null）。
+ *
+ * ⚠️ 必须取出来，否则往返会丢：`toMarkdown` 会写 `title="..."`，但 parseMarkdown 只在
+ * transformer 里取值 —— 少这一行，用户编辑正文后保存就会把 title 属性整体抹掉
+ * （卡片本身看不出异常，因为桌面端标题是实时查库得到的；受损的是网页端取数失败时的兜底标题）。
+ *
+ * 与 `toMarkdown` 的写法对称：不做 HTML 转义 / 反转义。标题里含半角双引号时本就写不出
+ * 合法属性（插入侧同样如此），属既有边界，不在本函数内单方面「修好」以免两端不等价。
+ *
+ * 属性前必须要求空白边界，避免匹配到 `data-xynote-embed-server` 之类名字里带 title 的属性。
+ *
+ * @param raw 承载嵌入卡的 html 原文。
+ * @returns 插入时的标题快照；卡片没有 title 属性时返回 null。
+ */
+export function parseEmbedTitle(raw: string): string | null {
+  const m = /(?:^|\s)title=["']([^"']*)["']/.exec(raw)
+  return m ? m[1] : null
+}
+
+/**
+ * 判断一段 html 是不是嵌入卡的载体 —— **两个标识属性任一存在**即算。
+ *
+ * 为什么不能只认 `data-xynote-embed`：网页端没有本机 uuid，插入卡片时只能写跨端标识
+ * `data-xynote-embed-server`。只认前者会让这类卡片在桌面端退化成源码文本
+ * （既认不出是卡片，也不会走 nodeView 渲染）。
+ *
+ * @param raw 承载嵌入卡的 html 原文。
+ * @returns 是嵌入卡载体返回 true。
+ */
+export function isEmbedHtml(raw: string): boolean {
+  return parseEmbedHtml(raw) != null || parseEmbedServerId(raw) != null
 }
 
 /**
@@ -65,10 +126,12 @@ export const embedRemarkTransformer = $remark('remarkXynoteEmbedTransformer', ()
   walkMdast(tree, (node, parent, index) => {
     // 情况一：root 直接子级就是 embed html（本插件若先于内置执行时兜底）
     if (node.type === 'html') {
-      const noteId = parseEmbedHtml(String(node.value ?? ''))
-      if (noteId == null) return
+      const raw = String(node.value ?? '')
+      if (!isEmbedHtml(raw)) return
       node.type = EMBED_MDAST_TYPE
-      node.noteId = noteId
+      node.noteId = parseEmbedHtml(raw) ?? ''
+      node.serverId = parseEmbedServerId(raw)
+      node.title = parseEmbedTitle(raw)
       return
     }
     // 情况二：embed html 已被内置 transformer 包进 paragraph（内置先执行的主路径）
@@ -76,11 +139,19 @@ export const embedRemarkTransformer = $remark('remarkXynoteEmbedTransformer', ()
     if (node.type === 'paragraph' && parent && index != null && parent.children) {
       const kids = node.children as any[]
       if (kids && kids.length === 1 && kids[0] && kids[0].type === 'html') {
-        const noteId = parseEmbedHtml(String(kids[0].value ?? ''))
-        if (noteId == null) return
-        const embedNode = kids[0] as { type: string; value?: string; noteId?: string }
+        const raw = String(kids[0].value ?? '')
+        if (!isEmbedHtml(raw)) return
+        const embedNode = kids[0] as {
+          type: string
+          value?: string
+          noteId?: string
+          serverId?: string | null
+          title?: string | null
+        }
         embedNode.type = EMBED_MDAST_TYPE
-        embedNode.noteId = noteId
+        embedNode.noteId = parseEmbedHtml(raw) ?? ''
+        embedNode.serverId = parseEmbedServerId(raw)
+        embedNode.title = parseEmbedTitle(raw)
         delete embedNode.value
         // 用提升后的 embed 节点替换外层 paragraph
         parent.children[index] = embedNode
@@ -92,9 +163,9 @@ export const embedRemarkTransformer = $remark('remarkXynoteEmbedTransformer', ()
 /**
  * noteEmbed 块级节点。
  * - block 节点：正文里作为独立一块
- * - attrs：noteId（被嵌入笔记 id）、title（可选，展示用）
- * - markdown 表达：`<div data-xynote-embed="note:<id>" title="..."></div>`（标准 HTML）
- *   往返经 remark transformer + 本 schema 的 parseMarkdown/toMarkdown 闭环，不发明方言
+ * - attrs：noteId（被嵌入笔记 id）、title（可选，展示用）、serverId（可选，跨端标识）
+ * - markdown 表达：`<div data-xynote-embed="note:<id>" data-xynote-embed-server="<serverId>" title="..."></div>`
+ *   （标准 HTML）往返经 remark transformer + 本 schema 的 parseMarkdown/toMarkdown 闭环，不发明方言
  */
 export const noteEmbedNodeSchema = $nodeSchema('xynoteEmbed', () => ({
   group: 'block',
@@ -109,16 +180,20 @@ export const noteEmbedNodeSchema = $nodeSchema('xynoteEmbed', () => ({
   draggable: false,
   attrs: {
     noteId: { default: '' },
-    title: { default: null as string | null }
+    title: { default: null as string | null },
+    // 跨端标识：目标笔记的云端 serverId（未同步为 null）。桌面端解析不依赖它。
+    serverId: { default: null as string | null }
   },
   parseDOM: [
     {
-      tag: 'div[data-xynote-embed]',
+      // 两个标识属性**任一存在**即认作嵌入卡：网页端插入的卡片只有 `data-xynote-embed-server`。
+      tag: 'div[data-xynote-embed], div[data-xynote-embed-server]',
       getAttrs: (dom) => {
         const el = dom as HTMLElement
         return {
           noteId: el.getAttribute('data-xynote-embed')?.replace(/^note:/, '') ?? '',
-          title: el.getAttribute('title')
+          title: el.getAttribute('title'),
+          serverId: el.getAttribute(EMBED_SERVER_TAG)
         }
       }
     }
@@ -126,19 +201,27 @@ export const noteEmbedNodeSchema = $nodeSchema('xynoteEmbed', () => ({
   toDOM: (node) => {
     const noteId = node.attrs.noteId as string
     const title = (node.attrs.title as string | null) ?? '笔记卡片'
+    const attrs: Record<string, string> = {
+      'data-embed-demo': 'true',
+      class: 'xynote-embed-demo'
+    }
+    // 本机 ID 为空说明这张卡是网页端插入后同步下来的（只带跨端标识）—— 不要写出 `note:` 空值。
+    if (noteId) attrs['data-xynote-embed'] = `note:${noteId}`
+    // 有 serverId 才输出，避免给未同步目标写出空属性（网页端据「有无」决定是否降级）。
+    const serverId = (node.attrs.serverId as string | null) ?? null
+    if (serverId) attrs[EMBED_SERVER_TAG] = String(serverId)
+    const suffix = noteId ? ` (note:${noteId})` : ''
     // ProseMirror 约定：toDOM 返回 DOMOutputSpec（数组描述），不可返回已创建的元素。
-    return [
-      'div',
-      { 'data-xynote-embed': `note:${noteId}`, 'data-embed-demo': 'true', class: 'xynote-embed-demo' },
-      `[嵌入卡片] ${title} (note:${noteId})`
-    ]
+    return ['div', attrs, `[嵌入卡片] ${title}${suffix}`]
   },
   parseMarkdown: {
     match: ({ type }) => type === EMBED_MDAST_TYPE,
     runner: (state, node, proseType) => {
+      const embedNode = node as { noteId?: string; title?: string | null; serverId?: string | null }
       state.addNode(proseType, {
-        noteId: (node as { noteId?: string }).noteId ?? '',
-        title: (node as { title?: string }).title ?? null
+        noteId: embedNode.noteId ?? '',
+        title: embedNode.title ?? null,
+        serverId: embedNode.serverId ?? null
       })
     }
   },
@@ -147,8 +230,13 @@ export const noteEmbedNodeSchema = $nodeSchema('xynoteEmbed', () => ({
     runner: (state, node) => {
       const id = (node.attrs.noteId as string) ?? ''
       const title = (node.attrs.title as string | null) ?? ''
+      const serverId = (node.attrs.serverId as string | null) ?? null
       const attr = title ? ` title="${title}"` : ''
-      state.addNode('html', undefined, `<div data-xynote-embed="note:${id}"${attr}></div>`)
+      // 跨端契约：属性顺序固定「本机标识 → 跨端标识 → 标题」，网页端序列化逐字节同此序。
+      // 缺值的属性一律不输出 —— 本机 ID 为空（网页端插入的卡片）时写出 `note:` 空值只会污染正文。
+      const idAttr = id ? ` data-xynote-embed="note:${id}"` : ''
+      const serverAttr = serverId ? ` ${EMBED_SERVER_TAG}="${serverId}"` : ''
+      state.addNode('html', undefined, `<div${idAttr}${serverAttr}${attr}></div>`)
     }
   }
 }))
@@ -163,14 +251,18 @@ export const noteEmbedView = $view(noteEmbedNodeSchema.node, () => (node: any, _
   const renderCard = (): void => {
     const noteId = (node.attrs.noteId as string) || ''
     const title = (node.attrs.title as string | null) ?? null
+    const serverId = (node.attrs.serverId as string | null) ?? null
     render(h(NoteEmbedCard, {
       noteId,
+      // 本机 ID 可能为空（网页端插入的卡片只带跨端标识），卡片据 serverId 取数。
+      serverId,
       title,
       // 右键卡片：nodeView 补上节点位置（getPos），交给编辑器复用正文右键菜单弹卡片操作项。
       onContextMenu: (payload: { x: number; y: number; available: boolean }) => {
         dispatchEmbedCardMenu({
           noteId,
           title,
+          serverId,
           pos: getPos() ?? -1,
           x: payload.x,
           y: payload.y,
@@ -188,8 +280,9 @@ export const noteEmbedView = $view(noteEmbedNodeSchema.node, () => (node: any, _
       if (nextNode.type !== node.type) return false
       const noteIdChanged = nextNode.attrs.noteId !== node.attrs.noteId
       const titleChanged = nextNode.attrs.title !== node.attrs.title
+      const serverIdChanged = nextNode.attrs.serverId !== node.attrs.serverId
       node = nextNode
-      if (noteIdChanged || titleChanged) renderCard()
+      if (noteIdChanged || titleChanged || serverIdChanged) renderCard()
       return true
     },
     destroy(): void {
