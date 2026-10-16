@@ -36,6 +36,7 @@
     "@types/node": "^24.13.2",
     "@vitejs/plugin-vue": "^6.0.7",
     "@vue/tsconfig": "^0.9.1",
+    "app-builder-bin": "^4.2.0",
     "concurrently": "^10.0.3",
     "electron": "^43.2.0",
     "electron-builder": "^26.15.3",
@@ -47,7 +48,7 @@
   "build": {
     "appId": "cn.lovethewind.notes.offline",
     "productName": "心悦笔记",
-    "artifactName": "xinyue-notes-macos-${version}-${arch}.${ext}",
+    "artifactName": "xinyue-notes-${os}-${version}-${arch}.${ext}",
     "protocols": [
       {
         "name": "心悦笔记浏览器登录",
@@ -93,6 +94,17 @@
           "y": 220,
           "type": "link",
           "path": "/Applications"
+        }
+      ]
+    },
+    "win": {
+      "icon": "build/icon.ico",
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
         }
       ]
     }
