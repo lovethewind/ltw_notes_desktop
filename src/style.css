@@ -740,6 +740,20 @@ html[data-theme="dark"] .markdown-rendered-doc {
   padding: 0;
 }
 /*
+  行内公式气泡抬到顶栏之上。
+  顶栏（见下方 `.milkdown-top-bar`）是 sticky + z-index 20 + 94% 底 + blur(16px)，
+  而 Crepe 没给这个气泡任何 z-index → 公式落在页面靠上时，气泡会滑进顶栏那一条带里被糊住，
+  看上去就是「弹窗和顶栏左侧的按钮叠在一起」。与链接气泡（z-index 30）同款兜底 ——
+  两者同在 div.milkdown 这个 stacking context 里，30 > 20 必然置顶。
+*/
+.milkdown-editor-root .milkdown .milkdown-latex-inline-edit { z-index: 30; }
+/*
+  气泡打开时块手柄让位：两者都往正文左侧挤（正文左内边距只有 34px 起，而块手柄自身宽 66px），
+  叠在一起分不清谁是谁；编辑公式时也用不到块手柄。
+  写法与 Crepe 自己收起手柄的 [data-show='false'] 一致（opacity + pointer-events，不触发重排）。
+*/
+.milkdown-editor-shell .milkdown-editor-root .milkdown:has(.milkdown-latex-inline-edit[data-show='true']) .milkdown-block-handle { opacity: 0; pointer-events: none; }
+/*
   标题体系对齐钉钉：Crepe 默认是 42/36/32/28/24/18px + 字重 400（Georgia 时代的设计），
   在窄窗口里一个 `# 标题` 能占掉半屏，且字重偏细、层级落差过大。
   这里收紧为 24/20/17/15.5/15/14px 并统一加粗，字号随 --markdown-body-font-size 等比缩放。

@@ -289,7 +289,7 @@ import {
   setBlockTypeCommand,
   wrapInBlockTypeCommand
 } from '@milkdown/kit/preset/commonmark'
-import { AllSelection, TextSelection } from '@milkdown/kit/prose/state'
+import { AllSelection, NodeSelection, TextSelection } from '@milkdown/kit/prose/state'
 import { Decoration, DecorationSet, type EditorView as ProseMirrorView } from '@milkdown/kit/prose/view'
 import { markdownToSlice, replaceAll } from '@milkdown/kit/utils'
 import { installXynoteEmbedFeature } from '../editor/xynote-embed'
@@ -3024,9 +3024,92 @@ function syncHistoryActionButtons(root: HTMLElement): void {
   })
 }
 
-/** 切换当前选区的行内公式格式。 */
+/**
+ * 判断当前选区里是否已经存在行内公式节点。
+ *
+ * 用来区分这次点「行内公式」是**包上**还是**拆掉**：选中的本来就是公式节点时，
+ * 即使 `textBetween` 是空串也必须放行（它是原子节点，取不到文字）。
+ *
+ * :param view: ProseMirror 视图。
+ * :return: 选区覆盖到 `math_inline` 节点时返回 true。
+ */
+function selectionHasInlineFormula(view: ProseMirrorView): boolean {
+  const mathType = view.state.schema.nodes.math_inline
+  if (!mathType) return false
+  const { from, to } = view.state.selection
+  let found = false
+  view.state.doc.nodesBetween(from, to, (node) => {
+    if (node.type === mathType) found = true
+    return true
+  })
+  return found
+}
+
+/**
+ * 切换当前选区的行内公式格式。
+ *
+ * ⚠️ 无选区时**绝不能**直接调 Crepe 的 `ToggleLatex`（2026-10-16 网页端先踩到，
+ * 桌面端同源同一份代码，一并补上）：该命令把 `doc.textBetween(from, to)` 当公式内容，
+ * 选区为空时取到空串 → 插进来一个**空公式节点**：屏幕上零宽、看不见（用户以为
+ * 「点了没反应」），序列化成 Markdown 却是一个孤零零的 `$$` —— 这行若落在行首/独占一行，
+ * 重新打开笔记时 remark 会把它当成**块级公式**的开头，把后面所有正文一口吞进公式里
+ * （数据损坏，得手动改源码才能救回）。
+ * 选区落在图片 / 嵌入卡这类原子节点上时 `textBetween` 同样是空串，会直接把卡片换掉。
+ *
+ * 所以先判定「选区里有可包的文字」或「选中的本来就是公式节点（这次是拆掉）」，
+ * 两者都不满足就只给提示，一个字都不动。
+ *
+ * :return: 无返回值。
+ */
 function toggleInlineFormula(): void {
-  editor?.editor.action((context) => context.get(commandsCtx).call('ToggleLatex'))
+  if (!editor || !editorReady || props.readonly || previewMode.value) return
+  const applied = editor.editor.action((context) => {
+    const view = context.get(editorViewCtx)
+    const { doc, selection } = view.state
+    const hasFormula = selectionHasInlineFormula(view)
+    if (!hasFormula && doc.textBetween(selection.from, selection.to, '\n').trim() === '') return false
+    context.get(commandsCtx).call('ToggleLatex')
+    // 命令执行后选区落在公式节点上却已失焦（点击落点被工具栏按钮抢走）；
+    // 把焦点交还编辑器，公式编辑气泡才会展开。
+    view.focus()
+    return true
+  })
+  if (!applied) showFeedback('请先选中要转成公式的文字')
+}
+
+/**
+ * 让「行内公式」编辑气泡的**确认按钮（勾）**顺手把气泡收起。
+ *
+ * ## ⚠️ 点勾为什么关不掉气泡（2026-10-16 用户报的坑，与网页端同源）
+ *
+ * Crepe 的 `LatexInlineTooltip` 只给那个按钮挂了 `pointerdown → updateValue`
+ * （把输入框里的文字写回 `math_inline` 节点的 `value`），**一个字都不动选区** ——
+ * 而气泡的显隐判据是 `selection instanceof NodeSelection && node.type.name === math_inline`，
+ * 光标还赖在公式节点上，判据继续成立，于是值写完了气泡还杵在原地。
+ *
+ * 这里补一刀：确认后把光标挪到公式节点**后面**，气泡自然收起
+ * （实测 `data-show` 由 `true` 转 `false`、`display` 转 `none`）。
+ * 想再改就再点一次公式 —— Crepe 会自动重新展开气泡。
+ *
+ * ⚠️ 必须注册在**冒泡**阶段：Crepe 的 handler 挂在那个 button 上，
+ * 冒泡阶段注册的监听一定排在它后面，读到的 `selection` 才是更新后的。
+ *
+ * :param event: 文档上的 pointerdown（事件委托，气泡每次显隐都复用同一个 DOM）。
+ * :return: 无返回值。
+ */
+function handleLatexBubbleConfirm(event: PointerEvent): void {
+  const target = event.target as HTMLElement | null
+  if (!target?.closest?.('.milkdown-latex-inline-edit button')) return
+  if (!editor || !editorReady || props.readonly || previewMode.value) return
+  editor.editor.action((context) => {
+    const view = context.get(editorViewCtx)
+    const { state } = view
+    if (!(state.selection instanceof NodeSelection)) return
+    // 光标落到公式节点之后（`near` 会自动夹到最近的合法文本位置，公式在段末也安全）。
+    const pos = Math.min(state.selection.to, state.doc.content.size)
+    view.dispatch(state.tr.setSelection(TextSelection.near(state.doc.resolve(pos), 1)))
+    view.focus()
+  })
 }
 
 /**
@@ -3496,6 +3579,9 @@ onMounted(() => {
   window.addEventListener('blur', clearLinkModifierState)
   document.addEventListener('pointerdown', closeImageContextMenu)
   document.addEventListener('pointerdown', closeEditorContextMenu)
+  // 行内公式气泡的确认按钮：Crepe 只管把值写回节点、不管收气泡，这里补一刀
+  // （原因见 handleLatexBubbleConfirm()）。走冒泡，才能排在 Crepe 挂在 button 上的 handler 之后。
+  document.addEventListener('pointerdown', handleLatexBubbleConfirm)
   // 捕获阶段：pointerdown 要先于 Crepe 的按钮处理打上标记，click 要先于 document 上冒泡阶段的
   // closeToolbarMenus 执行 —— 两条配套，见 trackBubbleFontSizePointerDown()。
   document.addEventListener('pointerdown', trackBubbleFontSizePointerDown, true)
@@ -3526,6 +3612,7 @@ onBeforeUnmount(() => {
   window.removeEventListener('blur', clearLinkModifierState)
   document.removeEventListener('pointerdown', closeImageContextMenu)
   document.removeEventListener('pointerdown', closeEditorContextMenu)
+  document.removeEventListener('pointerdown', handleLatexBubbleConfirm)
   editorScrollRef.value?.removeEventListener('scroll', closeImageContextMenu)
   editorScrollRef.value?.removeEventListener('scroll', closeEditorContextMenu)
   window.removeEventListener(EMBED_CARD_MENU_EVENT, handleEmbedCardMenu)
