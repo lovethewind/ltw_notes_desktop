@@ -1138,9 +1138,12 @@ function createRepository(database) {
   }
 
   /**
-   * 遍历全部未删除笔记，计算每篇正文里的本机地址能改写多少条。
+   * 遍历笔记，计算每篇正文里的本机地址能改写多少条。
    *
    * @param {string} webBaseUrl 网页版地址前缀。
+   * @param {Array<{ id: string, title: string, content: string }> | null} [rows] 指定待扫描的笔记；
+   *   省略时扫全库。给「同步完成后的提示」用：那条路径已经先用 SQL 把候选缩到含本机地址的笔记，
+   *   不必把全库正文再捞一遍（`totals.scannedNotes` 随之表示「实际扫描的篇数」）。
    * @returns {{
    *   totals: {
    *     scannedNotes: number, linkedNotes: number, totalLinks: number,
@@ -1149,8 +1152,8 @@ function createRepository(database) {
    *   affected: Array<{ id: string, title: string, content: string, changed: number }>
    * }} 统计与待改写项。
    */
-  function collectLocalNoteLinkRewrite(webBaseUrl) {
-    const rows = database.prepare("SELECT id, title, content FROM notes WHERE is_deleted = 0").all()
+  function collectLocalNoteLinkRewrite(webBaseUrl, rows = null) {
+    const scannedRows = rows || database.prepare("SELECT id, title, content FROM notes WHERE is_deleted = 0").all()
     const findTarget = database.prepare(
       "SELECT id, server_id FROM notes WHERE id = ? AND is_deleted = 0"
     )
@@ -1164,7 +1167,7 @@ function createRepository(database) {
       return resolved
     }
     const totals = {
-      scannedNotes: rows.length,
+      scannedNotes: scannedRows.length,
       linkedNotes: 0,
       totalLinks: 0,
       convertibleLinks: 0,
@@ -1173,7 +1176,7 @@ function createRepository(database) {
       noWebBaseLinks: 0
     }
     const affected = []
-    for (const row of rows) {
+    for (const row of scannedRows) {
       const outcome = rewriteLocalNoteLinksInContent(row.content, { resolveTarget, webBaseUrl })
       if (!outcome.total) continue
       totals.linkedNotes += 1
@@ -1225,6 +1228,38 @@ function createRepository(database) {
         title: item.title,
         changed: item.changed
       }))
+    }
+  }
+
+  /**
+   * 同步完成时的提示用：本轮新同步上去的笔记，是不是让正文里的本机地址「现在可以转」了。
+   *
+   * 与 `previewLocalNoteLinkRewrite`（用户主动点「本机地址转为线上地址」）同一套口径，区别只在
+   * **扫描范围**：这里先用 SQL 把候选缩到「正文里还含本机地址写法」的笔记 —— 绝大多数正文没有
+   * 这种地址，别让每次同步都把全库正文捞进 JS 跑一遍正则。
+   *
+   * 返回 `null` 表示「没什么可说的」（没有候选 / 没配网页地址 / 一条都转不了）；同步完成面板
+   * 据此决定要不要出声。**全程只读，不改任何数据** —— 真改写仍要用户点确认。
+   *
+   * @param {string} webBaseUrl 网页版地址前缀（来自同步设置）。
+   * @returns {{ convertibleNotes: number, convertibleLinks: number, unsyncedLinks: number, missingLinks: number } | null}
+   *   可转范围；没有可提示的内容时为 `null`。
+   */
+  function previewLocalNoteLinkHint(webBaseUrl) {
+    // LIKE 里的两个字面量不含 `%` / `_`，无需转义。两处写法与 `local-note-links.cjs` 同口径。
+    const rows = database.prepare(`
+      SELECT id, title, content FROM notes
+      WHERE is_deleted = 0
+        AND (content LIKE '%xinyue-note.local%' OR content LIKE '%xinyue-notes://note/%')
+    `).all()
+    if (!rows.length) return null
+    const { totals, affected } = collectLocalNoteLinkRewrite(webBaseUrl, rows)
+    if (!totals.convertibleLinks) return null
+    return {
+      convertibleNotes: affected.length,
+      convertibleLinks: totals.convertibleLinks,
+      unsyncedLinks: totals.unsyncedLinks,
+      missingLinks: totals.missingLinks
     }
   }
 
@@ -2379,12 +2414,21 @@ function createRepository(database) {
    *
    * @param {Record<string, any>} result 云端同步结果。
    * @param {number[] | null} acknowledgedOutboxIds 本轮已发送并可确认的待同步记录 ID。
-   * @returns {{ conflictCount: number }} 应用结果。
+   * @returns {{ conflictCount: number, newlySyncedNoteIds: string[] }} 应用结果。
+   *   `newlySyncedNoteIds` = 本轮**从「没有 server_id」变成有**的笔记：同步完成后的
+   *   「本机地址可以转网页地址了」提示只看这批，不必每次同步都去扫全库。
    */
   const applySyncResult = database.transaction((result, acknowledgedOutboxIds = null) => {
     const snapshot = result.snapshot || { folders: [], tags: [], notes: [] }
     const hasHistorySnapshot = Array.isArray(snapshot.histories)
     const conflictIds = new Set(result.conflictClientIds || [])
+    // 先一次性取「已经同步过的笔记」，避免为每条映射单查一次（首次全量同步时映射会很多）。
+    const alreadySyncedNoteIds = new Set(
+      database.prepare("SELECT id FROM notes WHERE server_id IS NOT NULL AND server_id <> ''")
+        .all()
+        .map((row) => String(row.id))
+    )
+    const newlySyncedNoteIds = []
     for (const mapping of result.mappings || []) {
       const tableName = mapping.entityType === "folder"
         ? "folders"
@@ -2394,6 +2438,13 @@ function createRepository(database) {
         SET server_id = ?, server_updated_at = ?
         WHERE id = ?
       `).run(String(mapping.serverId), mapping.updatedAt || null, mapping.clientId)
+      if (
+        tableName === "notes"
+        && mapping.serverId
+        && !alreadySyncedNoteIds.has(String(mapping.clientId))
+      ) {
+        newlySyncedNoteIds.push(String(mapping.clientId))
+      }
     }
 
     for (const clientId of conflictIds) {
@@ -2689,7 +2740,7 @@ function createRepository(database) {
       INSERT INTO sync_state(key, value) VALUES ('last_success_at', ?)
       ON CONFLICT(key) DO UPDATE SET value = excluded.value
     `).run(nowIso())
-    return { conflictCount: conflictIds.size }
+    return { conflictCount: conflictIds.size, newlySyncedNoteIds }
   })
 
   /**
@@ -2730,6 +2781,7 @@ function createRepository(database) {
     getNoteGraph,
     getGlobalGraph,
     previewLocalNoteLinkRewrite,
+    previewLocalNoteLinkHint,
     rewriteLocalNoteLinks,
     previewEmbedServerIdFill,
     fillEmbedServerIds,

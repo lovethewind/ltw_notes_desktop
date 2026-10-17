@@ -162,6 +162,23 @@ export interface SyncResultChange {
   occurredAt: string
 }
 
+/**
+ * 同步完成时「本机地址可以转网页地址了」的提示范围。
+ *
+ * 只是**只读统计**，不代表已经改过任何正文 —— 真改写仍要用户点确认。
+ * 后端只在「本轮确实有新笔记拿到 serverId」且「库里有可转的本机地址」时才带这个字段。
+ */
+export interface SyncLocalLinkHint {
+  /** 涉及多少篇笔记的正文。 */
+  convertibleNotes: number
+  /** 能转成网页地址的链接条数。 */
+  convertibleLinks: number
+  /** 目标笔记尚未同步、这次转不了的条数。 */
+  unsyncedLinks: number
+  /** 目标笔记已不存在的条数。 */
+  missingLinks: number
+}
+
 export interface SyncResultSummary {
   startedAt: string
   completedAt: string
@@ -172,6 +189,8 @@ export interface SyncResultSummary {
   attachmentCount: number
   conflictCount: number
   changes: SyncResultChange[]
+  /** 本次同步让某些本机笔记地址「可以转」时才有；没有可提示内容时不带这个字段。 */
+  localLinkHint?: SyncLocalLinkHint | null
 }
 
 export interface UpdateCheckResult {

@@ -1106,6 +1106,20 @@ async function confirmLocalNoteLinkRewrite(): Promise<void> {
 }
 
 /**
+ * 从「同步完成」面板直接去处理本机笔记地址。
+ *
+ * 先收起同步窗口，再打开数据管理并触发**既有**的预览 —— 这里不另起一套确认 UI，
+ * 「先给清单再确认」的形态与入口都保持唯一（与冲突中心同一条原则）。
+ *
+ * :return: 操作完成后的 Promise。
+ */
+async function openLocalLinkRewriteFromSync(): Promise<void> {
+  syncDialogVisible.value = false
+  openDataTransfer()
+  await previewLocalNoteLinkRewrite()
+}
+
+/**
  * 把预览里「保持原样」的各条数与原因拼成一句话。
  *
  * 三种原因必须分开说：目标未同步是「等同步完再来一次」，目标不存在是「这条链接已经废了」，
@@ -4682,6 +4696,20 @@ onBeforeUnmount(() => {
                 <article class="delete"><Icon icon="tabler:trash" /><div><small>删除</small><strong>{{ syncStatus.lastResult.deletedCount }}</strong></div></article>
                 <article class="attachment"><Icon icon="tabler:paperclip" /><div><small>附件</small><strong>{{ syncStatus.lastResult.attachmentCount }}</strong></div></article>
               </div>
+            </section>
+
+            <!-- 「先插链接、目标后同步」的残留：同步让某些本机地址变得可转了。
+                 只提示、不改写 —— 点「去转换」走的是数据管理里既有的「先给清单再确认」。 -->
+            <section v-if="syncStatus.lastResult.localLinkHint" class="sync-result-local-links">
+              <Icon icon="tabler:link" />
+              <div>
+                <strong>有本机链接可以换成线上地址了</strong>
+                <small>
+                  这次同步让 {{ syncStatus.lastResult.localLinkHint.convertibleNotes }} 篇笔记里的
+                  {{ syncStatus.lastResult.localLinkHint.convertibleLinks }} 条本机链接可以换掉；换掉后网页端就能直接打开<template v-if="syncStatus.lastResult.localLinkHint.unsyncedLinks">。另有 {{ syncStatus.lastResult.localLinkHint.unsyncedLinks }} 条的目标笔记还没同步，下次同步后会出现</template>。
+                </small>
+              </div>
+              <button type="button" @click="openLocalLinkRewriteFromSync">去转换</button>
             </section>
 
             <section class="sync-result-detail-section">

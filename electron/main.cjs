@@ -1359,6 +1359,20 @@ async function performSync() {
         startedAt,
         completedAt: lastSuccessAt
       })
+      // 「先插链接、目标后同步」是本机笔记地址最常见的残留场景（`buildNoteHref` 只在插入那一刻
+      // 决定地址）。这里只在**本轮确实有新笔记拿到 serverId** 时才去看一眼有没有可转的 ——
+      // 候选范围由 repository 侧用 SQL 收窄，不做全库正则。
+      // ⚠️ 只提示、**绝不改写**：批量改写用户正文必须由用户确认后执行，
+      // 见 docs/specs/2026-09-05-note-link-online-url.md 的「存量不清扫、不迁移」。
+      if (applied.newlySyncedNoteIds?.length) {
+        try {
+          const localLinkHint = repository.previewLocalNoteLinkHint(syncSettings.webUrl)
+          if (localLinkHint) lastResult.localLinkHint = localLinkHint
+        } catch (error) {
+          // 提示算不出来不该影响同步成功这件事本身。
+          console.warn("统计可转的本机笔记地址失败，本次跳过提示", error)
+        }
+      }
       const message = applied.conflictCount
         ? `已同步，保留 ${applied.conflictCount} 个冲突副本`
         : "已同步到云端"

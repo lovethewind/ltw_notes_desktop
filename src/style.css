@@ -1219,6 +1219,13 @@ html[data-theme="dark"] .markdown-rendered-doc {
 .sync-result-metrics .download > svg { background: #eaf3ff; color: #347fd2; }
 .sync-result-metrics .delete > svg { background: #fff0f1; color: #d75862; }
 .sync-result-metrics .attachment > svg { background: #f2edff; color: #7d5bd6; }
+.sync-result-local-links { margin-top: 12px; display: flex; align-items: center; gap: 10px; border: 1px solid #cfe0f7; border-radius: 13px; padding: 10px 12px; background: linear-gradient(135deg, #f2f7ff, #f8fbff); }
+.sync-result-local-links > svg { width: 30px; height: 30px; flex: 0 0 auto; border-radius: 9px; padding: 7px; background: #e6f0ff; color: #347fd2; }
+.sync-result-local-links > div { min-width: 0; display: grid; gap: 2px; }
+.sync-result-local-links strong { color: #2d4a6b; font-size: 12px; }
+.sync-result-local-links small { color: #7386a1; font-size: 9px; line-height: 1.5; }
+.sync-result-local-links button { margin-left: auto; flex: 0 0 auto; border: 1px solid #c3d9f5; border-radius: 9px; padding: 6px 12px; background: #fff; color: #2f6fbe; font-size: 10px; font-weight: 600; cursor: pointer; }
+.sync-result-local-links button:hover { border-color: #a9c8ee; background: #f0f6ff; }
 .sync-result-detail-section { margin-top: 14px; }
 .sync-result-section-heading { display: flex; align-items: center; justify-content: space-between; margin-bottom: 7px; padding: 0 2px; }
 .sync-result-section-heading strong { color: #344a65; font-size: 12px; }
