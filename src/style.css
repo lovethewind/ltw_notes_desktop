@@ -1494,7 +1494,9 @@ button:focus-visible { outline: 3px solid rgba(47,128,237,.22); outline-offset: 
   .milkdown-editor-root .milkdown .milkdown-top-bar .top-bar-item { flex-basis: 38px; }
   .milkdown-editor-root .milkdown .milkdown-top-bar .top-bar-divider { margin-inline: 4px; }
   .milkdown-editor-shell.has-outline { grid-template-columns: minmax(0, 1fr); }
-  .markdown-outline { position: absolute; z-index: 30; top: 58px; right: 0; bottom: 0; display: flex; width: min(270px, calc(100% - 28px)); border-top: 1px solid var(--line); box-shadow: -18px 12px 40px rgba(31,54,84,.14); }
+  /* 浮层压在正文上，基础样式的半透明底会让底下的字透出来（两行文字叠一起看着像花了）。
+     这里换成实色：并排时透一点没关系，盖住正文时必须干净。 */
+  .markdown-outline { position: absolute; z-index: 30; top: 58px; right: 0; bottom: 0; display: flex; width: min(270px, calc(100% - 28px)); border-top: 1px solid var(--line); background: #f9fcff; box-shadow: -18px 12px 40px rgba(31,54,84,.14); }
 }
 
 @media (min-width: 1600px) {

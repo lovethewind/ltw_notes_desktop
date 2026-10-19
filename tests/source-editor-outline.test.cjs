@@ -19,7 +19,7 @@ const source = () => readSource('src/components/MarkdownSourceEditor.vue')
 test('模式条上有大纲开关与复制按钮，两者都指向同一块侧栏', () => {
   const text = source()
 
-  assert.match(text, /class="markdown-source-editor__outline"/)
+  assert.match(text, /class="markdown-source-editor__outline-toggle"/)
   assert.match(text, /aria-controls="source-editor-outline-panel"/)
   assert.match(text, /:aria-pressed="outlineOpen"/)
   assert.match(text, /@click="toggleOutline"/)
@@ -29,10 +29,36 @@ test('模式条上有大纲开关与复制按钮，两者都指向同一块侧�
   assert.match(text, /id="source-editor-outline-panel"/)
 })
 
+/**
+ * 开关按钮与侧栏不许共用一个类名。
+ *
+ * 曾经两者都叫 `markdown-source-editor__outline`：侧栏的 `flex: 0 0 270px` 把按钮撑成
+ * 270px 宽的浅蓝色条，按钮的 `width/height: 26px` 又把侧栏压成 26×26 的小方块
+ * （窄窗口下大纲浮层整块塌掉，只剩几十像素）。两组规则必须落在不同类名上。
+ */
+test('大纲开关与侧栏不共用类名，避免两条样式互相污染', () => {
+  const text = source()
+  const classOf = (pattern) => {
+    const match = text.match(pattern)
+    return match ? match[1].split(/\s+/) : []
+  }
+  const buttonClasses = classOf(/<button[^>]*class="([^"]*markdown-source-editor__[^"]*)"/)
+  const asideClasses = classOf(/<aside[^>]*class="([^"]*)"/)
+  assert.ok(buttonClasses.includes('markdown-source-editor__outline-toggle'))
+  assert.ok(asideClasses.includes('markdown-source-editor__outline-panel'))
+  assert.deepEqual(
+    buttonClasses.filter((name) => asideClasses.includes(name)),
+    [],
+    '开关按钮与大纲侧栏不能共享任何类名'
+  )
+  // 侧栏的宽度规则只能落在 panel 类上；写回共用的 __outline 就会再撑宽按钮。
+  assert.match(text, /\.markdown-source-editor__outline-panel \{ flex: 0 0 var\(--source-editor-outline-width\); \}/)
+})
+
 test('大纲侧栏复用笔记那套全局样式，不在组件里另写一份', () => {
   const text = source()
 
-  assert.match(text, /class="markdown-outline markdown-source-editor__outline"/)
+  assert.match(text, /class="markdown-outline markdown-source-editor__outline-panel"/)
   assert.match(text, /class="markdown-outline__header"/)
   assert.match(text, /class="markdown-outline__list"/)
   assert.match(text, /class="markdown-outline-item"/)

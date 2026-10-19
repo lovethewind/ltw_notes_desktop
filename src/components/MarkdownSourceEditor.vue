@@ -593,9 +593,14 @@ watch(
         大纲开关与「复制 Markdown」放在这条模式条上 —— 与笔记编辑器完全同构。
         两者都是「只读正文」的操作，源码态与预览态都该按得到，所以不放 App 的文件标题栏。
       -->
+      <!--
+        开关与侧栏必须是两个类名：曾经共用一个 `markdown-source-editor__outline`，
+        结果按钮吃到了侧栏的 `flex: 0 0 270px`（被撑成宽条），
+        侧栏反过来吃到按钮的 `width/height: 26px`（塌成一个小方块）。见下方样式注释。
+      -->
       <button
         type="button"
-        class="markdown-source-editor__outline"
+        class="markdown-source-editor__outline-toggle"
         :class="{ 'is-active': outlineOpen }"
         :aria-pressed="outlineOpen"
         aria-controls="source-editor-outline-panel"
@@ -665,7 +670,7 @@ watch(
       <aside
         v-if="outlineOpen"
         id="source-editor-outline-panel"
-        class="markdown-outline markdown-source-editor__outline"
+        class="markdown-outline markdown-source-editor__outline-panel"
         aria-label="文件大纲"
       >
         <header class="markdown-outline__header">
@@ -788,8 +793,9 @@ html[data-theme="dark"] .markdown-source-editor {
 .markdown-source-editor__hint { min-width: 0; flex: 1; overflow: hidden; color: #a9b5c5; font-weight: 500; letter-spacing: 0; text-overflow: ellipsis; white-space: nowrap; }
 
 /* 模式条上的两个图标按钮（大纲开关 / 复制 Markdown）—— 与笔记模式条同一套外观。
-   合并成多行选择器后，靠正则锚「单行选择器」的断言会静默失效，所以这里改用类名断言守卫。 */
-.markdown-source-editor__outline,
+   合并成多行选择器后，靠正则锚「单行选择器」的断言会静默失效，所以这里改用类名断言守卫。
+   ⚠️ 这里只写按钮：侧栏是 `.markdown-source-editor__outline-panel`，两者绝不能共用一个类名。 */
+.markdown-source-editor__outline-toggle,
 .markdown-source-editor__copy {
   flex: 0 0 auto;
   width: 26px;
@@ -803,13 +809,14 @@ html[data-theme="dark"] .markdown-source-editor {
   color: #7d8b9e;
   cursor: pointer;
 }
-.markdown-source-editor__outline:hover,
+.markdown-source-editor__outline-toggle:hover,
 .markdown-source-editor__copy:hover { background: rgba(47, 128, 237, .09); color: #4a7fc1; }
-.markdown-source-editor__outline.is-active { background: rgba(47, 128, 237, .13); color: #2268c7; }
+.markdown-source-editor__outline-toggle.is-active { background: rgba(47, 128, 237, .13); color: #2268c7; }
 
 /* 正文区：源码 / 预览与大纲侧栏并排；模式条在上方横跨整宽，与笔记的网格同构。 */
 .markdown-source-editor__body { min-height: 0; flex: 1; display: flex; }
-.markdown-source-editor__outline { flex: 0 0 var(--source-editor-outline-width); }
+/* 只有侧栏吃宽度；写成 `__outline` 会把模式条上的按钮一起撑成 270px 宽。 */
+.markdown-source-editor__outline-panel { flex: 0 0 var(--source-editor-outline-width); }
 
 /* 窄窗口下全局样式会把 .markdown-outline 变成浮层（见 src/style.css），
    落点得改到模式条正下方，否则会盖住顶栏。 */
@@ -847,11 +854,11 @@ html[data-theme="dark"] .markdown-source-editor__modes { background: rgba(120, 1
 html[data-theme="dark"] .markdown-source-editor__mode-button { color: #8496ad; }
 html[data-theme="dark"] .markdown-source-editor__mode-button:hover { color: #9dc3f2; }
 html[data-theme="dark"] .markdown-source-editor__mode-button.is-active { background: #1b2b42; color: #a9cdf7; }
-html[data-theme="dark"] .markdown-source-editor__outline,
+html[data-theme="dark"] .markdown-source-editor__outline-toggle,
 html[data-theme="dark"] .markdown-source-editor__copy { color: #8496ad; }
-html[data-theme="dark"] .markdown-source-editor__outline:hover,
+html[data-theme="dark"] .markdown-source-editor__outline-toggle:hover,
 html[data-theme="dark"] .markdown-source-editor__copy:hover { background: rgba(120, 168, 235, .14); color: #9dc3f2; }
-html[data-theme="dark"] .markdown-source-editor__outline.is-active { background: rgba(120, 168, 235, .2); color: #a9cdf7; }
+html[data-theme="dark"] .markdown-source-editor__outline-toggle.is-active { background: rgba(120, 168, 235, .2); color: #a9cdf7; }
 
 /* 预览区：只读渲染，自己滚动。
    文档元素本身的排版在 style.css 的 `.markdown-rendered-doc`（与笔记预览共用一份），

@@ -666,6 +666,15 @@ test('本地文件的大纲：源码模式点标题定位光标，预览模式�
     // 侧栏默认展开（偏好键与笔记共用，隔离数据目录里取的是默认值）。
     const items = page.locator('.markdown-source-editor .markdown-outline-item')
     await items.first().waitFor()
+    // 几何尺寸要按「图标按钮 + 整列侧栏」来：两者曾经共用一个类名，按钮被撑成
+    // 270px 宽的浅蓝条、侧栏被压成 26×26 的小方块，内容全被裁掉。
+    const toggleBox = await page.locator('.markdown-source-editor__outline-toggle').boundingBox()
+    assert.ok(toggleBox && toggleBox.width <= 40, `大纲开关应是窄图标按钮，实际宽 ${toggleBox?.width}`)
+    const panelBox = await page.locator('aside.markdown-outline').boundingBox()
+    assert.ok(
+      panelBox && panelBox.width >= 200 && panelBox.height >= 200,
+      `大纲侧栏应占满一列，实际 ${panelBox?.width}×${panelBox?.height}`
+    )
     assert.deepEqual(
       (await items.allInnerTexts()).map((text) => text.trim()),
       ['第一章 开篇', '第二章 展开', '第三章 收尾']
