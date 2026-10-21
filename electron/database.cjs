@@ -669,6 +669,258 @@ function createRepository(database) {
     return true
   }
 
+  /*
+   * ===== AI 对话历史（只在本机、只跟当前档案库） =====
+   *
+   * 只存「已完成」的轮次：流式失败或中途关面板留下的半截回答不落库，
+   * 否则恢复出来的对话里会夹着一条永远写不完的回答。
+   *
+   * 不参与同步：跨端契约里没有 AI 会话，网页端也没有对应界面；
+   * 会话里的正文片段属于敏感内容，留在本机更可控。
+   */
+
+  /** 会话保留条数上限。 */
+  const AI_CONVERSATION_LIMIT = 50
+  /** 会话保留天数上限。 */
+  const AI_CONVERSATION_MAX_AGE_DAYS = 30
+  /** 单条来源摘要在库里的最大长度，防止把整篇笔记塞进来。 */
+  const AI_SOURCE_EXCERPT_LIMIT = 400
+
+  /** 把问题压成一行标题，用于历史列表。 */
+  function aiConversationTitle(question) {
+    const flattened = String(question || "").replace(/\s+/g, " ").trim()
+    if (!flattened) return "新对话"
+    return flattened.length > 30 ? `${flattened.slice(0, 30)}…` : flattened
+  }
+
+  /** 归一化来源数组，顺手截断超长摘要。 */
+  function normalizeAiSources(sources) {
+    if (!Array.isArray(sources)) return []
+    return sources.slice(0, 12).map((source) => ({
+      id: String(source?.id || ""),
+      noteId: String(source?.noteId || ""),
+      title: String(source?.title || ""),
+      excerpt: String(source?.excerpt || "").slice(0, AI_SOURCE_EXCERPT_LIMIT),
+      // 长笔记只取了前 N 字：恢复历史时这条提示也得跟着回来。
+      truncated: Boolean(source?.truncated)
+    }))
+  }
+
+  /** 按「最近 50 条 / 30 天」清理旧会话，连带轮次一起走。 */
+  function pruneAiConversations() {
+    const cutoff = new Date(
+      Date.now() - AI_CONVERSATION_MAX_AGE_DAYS * 24 * 60 * 60 * 1000
+    ).toISOString()
+    // 置顶的会话不受时间线约束：用户手动钉住的对话，不该因为「30 天没问」被清掉。
+    database.prepare("DELETE FROM ai_conversations WHERE updated_at < ? AND pinned = 0").run(cutoff)
+    // 条数上限里先扣掉置顶占的名额，剩下的才轮到普通会话按新旧裁。
+    const pinnedCount = Number(
+      database.prepare("SELECT COUNT(*) AS total FROM ai_conversations WHERE pinned = 1").get()?.total
+    ) || 0
+    database.prepare(`
+      DELETE FROM ai_conversations
+      WHERE pinned = 0 AND id NOT IN (
+        SELECT id FROM ai_conversations
+        WHERE pinned = 0
+        ORDER BY updated_at DESC, rowid DESC
+        LIMIT ?
+      )
+    `).run(Math.max(0, AI_CONVERSATION_LIMIT - pinnedCount))
+  }
+
+  /**
+   * 列出历史会话，置顶在前、其余最新在前；不带轮次正文，列表页用不到。
+   *
+   * `keyword` 非空时按标题或任意一轮的提问做子串匹配。搜提问而不只搜标题：
+   * 标题只截了第一个问题的前 30 字，追问里的关键词否则永远搜不到。
+   */
+  function listAiConversations(keyword) {
+    const term = String(keyword || "").replace(/\s+/g, " ").trim()
+    const params = []
+    let where = ""
+    if (term) {
+      // LIKE 里的 % _ \ 要先转义，否则用户输入「100%」会变成通配。
+      const like = `%${term.replace(/[\\%_]/g, (character) => `\\${character}`)}%`
+      where = `
+        WHERE conversation.title LIKE ? ESCAPE '\\'
+           OR EXISTS (
+             SELECT 1 FROM ai_conversation_turns hit
+             WHERE hit.conversation_id = conversation.id
+               AND hit.question LIKE ? ESCAPE '\\'
+           )`
+      params.push(like, like)
+    }
+    return database.prepare(`
+      SELECT conversation.id AS id,
+             conversation.title AS title,
+             conversation.pinned AS pinned,
+             conversation.created_at AS createdAt,
+             conversation.updated_at AS updatedAt,
+             COUNT(turn.id) AS turnCount
+      FROM ai_conversations conversation
+      LEFT JOIN ai_conversation_turns turn ON turn.conversation_id = conversation.id
+      ${where}
+      GROUP BY conversation.id
+      -- updated_at 只到毫秒，连续操作会打平；用 rowid 兜底才符合「后动的在前」。
+      ORDER BY conversation.pinned DESC, conversation.updated_at DESC, conversation.rowid DESC
+    `).all(...params).map((row) => ({
+      id: row.id,
+      title: row.title,
+      pinned: Boolean(row.pinned),
+      createdAt: row.createdAt,
+      updatedAt: row.updatedAt,
+      turnCount: Number(row.turnCount) || 0
+    }))
+  }
+
+  /** 读一整个会话（含轮次）；不存在时返回 null。 */
+  function getAiConversation(conversationId) {
+    const normalizedId = String(conversationId || "").trim()
+    if (!normalizedId) return null
+    const conversation = database.prepare(`
+      SELECT id, title, pinned, created_at AS createdAt, updated_at AS updatedAt
+      FROM ai_conversations WHERE id = ?
+    `).get(normalizedId)
+    if (!conversation) return null
+    const turns = database.prepare(`
+      SELECT id, question, answer, sources_json AS sourcesJson,
+             citation_missing AS citationMissing, created_at AS createdAt
+      FROM ai_conversation_turns
+      WHERE conversation_id = ?
+      ORDER BY position ASC
+    `).all(normalizedId).map((row) => {
+      let sources = []
+      try {
+        const parsed = JSON.parse(row.sourcesJson || "[]")
+        sources = normalizeAiSources(parsed)
+      } catch {
+        sources = []
+      }
+      return {
+        id: row.id,
+        question: row.question,
+        answer: row.answer,
+        sources,
+        citationMissing: Boolean(row.citationMissing),
+        createdAt: row.createdAt
+      }
+    })
+    return { ...conversation, pinned: Boolean(conversation.pinned), turns }
+  }
+
+  /**
+   * 追加一轮已完成的问答。
+   *
+   * `conversationId` 为空时按需新建（渲染层点「＋」不会立刻落库，
+   * 避免出现一堆没问过话的空会话）。返回真实的会话 ID 供界面回填。
+   */
+  const appendAiConversationTurn = database.transaction((input = {}) => {
+    const question = String(input.question || "").trim()
+    const answer = String(input.answer || "").trim()
+    if (!question || !answer) return null
+    const timestamp = nowIso()
+    let conversationId = String(input.conversationId || "").trim()
+    const existing = conversationId
+      ? database.prepare("SELECT id FROM ai_conversations WHERE id = ?").get(conversationId)
+      : null
+    if (!existing) {
+      conversationId = randomUUID()
+      database.prepare(`
+        INSERT INTO ai_conversations(id, title, created_at, updated_at)
+        VALUES (?, ?, ?, ?)
+      `).run(conversationId, aiConversationTitle(question), timestamp, timestamp)
+      pruneAiConversations()
+    }
+    const position = Number(database.prepare(`
+      SELECT COALESCE(MAX(position), -1) + 1 AS next FROM ai_conversation_turns
+      WHERE conversation_id = ?
+    `).get(conversationId)?.next) || 0
+    const turnId = randomUUID()
+    database.prepare(`
+      INSERT INTO ai_conversation_turns(
+        id, conversation_id, position, question, answer, sources_json, citation_missing, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      turnId,
+      conversationId,
+      position,
+      question,
+      answer,
+      JSON.stringify(normalizeAiSources(input.sources)),
+      input.citationMissing ? 1 : 0,
+      timestamp
+    )
+    database.prepare("UPDATE ai_conversations SET updated_at = ? WHERE id = ?")
+      .run(timestamp, conversationId)
+    return { conversationId, turnId }
+  })
+
+  /**
+   * 重写某一轮的回答（界面上的「重新生成」）。
+   *
+   * 只换答案与来源，不动问题、位置和会话：重答不该让这一轮在会话里换顺序，
+   * 也不该在历史里多出一条一模一样的提问。
+   */
+  const replaceAiConversationTurn = database.transaction((input = {}) => {
+    const turnId = String(input.turnId || "").trim()
+    const answer = String(input.answer || "").trim()
+    if (!turnId || !answer) return false
+    const existing = database.prepare(
+      "SELECT conversation_id AS conversationId FROM ai_conversation_turns WHERE id = ?"
+    ).get(turnId)
+    if (!existing) return false
+    database.prepare(`
+      UPDATE ai_conversation_turns
+      SET answer = ?, sources_json = ?, citation_missing = ?
+      WHERE id = ?
+    `).run(
+      answer,
+      JSON.stringify(normalizeAiSources(input.sources)),
+      input.citationMissing ? 1 : 0,
+      turnId
+    )
+    database.prepare("UPDATE ai_conversations SET updated_at = ? WHERE id = ?")
+      .run(nowIso(), existing.conversationId)
+    return true
+  })
+
+  /**
+   * 重命名会话。
+   *
+   * 故意不动 `updated_at`：改名是整理动作，不该把一条旧对话顶到列表最前
+   * ——用户刚拖下来的顺序会被一次改名打乱，看着像「排序坏了」。
+   */
+  function renameAiConversation(conversationId, title) {
+    const normalizedId = String(conversationId || "").trim()
+    const normalizedTitle = String(title || "").replace(/\s+/g, " ").trim().slice(0, 80)
+    if (!normalizedId || !normalizedTitle) return false
+    const result = database.prepare("UPDATE ai_conversations SET title = ? WHERE id = ?")
+      .run(normalizedTitle, normalizedId)
+    return Number(result.changes) > 0
+  }
+
+  /** 置顶 / 取消置顶；同样不碰 `updated_at`，理由同重命名。 */
+  function setAiConversationPinned(conversationId, pinned) {
+    const normalizedId = String(conversationId || "").trim()
+    if (!normalizedId) return false
+    const result = database.prepare("UPDATE ai_conversations SET pinned = ? WHERE id = ?")
+      .run(pinned ? 1 : 0, normalizedId)
+    return Number(result.changes) > 0
+  }
+
+  /** 删除一个会话（轮次由外键级联删除）。 */  function deleteAiConversation(conversationId) {
+    const normalizedId = String(conversationId || "").trim()
+    if (!normalizedId) return false
+    const result = database.prepare("DELETE FROM ai_conversations WHERE id = ?").run(normalizedId)
+    return Number(result.changes) > 0
+  }
+
+  /** 清空全部会话历史。 */
+  function clearAiConversations() {
+    const result = database.prepare("DELETE FROM ai_conversations").run()
+    return Number(result.changes) || 0
+  }
+
   /**
    * 使用 SQLite FTS5 搜索标题与完整正文，可选匹配标签和文件夹名称。
    */
@@ -2769,6 +3021,14 @@ function createRepository(database) {
     getWorkspaceSession,
     saveWorkspaceSession,
     saveNoteViewState,
+    listAiConversations,
+    getAiConversation,
+    appendAiConversationTurn,
+    replaceAiConversationTurn,
+    renameAiConversation,
+    setAiConversationPinned,
+    deleteAiConversation,
+    clearAiConversations,
     getNote,
     getNoteForEditing,
     searchNotes,

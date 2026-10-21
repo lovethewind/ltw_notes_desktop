@@ -443,11 +443,75 @@ export interface AiAssistantSource {
   noteId: string
   title: string
   excerpt: string
+  /** 这篇太长，只把前 N 字送给了模型（界面据此提示，别让人以为看全了）。 */
+  truncated?: boolean
+}
+
+/** 一轮已完成的问答；追问时按顺序回传给主进程拼进 messages。 */
+export interface AiAssistantTurn {
+  question: string
+  answer: string
 }
 
 export interface AiAssistantAnswer {
   answer: string
   sources: AiAssistantSource[]
+  /**
+   * 模型这次没写 [S1] 之类的引用标记。
+   *
+   * 以前这种情况直接抛错让用户重试，模型偶尔漏标就白等一次；
+   * 现在照常给答案，由界面提示「本条未标注来源」，sources 退回为本次检索到的笔记。
+   */
+  citationMissing?: boolean
+}
+
+/** 历史对话列表项；不含轮次正文，列表页用不到。 */
+export interface AiConversationSummary {
+  id: string
+  title: string
+  /** 用户手动钉住：排在最前，且不被保留策略按时间清掉。 */
+  pinned: boolean
+  turnCount: number
+  createdAt: string
+  updatedAt: string
+}
+
+/** 从本机库里读回的一轮问答。 */
+export interface AiConversationTurn {
+  id: string
+  question: string
+  answer: string
+  sources: AiAssistantSource[]
+  citationMissing: boolean
+  createdAt: string
+}
+
+/** 完整的历史对话。 */
+export interface AiConversation extends AiConversationSummary {
+  turns: AiConversationTurn[]
+}
+
+/** 追加一轮问答的入参；`conversationId` 为空时主进程按需新建会话。 */
+export interface AiConversationTurnInput {
+  conversationId?: string | null
+  question: string
+  answer: string
+  sources?: AiAssistantSource[]
+  citationMissing?: boolean
+}
+
+/** 追加结果：回填真实的会话 ID，界面后续轮次沿用它。 */
+export interface AiConversationTurnResult {
+  conversationId: string
+  turnId: string
+}
+
+/** 重写一轮回答的入参；问题与位置不变，只换答案与来源。 */
+export interface AiConversationTurnReplaceInput {
+  turnId: string
+  answer: string
+  sources?: AiAssistantSource[]
+  citationMissing?: boolean
 }
 
 /**
@@ -492,13 +556,67 @@ export interface NotesDesktopApi {
     model: string
     apiKey?: string
   }): Promise<AiAssistantSettings>
-  /** 基于有限的本地笔记上下文请求 AI 回答。 */
+  /** 基于有限的本地笔记上下文请求 AI 回答；history 为最近几轮问答，用于追问。 */
   askAiAssistant(input: {
     question: string
     scope: AiAssistantScope
     noteId?: string | null
     folderId?: string | null
+    /**
+     * 正文里选中的片段（选中气泡「问 AI」带进来）。
+     *
+     * 非空时主进程把它编成 S1 直接塞进资料最前面，不必再靠 FTS 召回到这一段。
+     */
+    selection?: string
+    /** 已完成的问答，按时间正序；主进程只取最近 6 轮并做字符预算截断。 */
+    history?: AiAssistantTurn[]
   }): Promise<AiAssistantAnswer>
+  /**
+   * 流式问答：返回值与 `askAiAssistant` 一致，过程中通过 `onAiAssistantDelta` 推送增量。
+   *
+   * @param input 与 `askAiAssistant` 相同，另带 `requestId`（渲染层生成，用于过滤增量）。
+   */
+  askAiAssistantStream(input: {
+    question: string
+    scope: AiAssistantScope
+    noteId?: string | null
+    folderId?: string | null
+    selection?: string
+    history?: AiAssistantTurn[]
+    requestId: string
+  }): Promise<AiAssistantAnswer>
+  /**
+   * 订阅流式增量。
+   *
+   * @param callback 每次收到一段文本时回调，`requestId` 对应发起时的值。
+   * @returns 取消订阅函数。
+   */
+  onAiAssistantDelta(
+    callback: (payload: { requestId: string, delta: string }) => void
+  ): () => void
+  /**
+   * 停止生成：中止主进程那条流式请求。
+   *
+   * @param requestId 与提问时同一个 requestId。
+   * @returns 是否真的停掉了一条在跑的请求。
+   */
+  abortAiAssistantStream(requestId: string): Promise<boolean>
+  /** 列出本机保存的历史对话；`keyword` 非空时按标题或任意一轮提问过滤。 */
+  listAiConversations(keyword?: string): Promise<AiConversationSummary[]>
+  /** 读一个历史对话的完整轮次；不存在时返回 null。 */
+  getAiConversation(conversationId: string): Promise<AiConversation | null>
+  /** 追加一轮已完成的问答；`conversationId` 为空时按需新建会话。 */
+  appendAiConversationTurn(input: AiConversationTurnInput): Promise<AiConversationTurnResult | null>
+  /** 重写某一轮的回答（重新生成），不动问题与位置。 */
+  replaceAiConversationTurn(input: AiConversationTurnReplaceInput): Promise<boolean>
+  /** 给历史对话改名；空标题返回 false。 */
+  renameAiConversation(conversationId: string, title: string): Promise<boolean>
+  /** 置顶 / 取消置顶一条历史对话。 */
+  setAiConversationPinned(conversationId: string, pinned: boolean): Promise<boolean>
+  /** 删除一个历史对话（轮次级联删除）。 */
+  deleteAiConversation(conversationId: string): Promise<boolean>
+  /** 清空全部历史对话，返回删除的会话条数。 */
+  clearAiConversations(): Promise<number>
   /** 打开指定笔记。 */
   openNoteLink(noteId: string): Promise<boolean>
   /** 查询引用了指定笔记的本地笔记列表（入边）。 */

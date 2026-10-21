@@ -12,6 +12,57 @@ contextBridge.exposeInMainWorld("notesDesktop", {
   getAiAssistantSettings: () => ipcRenderer.invoke("ai-assistant:settings:get"),
   saveAiAssistantSettings: (input) => ipcRenderer.invoke("ai-assistant:settings:save", input),
   askAiAssistant: (input) => ipcRenderer.invoke("ai-assistant:ask", input),
+  /**
+   * 流式提问：返回值与非流式一致，过程中通过 `onAiAssistantDelta` 推送增量。
+   *
+   * @param {Record<string, any>} input 含 requestId，主进程原样回传用于过滤。
+   * @returns {Promise<Record<string, any>>} 最终答案与来源。
+   */
+  askAiAssistantStream: (input) => ipcRenderer.invoke("ai-assistant:ask-stream", input),
+  /**
+   * 停止生成：中止主进程那条流式请求（不是只丢增量）。
+   *
+   * @param {string} requestId 与提问时同一个 requestId。
+   * @returns {Promise<boolean>} 是否真的停掉了一条在跑的请求。
+   */
+  abortAiAssistantStream: (requestId) => ipcRenderer.invoke("ai-assistant:abort", requestId),
+  /**
+   * 监听流式增量。
+   *
+   * @param {(payload: { requestId: string, delta: string }) => void} callback 增量回调。
+   * @returns {() => void} 取消监听函数。
+   */
+  onAiAssistantDelta: (callback) => {
+    const listener = (_event, payload) => callback(payload || {})
+    ipcRenderer.on("ai-assistant:delta", listener)
+    return () => ipcRenderer.removeListener("ai-assistant:delta", listener)
+  },
+  /**
+   * 列出本机保存的历史对话（置顶在前、其余最新在前，不含正文）。
+   *
+   * @param {string} [keyword] 关键词；按标题或任意一轮提问做子串匹配。
+   */
+  listAiConversations: (keyword) => ipcRenderer.invoke("ai-conversation:list", keyword),
+  /** 读一个历史对话的完整轮次；不存在时返回 null。 */
+  getAiConversation: (conversationId) => ipcRenderer.invoke("ai-conversation:get", conversationId),
+  /**
+   * 追加一轮已完成的问答；`conversationId` 为空时按需新建会话。
+   *
+   * @param {{ conversationId?: string, question: string, answer: string,
+   *   sources?: unknown[], citationMissing?: boolean }} input 轮次内容。
+   * @returns {Promise<{ conversationId: string, turnId: string } | null>} 落库后的 ID。
+   */
+  appendAiConversationTurn: (input) => ipcRenderer.invoke("ai-conversation:append-turn", input),
+  /** 重写某一轮的回答（重新生成），不动问题与位置。 */
+  replaceAiConversationTurn: (input) => ipcRenderer.invoke("ai-conversation:replace-turn", input),
+  /** 给历史对话改名；空标题返回 false。 */
+  renameAiConversation: (conversationId, title) => ipcRenderer.invoke("ai-conversation:rename", conversationId, title),
+  /** 置顶 / 取消置顶一条历史对话。 */
+  setAiConversationPinned: (conversationId, pinned) => ipcRenderer.invoke("ai-conversation:pin", conversationId, pinned),
+  /** 删除一个历史对话（轮次级联删除）。 */
+  deleteAiConversation: (conversationId) => ipcRenderer.invoke("ai-conversation:delete", conversationId),
+  /** 清空全部历史对话。 */
+  clearAiConversations: () => ipcRenderer.invoke("ai-conversation:clear"),
   /** @param {string} noteId 笔记 ID；@returns {Promise<boolean>} 是否已发起打开。 */
   openNoteLink: (noteId) => ipcRenderer.invoke("note-link:open-local", noteId),
   /** 查询引用了指定笔记的本地笔记列表。 */

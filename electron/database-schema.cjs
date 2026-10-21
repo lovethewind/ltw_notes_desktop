@@ -131,6 +131,33 @@ function initializeNotesDatabase(database) {
       PRIMARY KEY(source_note_id, target_note_id)
     );
     CREATE INDEX IF NOT EXISTS idx_note_links_target ON note_links(target_note_id);
+    /*
+     * AI 对话历史：只在本机、只跟当前档案。
+     * 不参与同步（跨端契约里没有 AI 会话，网页端也没有对应 UI），
+     * 删除会话时轮次跟着走，所以外键必须 ON DELETE CASCADE。
+     */
+    CREATE TABLE IF NOT EXISTS ai_conversations (
+      id TEXT PRIMARY KEY,
+      title TEXT NOT NULL DEFAULT '新对话',
+      -- 置顶：用户手动钉住的会话排在列表最前，且不被保留策略按时间清掉。
+      pinned INTEGER NOT NULL DEFAULT 0,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_ai_conversations_updated
+      ON ai_conversations(updated_at DESC);
+    CREATE TABLE IF NOT EXISTS ai_conversation_turns (
+      id TEXT PRIMARY KEY,
+      conversation_id TEXT NOT NULL REFERENCES ai_conversations(id) ON DELETE CASCADE,
+      position INTEGER NOT NULL,
+      question TEXT NOT NULL,
+      answer TEXT NOT NULL,
+      sources_json TEXT NOT NULL DEFAULT '[]',
+      citation_missing INTEGER NOT NULL DEFAULT 0,
+      created_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_ai_turns_conversation
+      ON ai_conversation_turns(conversation_id, position);
   `)
   initializeNotePreviews(database)
   initializeNoteSearch(database)
@@ -228,6 +255,11 @@ function migrateLegacyColumns(database) {
   const assetColumns = database.prepare("PRAGMA table_info(note_assets)").all()
   if (!assetColumns.some((column) => column.name === "server_source_id")) {
     database.exec("ALTER TABLE note_assets ADD COLUMN server_source_id TEXT")
+  }
+  // 0.10.1 给历史对话加了置顶：老库里这张表已经建好，CREATE TABLE IF NOT EXISTS 不会补列。
+  const conversationColumns = database.prepare("PRAGMA table_info(ai_conversations)").all()
+  if (!conversationColumns.some((column) => column.name === "pinned")) {
+    database.exec("ALTER TABLE ai_conversations ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0")
   }
 }
 

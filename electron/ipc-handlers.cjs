@@ -141,11 +141,41 @@ function registerAiAssistantHandlers(ipcMain, domain) {
   ipcMain.handle("ai-assistant:settings:get", domain.getSettings)
   ipcMain.handle("ai-assistant:settings:save", (_event, input) => domain.saveSettings(input || {}))
   ipcMain.handle("ai-assistant:ask", (_event, input) => domain.ask(input || {}))
+  // 流式：增量按 requestId 回推给发起窗口；窗口已销毁就不再发。
+  ipcMain.handle("ai-assistant:ask-stream", (event, input) => {
+    const payload = input || {}
+    const requestId = String(payload.requestId || "")
+    return domain.askStream(payload, (delta) => {
+      if (!requestId || event.sender.isDestroyed()) return
+      event.sender.send("ai-assistant:delta", { requestId, delta: String(delta || "") })
+    })
+  })
+  // 停止生成：真的掐掉主进程那条连接，而不是让它在后台跑完。
+  ipcMain.handle("ai-assistant:abort", (_event, requestId) =>
+    domain.abortStream(String(requestId || "")))
+}
+
+/**
+ * 注册 AI 对话历史接口。
+ *
+ * 会话只落在当前档案的本地库里，不生成 outbox 记录、不参与同步 ——
+ * 所以这里只做读写，不碰同步队列。
+ */
+function registerAiConversationHandlers(ipcMain, domain) {
+  ipcMain.handle("ai-conversation:list", (_event, keyword) => domain.list(keyword))
+  ipcMain.handle("ai-conversation:get", (_event, conversationId) => domain.get(conversationId))
+  ipcMain.handle("ai-conversation:append-turn", (_event, input) => domain.appendTurn(input || {}))
+  ipcMain.handle("ai-conversation:replace-turn", (_event, input) => domain.replaceTurn(input || {}))
+  ipcMain.handle("ai-conversation:rename", (_event, conversationId, title) => domain.rename(conversationId, title))
+  ipcMain.handle("ai-conversation:pin", (_event, conversationId, pinned) => domain.setPinned(conversationId, pinned))
+  ipcMain.handle("ai-conversation:delete", (_event, conversationId) => domain.remove(conversationId))
+  ipcMain.handle("ai-conversation:clear", () => domain.clear())
 }
 
 function registerIpcHandlers(ipcMain, domains) {
   registerApplicationHandlers(ipcMain, domains.application)
   registerAiAssistantHandlers(ipcMain, domains.aiAssistant)
+  registerAiConversationHandlers(ipcMain, domains.aiConversation)
   registerWorkspaceHandlers(ipcMain, domains.workspace)
   registerAttachmentHandlers(ipcMain, domains.attachments)
   registerNoteHandlers(ipcMain, domains.notes)

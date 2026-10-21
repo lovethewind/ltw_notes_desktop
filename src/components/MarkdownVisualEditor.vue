@@ -356,6 +356,21 @@ const FONT_SIZE_TRIGGER_ICON = `
 `
 
 /**
+ * 选中气泡里「问 AI」按钮的图标（Material Symbols auto_awesome）。
+ *
+ * 和字号触发器同源：Crepe 的 Toolbar 只给每项渲染一个写死属性的按钮，
+ * `onRun` 拿不到事件对象、也挂不了自定义 class，所以图标里自带的 `span` 既是
+ * CSS 钩子也是 e2e 的定位锚点（`.toolbar-item:has(.xynote-ask-ai-trigger)`）。
+ */
+const ASK_AI_TRIGGER_ICON = `
+  <span class="xynote-ask-ai-trigger">
+    <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="currentColor">
+      <path d="m19 9 1.25-2.75L23 5l-2.75-1.25L19 1l-1.25 2.75L15 5l2.75 1.25L19 9Zm-7.5.5L9 4 6.5 9.5 1 12l5.5 2.5L9 20l2.5-5.5L17 12l-5.5-2.5ZM19 15l-1.25 2.75L15 19l2.75 1.25L19 23l1.25-2.75L23 19l-2.75-1.25L19 15Z" />
+    </svg>
+  </span>
+`
+
+/**
  * 链接气泡左侧那两个按钮（打开 / 复制）的图标。
  *
  * 背景：Crepe 的 LinkTooltip 只开放一个 `linkIcon` 槽位，而**这个槽位的点击写死是复制**
@@ -444,6 +459,8 @@ const props = withDefaults(defineProps<Props>(), {
 const emit = defineEmits<{
   (event: 'change', value: string, documentId: string): void
   (event: 'scroll-position-change', scrollTop: number, documentId: string): void
+  /** 选区问 AI：把选中的正文交给上层打开面板。 */
+  (event: 'ask-ai', text: string): void
 }>()
 
 const editorRootRef = ref<HTMLDivElement | null>(null)
@@ -2790,6 +2807,32 @@ function syncBubbleFontSizePanel(panel: HTMLDivElement): void {
 }
 
 /**
+ * 选中气泡里的「问 AI」：把这一段正文交给 AI 助手面板提问。
+ *
+ * 只递文字、**不回写正文** —— 改写正文要走编辑器事务（选区映射、历史栈、撤销粒度），
+ * 风险与「问」完全不是一个量级，先只做问。
+ *
+ * 选区从 ProseMirror 的 `state.selection` 读，不用 `window.getSelection()`：
+ * 气泡是挂在 `body` 上的 portal，按钮被按下这一瞬间浏览器原生选区可能已经抖动，
+ * 而 PM 的选区仍稳稳锚在原文上。
+ *
+ * :param view: 当前 ProseMirror 视图。
+ * :return: 无返回值。
+ */
+function askSelectionWithAi(view: ProseMirrorView): void {
+  const { from, to } = view.state.selection
+  // 光标态（from === to）没有可问的东西，空选区也一并挡掉。
+  const text = from === to ? '' : view.state.doc.textBetween(from, to, '\n').trim()
+  if (!text) {
+    showFeedback('先选中一段文字，再问 AI')
+    return
+  }
+  // 先把自己开的浮层收掉，免得面板弹出后气泡还挂在旁边。
+  closeToolbarMenus()
+  emit('ask-ai', text)
+}
+
+/**
  * 开合选中气泡内的字号面板（贴在「字号」按钮正下方）。
  *
  * 复用顶栏那套「portals 到 body + `is-portal-open` 固定定位 + `toolbarMenuPanels` 统一关闭」，
@@ -3350,6 +3393,13 @@ async function createEditor(): Promise<void> {
               return Boolean(markType?.isInSet(activeCtx.get(editorViewCtx).state.selection.$from.marks()))
             },
             onRun: () => toggleBubbleFontSizePanel()
+          })
+          // 「问 AI」放在功能组末尾：它是这条气泡工具条的终点动作，不该夹在格式化中间。
+          builder.getGroup('function').addItem('xynote-ask-ai', {
+            icon: ASK_AI_TRIGGER_ICON,
+            // 不是开关型按钮（点了就开面板），所以永远不处于「按下」态。
+            active: () => false,
+            onRun: (runCtx) => askSelectionWithAi(runCtx.get(editorViewCtx))
           })
         }
       },

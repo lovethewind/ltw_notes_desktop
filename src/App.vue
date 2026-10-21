@@ -216,6 +216,14 @@ let conflictDetailRequestId = 0
 const generalSettingsVisible = ref(false)
 const globalGraphVisible = ref(false)
 const aiAssistantVisible = ref(false)
+/**
+ * 从正文选区带进 AI 助手的片段。
+ *
+ * 非空时面板输入框上方会挂一个「选中片段」chip，提问时它作为最高优先级的资料
+ * （主进程里编成 S1）直接送给模型，不必再靠 FTS 去碰运气。
+ * 空串 = 没有选区，走原来的召回路径。
+ */
+const aiSelectionText = ref('')
 const quickOpenVisible = ref(false)
 const quickOpenShortcut = ref(window.localStorage.getItem('notes-quick-open-shortcut') || 'CommandOrControl+O')
 const storedShowTreeLines = window.localStorage.getItem('notes-show-tree-lines')
@@ -983,8 +991,32 @@ async function toggleAiAssistant(): Promise<void> {
     aiAssistantVisible.value = false
     return
   }
+  // 从顶栏进来的是一次全新提问，别把上回选区留下的 chip 带过来。
+  aiSelectionText.value = ''
   if (activeNote.value) await flushSave()
   aiAssistantVisible.value = true
+}
+
+/**
+ * 选中正文后从气泡里「问 AI」。
+ *
+ * 先把防抖中的草稿冲掉：主进程按 noteId 重新读库，
+ * 刚敲的字如果还没落库，模型看到的就是修改前的版本。
+ *
+ * :param text: 编辑器递过来的选区正文。
+ * :return: 无返回值。
+ */
+async function askAiWithSelection(text: string): Promise<void> {
+  const selection = String(text || '').trim()
+  if (!selection || !activeNote.value) return
+  aiSelectionText.value = selection
+  await flushSave()
+  aiAssistantVisible.value = true
+}
+
+/** 清掉「选中片段」chip，后续提问回到整篇/全库召回。 */
+function clearAiSelection(): void {
+  aiSelectionText.value = ''
 }
 
 /**
@@ -4364,6 +4396,7 @@ onBeforeUnmount(() => {
               :web-base-url="syncSettings.webUrl"
               @change="updateDraftContent"
               @scroll-position-change="updateNoteScrollPosition"
+              @ask-ai="askAiWithSelection"
             />
           </div>
         </template>
@@ -4378,7 +4411,9 @@ onBeforeUnmount(() => {
           :current-note-id="activeNote?.id ?? null"
           :current-folder-id="activeNote?.folderId ?? null"
           :current-note-title="activeNote?.title ?? ''"
+          :selection-text="aiSelectionText"
           @close="aiAssistantVisible = false"
+          @clear-selection="clearAiSelection"
           @open-source="openAiAssistantSource"
         />
       </section>

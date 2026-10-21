@@ -2444,6 +2444,17 @@ function registerIpcHandlers() {
       }
     },
     aiAssistant,
+    // 会话读写每次现取 repository：切换档案后必须落到新库，不能用闭包里的旧实例。
+    aiConversation: {
+      list: (keyword) => repository.listAiConversations(keyword),
+      get: (conversationId) => repository.getAiConversation(conversationId),
+      appendTurn: (input) => repository.appendAiConversationTurn(input),
+      replaceTurn: (input) => repository.replaceAiConversationTurn(input),
+      rename: (conversationId, title) => repository.renameAiConversation(conversationId, title),
+      setPinned: (conversationId, pinned) => repository.setAiConversationPinned(conversationId, pinned),
+      remove: (conversationId) => repository.deleteAiConversation(conversationId),
+      clear: () => repository.clearAiConversations()
+    },
     workspace: {
       listWorkspace: () => repository.listWorkspace(),
       getSession: () => repository.getWorkspaceSession(),
