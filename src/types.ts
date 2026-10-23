@@ -466,11 +466,23 @@ export interface AiAssistantAnswer {
 }
 
 /** 历史对话列表项；不含轮次正文，列表页用不到。 */
+/** 历史列表的筛选条件：两个都空就是「全部会话」。 */
+export interface AiConversationListOptions {
+  /** 按标题或任意一轮的提问做子串匹配。 */
+  keyword?: string
+  /** 只列归属这篇笔记的会话。 */
+  noteId?: string
+}
+
 export interface AiConversationSummary {
   id: string
   title: string
   /** 用户手动钉住：排在最前，且不被保留策略按时间清掉。 */
   pinned: boolean
+  /** 归属笔记：开始提问时打开的那一篇；老会话或未带笔记提问时为 null。 */
+  noteId: string | null
+  /** 归属笔记的当前标题；笔记已删除（含进了回收站）时为 null。 */
+  noteTitle: string | null
   turnCount: number
   createdAt: string
   updatedAt: string
@@ -498,6 +510,8 @@ export interface AiConversationTurnInput {
   answer: string
   sources?: AiAssistantSource[]
   citationMissing?: boolean
+  /** 仅新建会话时生效：记下「在哪篇笔记下开始问的」。追问不改归属。 */
+  noteId?: string | null
 }
 
 /** 追加结果：回填真实的会话 ID，界面后续轮次沿用它。 */
@@ -601,8 +615,13 @@ export interface NotesDesktopApi {
    * @returns 是否真的停掉了一条在跑的请求。
    */
   abortAiAssistantStream(requestId: string): Promise<boolean>
-  /** 列出本机保存的历史对话；`keyword` 非空时按标题或任意一轮提问过滤。 */
-  listAiConversations(keyword?: string): Promise<AiConversationSummary[]>
+  /**
+   * 列出本机保存的历史对话。
+   *
+   * @param options.keyword 非空时按标题或任意一轮提问过滤。
+   * @param options.noteId 非空时只列归属这篇笔记的会话。
+   */
+  listAiConversations(options?: AiConversationListOptions): Promise<AiConversationSummary[]>
   /** 读一个历史对话的完整轮次；不存在时返回 null。 */
   getAiConversation(conversationId: string): Promise<AiConversation | null>
   /** 追加一轮已完成的问答；`conversationId` 为空时按需新建会话。 */

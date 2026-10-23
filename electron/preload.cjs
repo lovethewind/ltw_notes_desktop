@@ -40,16 +40,19 @@ contextBridge.exposeInMainWorld("notesDesktop", {
   /**
    * 列出本机保存的历史对话（置顶在前、其余最新在前，不含正文）。
    *
-   * @param {string} [keyword] 关键词；按标题或任意一轮提问做子串匹配。
+   * @param {{ keyword?: string, noteId?: string }} [options] 筛选条件；
+   *   `keyword` 按标题或任意一轮提问匹配，`noteId` 只列归属这篇笔记的会话。
    */
-  listAiConversations: (keyword) => ipcRenderer.invoke("ai-conversation:list", keyword),
+  listAiConversations: (options) => ipcRenderer.invoke("ai-conversation:list", options),
   /** 读一个历史对话的完整轮次；不存在时返回 null。 */
   getAiConversation: (conversationId) => ipcRenderer.invoke("ai-conversation:get", conversationId),
   /**
    * 追加一轮已完成的问答；`conversationId` 为空时按需新建会话。
    *
+   * `noteId` 只在新建会话时生效，记下「在哪篇笔记下开始问的」，追问不改归属。
+   *
    * @param {{ conversationId?: string, question: string, answer: string,
-   *   sources?: unknown[], citationMissing?: boolean }} input 轮次内容。
+   *   sources?: unknown[], citationMissing?: boolean, noteId?: string }} input 轮次内容。
    * @returns {Promise<{ conversationId: string, turnId: string } | null>} 落库后的 ID。
    */
   appendAiConversationTurn: (input) => ipcRenderer.invoke("ai-conversation:append-turn", input),

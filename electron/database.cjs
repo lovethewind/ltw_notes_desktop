@@ -733,31 +733,45 @@ function createRepository(database) {
    *
    * `keyword` 非空时按标题或任意一轮的提问做子串匹配。搜提问而不只搜标题：
    * 标题只截了第一个问题的前 30 字，追问里的关键词否则永远搜不到。
+   *
+   * `noteId` 非空时只返回归属该篇笔记的会话 —— 面板打开时靠它找「该续接哪一条」。
    */
-  function listAiConversations(keyword) {
-    const term = String(keyword || "").replace(/\s+/g, " ").trim()
+  function listAiConversations(options = {}) {
+    const term = String(options.keyword || "").replace(/\s+/g, " ").trim()
+    const scopedNoteId = String(options.noteId || "").trim()
     const params = []
-    let where = ""
+    const conditions = []
     if (term) {
       // LIKE 里的 % _ \ 要先转义，否则用户输入「100%」会变成通配。
       const like = `%${term.replace(/[\\%_]/g, (character) => `\\${character}`)}%`
-      where = `
-        WHERE conversation.title LIKE ? ESCAPE '\\'
-           OR EXISTS (
-             SELECT 1 FROM ai_conversation_turns hit
-             WHERE hit.conversation_id = conversation.id
-               AND hit.question LIKE ? ESCAPE '\\'
-           )`
+      conditions.push(`(
+        conversation.title LIKE ? ESCAPE '\\'
+        OR EXISTS (
+          SELECT 1 FROM ai_conversation_turns hit
+          WHERE hit.conversation_id = conversation.id
+            AND hit.question LIKE ? ESCAPE '\\'
+        )
+      )`)
       params.push(like, like)
     }
+    if (scopedNoteId) {
+      conditions.push("conversation.note_id = ?")
+      params.push(scopedNoteId)
+    }
+    const where = conditions.length ? `WHERE ${conditions.join(" AND ")}` : ""
     return database.prepare(`
       SELECT conversation.id AS id,
              conversation.title AS title,
              conversation.pinned AS pinned,
+             conversation.note_id AS noteId,
+             -- 软删除的笔记（is_deleted = 1）也按「已删除」算：跳过去只会打开回收站里的条目。
+             CASE WHEN note.id IS NULL OR note.is_deleted = 1
+                  THEN NULL ELSE note.title END AS noteTitle,
              conversation.created_at AS createdAt,
              conversation.updated_at AS updatedAt,
              COUNT(turn.id) AS turnCount
       FROM ai_conversations conversation
+      LEFT JOIN notes note ON note.id = conversation.note_id
       LEFT JOIN ai_conversation_turns turn ON turn.conversation_id = conversation.id
       ${where}
       GROUP BY conversation.id
@@ -767,6 +781,8 @@ function createRepository(database) {
       id: row.id,
       title: row.title,
       pinned: Boolean(row.pinned),
+      noteId: row.noteId || null,
+      noteTitle: row.noteTitle || null,
       createdAt: row.createdAt,
       updatedAt: row.updatedAt,
       turnCount: Number(row.turnCount) || 0
@@ -778,8 +794,17 @@ function createRepository(database) {
     const normalizedId = String(conversationId || "").trim()
     if (!normalizedId) return null
     const conversation = database.prepare(`
-      SELECT id, title, pinned, created_at AS createdAt, updated_at AS updatedAt
-      FROM ai_conversations WHERE id = ?
+      SELECT conversation.id AS id,
+             conversation.title AS title,
+             conversation.pinned AS pinned,
+             conversation.note_id AS noteId,
+             CASE WHEN note.id IS NULL OR note.is_deleted = 1
+                  THEN NULL ELSE note.title END AS noteTitle,
+             conversation.created_at AS createdAt,
+             conversation.updated_at AS updatedAt
+      FROM ai_conversations conversation
+      LEFT JOIN notes note ON note.id = conversation.note_id
+      WHERE conversation.id = ?
     `).get(normalizedId)
     if (!conversation) return null
     const turns = database.prepare(`
@@ -805,7 +830,13 @@ function createRepository(database) {
         createdAt: row.createdAt
       }
     })
-    return { ...conversation, pinned: Boolean(conversation.pinned), turns }
+    return {
+      ...conversation,
+      pinned: Boolean(conversation.pinned),
+      noteId: conversation.noteId || null,
+      noteTitle: conversation.noteTitle || null,
+      turns
+    }
   }
 
   /**
@@ -813,6 +844,9 @@ function createRepository(database) {
    *
    * `conversationId` 为空时按需新建（渲染层点「＋」不会立刻落库，
    * 避免出现一堆没问过话的空会话）。返回真实的会话 ID 供界面回填。
+   *
+   * `noteId` 只在新建时写入：一条对话归属「开始提问时打开的那篇笔记」，
+   * 之后切到别的笔记接着追问也不改归属 —— 一段上下文自始至终围绕同一篇。
    */
   const appendAiConversationTurn = database.transaction((input = {}) => {
     const question = String(input.question || "").trim()
@@ -826,9 +860,15 @@ function createRepository(database) {
     if (!existing) {
       conversationId = randomUUID()
       database.prepare(`
-        INSERT INTO ai_conversations(id, title, created_at, updated_at)
-        VALUES (?, ?, ?, ?)
-      `).run(conversationId, aiConversationTitle(question), timestamp, timestamp)
+        INSERT INTO ai_conversations(id, title, note_id, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?)
+      `).run(
+        conversationId,
+        aiConversationTitle(question),
+        String(input.noteId || "").trim() || null,
+        timestamp,
+        timestamp
+      )
       pruneAiConversations()
     }
     const position = Number(database.prepare(`

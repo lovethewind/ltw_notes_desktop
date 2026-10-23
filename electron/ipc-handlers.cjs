@@ -162,7 +162,7 @@ function registerAiAssistantHandlers(ipcMain, domain) {
  * 所以这里只做读写，不碰同步队列。
  */
 function registerAiConversationHandlers(ipcMain, domain) {
-  ipcMain.handle("ai-conversation:list", (_event, keyword) => domain.list(keyword))
+  ipcMain.handle("ai-conversation:list", (_event, options) => domain.list(options || {}))
   ipcMain.handle("ai-conversation:get", (_event, conversationId) => domain.get(conversationId))
   ipcMain.handle("ai-conversation:append-turn", (_event, input) => domain.appendTurn(input || {}))
   ipcMain.handle("ai-conversation:replace-turn", (_event, input) => domain.replaceTurn(input || {}))

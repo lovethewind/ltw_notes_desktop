@@ -93,6 +93,13 @@ let renameInputEl: HTMLInputElement | null = null
 /** 「清空全部历史」的两段确认：第一次点击只是把按钮换成确认态。 */
 const confirmClearHistory = ref(false)
 const copiedTurnId = ref<number | null>(null)
+/**
+ * 自动续接进来的会话：记住它的归属笔记，顶部横幅据此显示「已载入《XX》的对话」。
+ *
+ * 空表示当前对话不是自动载入的 —— 现场提问的、或从历史列表手动打开的都不算，
+ * 那两种情况下用户知道自己在哪条对话里，不需要横幅再提示一次。
+ */
+const resumedNote = ref<{ id: string, title: string } | null>(null)
 const loadingStage = ref(LOADING_STAGES[0])
 const settings = ref<AiAssistantSettings>({ baseUrl: 'https://api.openai.com/v1', model: '', hasApiKey: false })
 const settingsDraft = ref({ baseUrl: 'https://api.openai.com/v1', model: '', apiKey: '' })
@@ -111,6 +118,13 @@ let unsubscribeDelta: (() => void) | null = null
  * 前者保留半截回答、不弹错、不落库，后者才走错误态。
  */
 const stoppedRequests = new Set<string>()
+/**
+ * 刚点过「开始新对话」的笔记 ID。
+ *
+ * 不记这一笔的话，关掉面板再打开又会把刚才那条自动载回来，
+ * 用户会觉得「新对话」根本没生效。切到别的笔记就清空，不影响下次续接。
+ */
+let resumeSkippedNoteId: string | null = null
 
 const scopeOptions: Array<{ value: AiAssistantScope, label: string, icon: string }> = [
   { value: 'current', label: '当前笔记', icon: 'tabler:file-text' },
@@ -529,6 +543,9 @@ function startNewConversation(): void {
   error.value = ''
   question.value = ''
   historyOpen.value = false
+  resumedNote.value = null
+  // 记下「这篇笔记刚开过新的」：关掉面板再打开别再自动载回刚才那条。
+  resumeSkippedNoteId = props.currentNoteId
   cancelRename()
   // 选区 chip 属于「就这段提问」的那次上下文，新对话不该继承它。
   if (props.selectionText) emit('clearSelection')
@@ -569,7 +586,10 @@ async function persistTurn(turn: ChatTurn): Promise<void> {
       question: turn.question,
       answer: turn.answer,
       sources,
-      citationMissing: turn.citationMissing
+      citationMissing: turn.citationMissing,
+      // 只有新建会话时主进程才会用这个值：一条对话归属「开始提问时的那篇笔记」，
+      // 中途切到别的笔记追问也不改归属。
+      noteId: props.currentNoteId
     })
     if (saved?.conversationId) conversationId.value = saved.conversationId
     if (saved?.turnId) turn.dbTurnId = saved.turnId
@@ -626,7 +646,9 @@ async function loadHistory(): Promise<void> {
   historyLoading.value = true
   historyError.value = ''
   try {
-    historyItems.value = await window.notesDesktop.listAiConversations(historySearch.value.trim() || undefined)
+    // 历史页永远看全部会话（不限笔记），搜索只收窄关键词。
+    const keyword = historySearch.value.trim()
+    historyItems.value = await window.notesDesktop.listAiConversations({ keyword: keyword || undefined })
   } catch (loadError) {
     historyItems.value = []
     historyError.value = loadError instanceof Error ? loadError.message : '历史对话读取失败'
@@ -700,8 +722,29 @@ async function togglePin(item: AiConversationSummary): Promise<void> {
   }
 }
 
-/** 打开一条历史对话：把落库的轮次还原成界面气泡。 */
-async function openConversation(item: AiConversationSummary): Promise<void> {
+/**
+ * 从历史列表跳到这条对话的归属笔记。
+ *
+ * 复用回答里 `[S1]` 引用那条链路（emit openSource，由 App 负责切换笔记），
+ * 不自己调 openNoteLink —— 那样要在这里再处理一遍「笔记不存在」。
+ * 跳之前把历史层收起来：点了来源就是要走，层还盖着看起来像没反应。
+ */
+function openNoteFromHistory(item: AiConversationSummary): void {
+  if (!item.noteId || !item.noteTitle) return
+  historyOpen.value = false
+  emit('openSource', item.noteId)
+}
+
+/**
+ * 打开一条历史对话：把落库的轮次还原成界面气泡。
+ *
+ * `resume` 只影响顶部横幅：自动载入的要提示「已载入哪篇笔记的对话」，
+ * 从历史列表手动点开的不提示 —— 那是用户自己挑的，再提示一次是噪音。
+ */
+async function openConversation(
+  item: AiConversationSummary,
+  options: { resume?: boolean } = {}
+): Promise<void> {
   if (loading.value) return
   cancelRename()
   historyLoading.value = true
@@ -733,6 +776,9 @@ async function openConversation(item: AiConversationSummary): Promise<void> {
       }
     })
     conversationId.value = conversation.id
+    resumedNote.value = options.resume
+      ? { id: conversation.noteId || '', title: conversation.noteTitle || '' }
+      : null
     historyOpen.value = false
     error.value = ''
     // 恢复出来的是另一条上下文，别让当前选区 chip 挂在新对话上。
@@ -744,6 +790,30 @@ async function openConversation(item: AiConversationSummary): Promise<void> {
     historyError.value = openError instanceof Error ? openError.message : '这条对话打开失败'
   } finally {
     historyLoading.value = false
+  }
+}
+
+/**
+ * 打开面板时，把「这篇笔记上一次的对话」接回来。
+ *
+ * 只在真正的空白会话上动手：正在进行的对话上下文还在用，带选区进来的提问
+ * 是用户刚圈了一段要问 —— 这两种情况下抢过去只会打断他，甚至把选段清掉。
+ */
+async function tryResumeConversation(): Promise<void> {
+  const noteId = props.currentNoteId
+  if (!noteId) return
+  if (conversationId.value || turns.value.length || loading.value) return
+  if (props.selectionText) return
+  if (resumeSkippedNoteId === noteId) return
+  try {
+    const conversations = await window.notesDesktop.listAiConversations({ noteId })
+    const latest = conversations.find((item) => item.turnCount > 0)
+    if (!latest) return
+    // 等库的这段时间里用户可能已经开始提问、或者切走了：开出了新会话就别再抢。
+    if (conversationId.value || turns.value.length || props.currentNoteId !== noteId) return
+    await openConversation(latest, { resume: true })
+  } catch {
+    // 续接是锦上添花：读不到就当没有，不能反过来挡住面板本身。
   }
 }
 
@@ -804,7 +874,18 @@ watch(() => props.visible, (visible) => {
   void loadSettings().then(() => {
     inputEl.value?.focus()
   })
+  // 打开面板就是「接着上次问」的最自然时机；要不要真的接，由它自己判断。
+  void tryResumeConversation()
 }, { immediate: true })
+
+// 笔记 ID 可能比面板晚到（刚启动就点 AI 按钮时它还是空的），也可能被用户切走：
+// 两种情况都要清掉「别再续接」的标记，并在面板开着时补一次续接 ——
+// 只靠 visible 那一下，笔记没加载完就永远续不上了。
+watch(() => props.currentNoteId, (noteId) => {
+  resumeSkippedNoteId = null
+  if (!noteId || !props.visible) return
+  void tryResumeConversation()
+})
 
 onMounted(() => {
   unsubscribeDelta = window.notesDesktop.onAiAssistantDelta(handleDelta)
@@ -951,13 +1032,37 @@ onBeforeUnmount(() => {
                 @blur="commitRename(item)"
               />
               <template v-else>
-                <button type="button" class="ai-history-item" @click="openConversation(item)">
+                <!-- 用 div 而不是 button：这一行里还要嵌「来源笔记」这个可点标签，
+                     button 套 button 不合规范。键盘可访问性靠 role + keydown 补齐。 -->
+                <div
+                  class="ai-history-item"
+                  role="button"
+                  tabindex="0"
+                  :aria-label="`打开对话：${item.title}`"
+                  @click="openConversation(item)"
+                  @keydown.enter.prevent="openConversation(item)"
+                  @keydown.space.prevent="openConversation(item)"
+                >
                   <span class="ai-history-title">
                     <Icon v-if="item.pinned" icon="tabler:pin" class="ai-history-pin" />
                     {{ item.title }}
                   </span>
-                  <small>{{ formatHistoryTime(item.updatedAt) }} · {{ item.turnCount }} 轮</small>
-                </button>
+                  <small class="ai-history-meta">
+                    <button
+                      v-if="item.noteId && item.noteTitle"
+                      type="button"
+                      class="ai-history-note"
+                      :title="`打开笔记：${item.noteTitle}`"
+                      @click.stop="openNoteFromHistory(item)"
+                    >
+                      <Icon icon="tabler:file-text" />
+                      <span>{{ item.noteTitle }}</span>
+                    </button>
+                    <!-- 笔记被删（或进了回收站）时只留一句说明：没有可跳的目标。 -->
+                    <span v-else-if="item.noteId" class="ai-history-note is-missing">笔记已删除</span>
+                    <span>{{ formatHistoryTime(item.updatedAt) }} · {{ item.turnCount }} 轮</span>
+                  </small>
+                </div>
                 <div class="ai-history-actions">
                   <button
                     type="button"
@@ -1006,6 +1111,16 @@ onBeforeUnmount(() => {
           </p>
         </section>
       </Transition>
+
+      <!-- 自动续接的提示条：说明「眼前这些旧对话是哪来的」，并给一键回到空白会话的出口。
+           放在滚动容器外面，跟着对话滚走就失去提示意义了。 -->
+      <div v-if="resumedNote" class="ai-resumed">
+        <Icon icon="tabler:history" />
+        <span class="ai-resumed-text">
+          已载入{{ resumedNote.title ? `《${resumedNote.title}》` : '本篇笔记' }}的对话
+        </span>
+        <button type="button" class="ai-resumed-new" @click="startNewConversation">开始新对话</button>
+      </div>
 
       <div ref="transcriptEl" class="ai-transcript">
         <div v-if="!turns.length && !loading" class="ai-empty">
@@ -1211,6 +1326,13 @@ onBeforeUnmount(() => {
 .ai-header-actions button:disabled:hover { background: transparent; color: var(--muted); }
 
 /* 对话流：整块唯一滚动容器，新消息进来自动贴底。 */
+/* 自动续接提示条：低饱和蓝底，高度压到 26px 以内，不抢对话区的空间。 */
+.ai-resumed { display: flex; align-items: center; gap: 6px; margin: 0 14px; border-radius: 8px; padding: 4px 8px; background: rgba(47,128,237,.08); color: var(--blue); font-size: 11px; }
+.ai-resumed svg { width: 13px; height: 13px; flex: none; }
+.ai-resumed-text { overflow: hidden; flex: 1; min-width: 0; text-overflow: ellipsis; white-space: nowrap; }
+.ai-resumed-new { flex: none; border: 0; border-radius: 6px; padding: 2px 6px; background: rgba(47,128,237,.14); color: var(--blue); font-family: inherit; font-size: 11px; font-weight: 600; cursor: pointer; }
+.ai-resumed-new:hover { background: rgba(47,128,237,.24); }
+
 .ai-transcript { display: flex; min-height: 0; flex: 1; flex-direction: column; gap: 14px; overflow-y: auto; padding: 18px 14px 10px; }
 
 .ai-empty { display: grid; flex: 1; align-content: center; justify-items: center; gap: 8px; padding: 0 10px 30px; text-align: center; }
@@ -1364,6 +1486,18 @@ onBeforeUnmount(() => {
 .ai-history-title { overflow: hidden; font-size: var(--overlay-option-font-size); font-weight: 600; text-overflow: ellipsis; white-space: nowrap; }
 .ai-history-pin { width: 12px; height: 12px; margin-right: 3px; color: var(--blue); vertical-align: -1px; }
 .ai-history-item small { color: var(--muted); font-size: 11px; }
+/* 副行：来源笔记 · 时间 · 轮数。来源要能点，所以整行用 flex 排、溢出靠 min-width 收。 */
+.ai-history-meta { display: flex; min-width: 0; align-items: center; gap: 6px; overflow: hidden; white-space: nowrap; }
+/* 来源做成小标签：历史里「新对话」这类标题大量重名，不标出在哪篇笔记下问的就分不清。 */
+.ai-history-note { display: inline-flex; max-width: 96px; align-items: center; gap: 3px; overflow: hidden; border: 0; border-radius: 4px; padding: 0 3px; background: transparent; color: var(--muted); font-family: inherit; font-size: 11px; cursor: pointer; }
+.ai-history-note span { overflow: hidden; text-overflow: ellipsis; }
+.ai-history-note svg { width: 10px; height: 10px; flex: none; }
+.ai-history-note:hover { background: rgba(47,128,237,.1); color: var(--blue); }
+/* 归属笔记被删（含进了回收站）：只留一句说明，没有可跳的目标。 */
+.ai-history-note.is-missing { cursor: default; opacity: .65; }
+.ai-history-note.is-missing:hover { background: transparent; color: var(--muted); }
+/* 列表项从 button 换成了带 role 的 div，焦点环要自己补。 */
+.ai-history-item:focus-visible { outline: 2px solid rgba(47,128,237,.5); outline-offset: -2px; }
 /* 行内改名：和列表项等高，不撑动布局。 */
 .ai-history-rename { flex: 1; min-width: 0; height: 30px; border: 1px solid rgba(47,128,237,.55); border-radius: var(--overlay-item-radius); padding: 0 8px; background: var(--surface-solid); color: var(--ink); font-family: inherit; font-size: var(--overlay-option-font-size); font-weight: 600; outline: none; }
 /* 置顶 / 改名 / 删除只在悬停或键盘聚焦时浮出：列表本身是「点一下打开」。 */

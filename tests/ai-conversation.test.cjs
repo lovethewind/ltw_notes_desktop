@@ -305,7 +305,7 @@ test('搜索命中标题或任意一轮的提问，通配字符按字面处理',
     })
     const other = repository.appendAiConversationTurn({ question: '完全无关的话题', answer: '答。' })
 
-    const idsOf = (keyword) => repository.listAiConversations(keyword).map((item) => item.id)
+    const idsOf = (keyword) => repository.listAiConversations({ keyword }).map((item) => item.id)
     assert.deepEqual(idsOf('线程'), [first.conversationId])
     assert.deepEqual(idsOf('命中率'), [first.conversationId])
     // `%` 和 `_` 必须转义成字面量，否则会变成通配符匹配到别的行。
@@ -315,8 +315,134 @@ test('搜索命中标题或任意一轮的提问，通配字符按字面处理',
     assert.deepEqual(idsOf('   ').sort(), [first.conversationId, other.conversationId].sort())
     assert.deepEqual(idsOf('搜不到的词'), [])
     // 搜索只过滤，不改条数与顺序。
-    assert.equal(repository.listAiConversations('').length, 2)
+    assert.equal(repository.listAiConversations({}).length, 2)
   })
+})
+
+test('会话记下归属笔记，标题以 notes 表为准而非存快照', () => {
+  withRepository((repository) => {
+    const note = repository.createNote(null)
+    repository.updateNote(note.id, { title: '并发方案' })
+    repository.appendAiConversationTurn({
+      question: '线程池怎么配',
+      answer: '答。',
+      noteId: note.id
+    })
+
+    const [item] = repository.listAiConversations({})
+    assert.equal(item.noteId, note.id)
+    assert.equal(item.noteTitle, '并发方案')
+
+    // 笔记改名后历史里跟着变：存快照的话这里会停在旧名字。
+    repository.updateNote(note.id, { title: '并发方案（改）' })
+    assert.equal(repository.listAiConversations({})[0].noteTitle, '并发方案（改）')
+  })
+})
+
+test('追问不改变会话归属：中途切到别的笔记，仍记在开始时那篇', () => {
+  withRepository((repository) => {
+    const first = repository.createNote(null)
+    const second = repository.createNote(null)
+    const saved = repository.appendAiConversationTurn({
+      question: '第一问',
+      answer: '答。',
+      noteId: first.id
+    })
+    // 已有 conversationId 时 noteId 必须被忽略，否则一条对话的归属会随追问漂移。
+    repository.appendAiConversationTurn({
+      conversationId: saved.conversationId,
+      question: '切到另一篇之后接着问',
+      answer: '答。',
+      noteId: second.id
+    })
+
+    const list = repository.listAiConversations({})
+    assert.equal(list.length, 1)
+    assert.equal(list[0].noteId, first.id)
+  })
+})
+
+test('按 noteId 过滤只留归属该笔记的会话，不带归属的老会话不混进来', () => {
+  withRepository((repository) => {
+    const first = repository.createNote(null)
+    const second = repository.createNote(null)
+    repository.appendAiConversationTurn({ question: '问一', answer: '答。', noteId: first.id })
+    tick()
+    repository.appendAiConversationTurn({ question: '问二', answer: '答。', noteId: second.id })
+    tick()
+    // 没有选区、也没有打开笔记时问的：归属为空，任何按笔记过滤都查不到它。
+    repository.appendAiConversationTurn({ question: '问三', answer: '答。' })
+
+    const scoped = repository.listAiConversations({ noteId: first.id })
+    assert.equal(scoped.length, 1)
+    assert.equal(scoped[0].noteId, first.id)
+    assert.equal(repository.listAiConversations({ noteId: 'missing-note' }).length, 0)
+    assert.equal(repository.listAiConversations({}).length, 3)
+  })
+})
+
+test('归属笔记被删或进回收站时标题置空，会话本身留着', () => {
+  withRepository((repository) => {
+    const note = repository.createNote(null)
+    repository.appendAiConversationTurn({ question: '问', answer: '答。', noteId: note.id })
+    assert.ok(repository.listAiConversations({})[0].noteTitle)
+
+    // 软删除 = 进了回收站：跳过去只会打开回收站条目，按「已删除」处理。
+    repository.setNoteDeleted(note.id, true)
+    const trashed = repository.listAiConversations({})[0]
+    assert.equal(trashed.noteTitle, null)
+    // 归属 ID 仍然记着，只是没有可跳的目标，界面据此显示「笔记已删除」。
+    assert.equal(trashed.noteId, note.id)
+
+    // 彻底删掉：问过的对话不该被一篇笔记的删除带走。
+    repository.deleteNotePermanently(note.id)
+    const survivors = repository.listAiConversations({})
+    assert.equal(survivors.length, 1)
+    assert.equal(survivors[0].noteTitle, null)
+    assert.equal(repository.getAiConversation(survivors[0].id).noteTitle, null)
+  })
+})
+
+test('老库缺 note_id / pinned 列时自动补齐，已有会话照常读得出来', () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'ltw-notes-ai-legacy-'))
+  const legacy = new Database(path.join(directory, 'notes.sqlite3'))
+  // 手搓一张「上一版」的表：只有 id / title / 两个时间戳。
+  legacy.exec(`
+    CREATE TABLE ai_conversations (
+      id TEXT PRIMARY KEY,
+      title TEXT NOT NULL DEFAULT '新对话',
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+    CREATE TABLE ai_conversation_turns (
+      id TEXT PRIMARY KEY,
+      conversation_id TEXT NOT NULL,
+      position INTEGER NOT NULL,
+      question TEXT NOT NULL,
+      answer TEXT NOT NULL,
+      sources_json TEXT NOT NULL DEFAULT '[]',
+      citation_missing INTEGER NOT NULL DEFAULT 0,
+      created_at TEXT NOT NULL
+    );
+  `)
+  const timestamp = '2026-10-01T00:00:00.000Z'
+  legacy.prepare(
+    'INSERT INTO ai_conversations(id, title, created_at, updated_at) VALUES (?, ?, ?, ?)'
+  ).run('legacy-1', '旧对话', timestamp, timestamp)
+  legacy.close()
+
+  const repository = openNotesDatabase(directory)
+  try {
+    const [item] = repository.listAiConversations({})
+    assert.equal(item.id, 'legacy-1')
+    // 迁移补上的两列：置顶默认 0，归属为空 —— 老会话不会因此从历史里消失。
+    assert.equal(item.pinned, false)
+    assert.equal(item.noteId, null)
+    assert.equal(item.noteTitle, null)
+  } finally {
+    repository.close()
+    fs.rmSync(directory, { recursive: true, force: true })
+  }
 })
 
 test('置顶的会话不受 30 天清理影响，没置顶的照常被清', () => {

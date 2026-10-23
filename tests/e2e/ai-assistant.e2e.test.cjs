@@ -715,3 +715,114 @@ test('回答可以插入当前笔记，也能直接存成新笔记', { timeout: 
     await fs.rm(userDataPath, { recursive: true, force: true })
   }
 })
+
+test('会话记得在哪篇笔记下问的：历史标出来源，重开时自动续接', { timeout: 150_000 }, async () => {
+  const userDataPath = await fs.mkdtemp(path.join(os.tmpdir(), 'xinyue-notes-ai-scope-e2e-'))
+  const model = startMockModel(['线程池适合 IO 密集任务。[S1]', '先灰度再全量。[S1]'])
+  const port = await model.listen()
+  let application
+
+  try {
+    application = await launchApplication(userDataPath)
+    let page = application.page
+    // 两篇都放上标签栏：后面要靠点标签在两篇之间来回切。
+    await page.evaluate(async () => {
+      const first = await window.notesDesktop.createNote(null)
+      await window.notesDesktop.updateNote(first.id, {
+        title: '并发方案',
+        content: '线程池适合 IO 密集任务。'
+      })
+      const second = await window.notesDesktop.createNote(null)
+      await window.notesDesktop.updateNote(second.id, {
+        title: '部署清单',
+        content: '灰度发布跑稳之后再全量。'
+      })
+      await window.notesDesktop.saveWorkspaceSession({
+        tabs: [{ noteId: first.id, isPinned: false }, { noteId: second.id, isPinned: false }],
+        activeNoteId: first.id
+      })
+    })
+    await page.reload()
+    await page.locator('.milkdown-editor-root .ProseMirror').waitFor()
+
+    await page.getByRole('button', { name: 'AI 笔记助手' }).click()
+    let panel = page.getByRole('complementary', { name: 'AI 笔记助手' })
+    await panel.waitFor()
+    await saveAiSettings(panel, { baseUrl: `http://127.0.0.1:${port}`, model: 'scope-test' })
+
+    // ① 在《并发方案》里问一轮：这条对话归属 A。
+    await panel.getByLabel('你想从笔记中了解什么？').fill('线程池适合什么任务')
+    await panel.getByRole('button', { name: '发送' }).click()
+    await page.waitForFunction(() => (
+      document.querySelectorAll('.ai-answer-text').length === 1
+      && !document.querySelector('.ai-answer-text.is-streaming')
+    ), null, { timeout: 20_000 })
+
+    // ② 切到《部署清单》，开新对话再问：新会话归属 B。
+    await page.locator('.note-tab-main', { hasText: '部署清单' }).click()
+    await page.waitForFunction(() => document.querySelector('.title-input')?.value === '部署清单')
+    await panel.getByRole('button', { name: '新对话' }).click()
+    await panel.getByLabel('你想从笔记中了解什么？').fill('部署顺序怎么排')
+    await panel.getByRole('button', { name: '发送' }).click()
+    await page.waitForFunction(() => (
+      document.querySelectorAll('.ai-answer-text').length === 1
+      && !document.querySelector('.ai-answer-text.is-streaming')
+    ), null, { timeout: 20_000 })
+
+    // ③ 历史里两条对话各自标出归属笔记。
+    await panel.getByRole('button', { name: '历史对话' }).click()
+    const sheet = panel.getByRole('region', { name: '历史对话' })
+    await sheet.locator('.ai-history-item').first().waitFor({ timeout: 5000 })
+    assert.equal(await sheet.locator('.ai-history-item').count(), 2)
+    const sources = await sheet.locator('.ai-history-note').allInnerTexts()
+    assert.deepEqual(sources.sort(), ['并发方案', '部署清单'].sort())
+
+    // ④ 点来源标签跳回那篇笔记：历史层收起，标题切过去。
+    const threadRow = sheet.locator('li', { hasText: '线程池适合什么任务' })
+    await threadRow.locator('.ai-history-note', { hasText: '并发方案' }).click()
+    await sheet.waitFor({ state: 'detached', timeout: 5000 })
+    await page.waitForFunction(() => document.querySelector('.title-input')?.value === '并发方案')
+
+    // ⑤ 重开应用：内存里的对话没了，打开面板应当把当前笔记上次的对话接回来。
+    await application.electronApplication.close()
+    application = await launchApplication(userDataPath)
+    page = application.page
+    const activeTitle = await page.locator('.title-input').inputValue()
+    await page.getByRole('button', { name: 'AI 笔记助手' }).click()
+    panel = page.getByRole('complementary', { name: 'AI 笔记助手' })
+    await panel.waitFor()
+
+    const banner = panel.locator('.ai-resumed')
+    await banner.waitFor({ timeout: 10_000 })
+    // 横幅必须点名是哪篇笔记的对话，否则用户不知道眼前这些旧内容从哪来。
+    assert.match(await banner.innerText(), new RegExp(activeTitle))
+    assert.ok(await panel.locator('.ai-bubble--user').count() >= 1, '续接后应该能看到上次的提问')
+
+    // ⑥ 「开始新对话」退回空白，且关掉再打开不会又被自动载回来。
+    await panel.getByRole('button', { name: '开始新对话' }).click()
+    await banner.waitFor({ state: 'detached', timeout: 5000 })
+    assert.equal(await panel.locator('.ai-bubble--user').count(), 0)
+
+    await page.getByRole('button', { name: 'AI 笔记助手' }).click()
+    await panel.waitFor({ state: 'detached' })
+    await page.getByRole('button', { name: 'AI 笔记助手' }).click()
+    panel = page.getByRole('complementary', { name: 'AI 笔记助手' })
+    await panel.waitFor()
+    await page.waitForTimeout(600)
+    assert.equal(await panel.locator('.ai-resumed').count(), 0, '刚开过新对话就不该再自动续接')
+    assert.equal(await panel.locator('.ai-bubble--user').count(), 0)
+
+    // ⑦ 换到另一篇笔记：面板还开着、会话是空白的，应当直接接上那一篇自己的对话。
+    //    （⑦ 必须切到「另一篇」：重启后的活跃笔记本来就是《并发方案》，点同名标签
+    //    不会改变 currentNoteId，跳过标记也就不会清掉。）
+    await page.locator('.note-tab-main', { hasText: '部署清单' }).click()
+    await page.waitForFunction(() => document.querySelector('.title-input')?.value === '部署清单')
+    await panel.locator('.ai-resumed').waitFor({ timeout: 10_000 })
+    assert.match(await panel.locator('.ai-resumed').innerText(), /部署清单/)
+    assert.match(await panel.locator('.ai-bubble--user').first().innerText(), /部署顺序怎么排/)
+  } finally {
+    if (application) await application.electronApplication.close().catch(() => {})
+    await model.close()
+    await fs.rm(userDataPath, { recursive: true, force: true })
+  }
+})

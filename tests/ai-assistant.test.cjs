@@ -428,7 +428,7 @@ test('历史对话：IPC、preload、类型与面板四处接线一致', () => {
   }
   // 会话读写走 repository 的现取调用，切换档案后才会落到新库。
   assert.match(mainSource, /aiConversation: \{/)
-  assert.match(mainSource, /list: \(keyword\) => repository\.listAiConversations\(keyword\)/)
+  assert.match(mainSource, /list: \(options\) => repository\.listAiConversations\(options \|\| \{\}\)/)
   // 改名与置顶：通道 → 域方法 → 仓库方法，三段都要在。
   assert.match(mainSource, /rename: \(conversationId, title\) => repository\.renameAiConversation/)
   assert.match(mainSource, /setPinned: \(conversationId, pinned\) => repository\.setAiConversationPinned/)
@@ -438,8 +438,20 @@ test('历史对话：IPC、preload、类型与面板四处接线一致', () => {
   assert.match(typesSource, /setAiConversationPinned/)
   // 置顶要能影响排序与清理，两个字段都得从库里读出来。
   assert.match(typesSource, /pinned: boolean/)
-  assert.match(panelSource, /historySearch\.value\.trim\(\) \|\| undefined/)
+  assert.match(panelSource, /listAiConversations\(\{ keyword: keyword \|\| undefined \}\)/)
   assert.match(panelSource, /@input="scheduleSearch"/)
+
+  // 会话归属笔记：面板把当前笔记带进落库，类型里必须能读回标题；
+  // 续接只在空白会话上发生，否则会打断正在进行的对话或吞掉刚选中的片段。
+  assert.match(panelSource, /noteId: props\.currentNoteId/)
+  assert.match(typesSource, /noteId: string \| null/)
+  assert.match(typesSource, /noteTitle: string \| null/)
+  assert.match(panelSource, /async function tryResumeConversation/)
+  assert.match(panelSource, /if \(conversationId\.value \|\| turns\.value\.length \|\| loading\.value\) return/)
+  assert.match(panelSource, /if \(props\.selectionText\) return/)
+  // 历史项从 button 换成了带 role 的 div，键盘入口不能丢。
+  assert.match(panelSource, /class="ai-history-item"\s+role="button"/)
+  assert.match(panelSource, /@keydown\.enter\.prevent="openConversation\(item\)"/)
 
   // 「＋」不再是破坏性清空：旧对话上一轮答完就落库了，这里只负责开一条新的。
   assert.match(panelSource, /function startNewConversation/)

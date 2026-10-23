@@ -2446,7 +2446,7 @@ function registerIpcHandlers() {
     aiAssistant,
     // 会话读写每次现取 repository：切换档案后必须落到新库，不能用闭包里的旧实例。
     aiConversation: {
-      list: (keyword) => repository.listAiConversations(keyword),
+      list: (options) => repository.listAiConversations(options || {}),
       get: (conversationId) => repository.getAiConversation(conversationId),
       appendTurn: (input) => repository.appendAiConversationTurn(input),
       replaceTurn: (input) => repository.replaceAiConversationTurn(input),

@@ -141,6 +141,10 @@ function initializeNotesDatabase(database) {
       title TEXT NOT NULL DEFAULT '新对话',
       -- 置顶：用户手动钉住的会话排在列表最前，且不被保留策略按时间清掉。
       pinned INTEGER NOT NULL DEFAULT 0,
+      -- 归属笔记：只记「这条对话是在哪篇笔记下开始的」，追问不改变它。
+      -- 故意不设外键：笔记删了对话仍留在历史里（显示为「笔记已删除」），
+      -- 否则删一篇笔记会连带抹掉用户问过的整段问答。
+      note_id TEXT,
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL
     );
@@ -260,6 +264,10 @@ function migrateLegacyColumns(database) {
   const conversationColumns = database.prepare("PRAGMA table_info(ai_conversations)").all()
   if (!conversationColumns.some((column) => column.name === "pinned")) {
     database.exec("ALTER TABLE ai_conversations ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0")
+  }
+  // 同一批：会话归属笔记。老会话留 NULL，列表里不显示来源标签，其余照旧可用。
+  if (!conversationColumns.some((column) => column.name === "note_id")) {
+    database.exec("ALTER TABLE ai_conversations ADD COLUMN note_id TEXT")
   }
 }
 
