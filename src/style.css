@@ -322,11 +322,18 @@ button { color: inherit; }
 
 .editor-meta { position: relative; z-index: 25; padding: 8px 16px; border-bottom: 1px solid var(--line); }
 .editor-body { position: relative; }
-.note-find-bar { position: absolute; z-index: 45; top: 10px; right: 18px; display: flex; align-items: center; gap: 5px; border: 1px solid #d6e1ed; border-radius: 11px; padding: 6px 7px 6px 10px; background: rgba(255,255,255,.97); box-shadow: 0 12px 32px rgba(30,52,80,.16); color: #718299; }
-.note-find-bar > input { width: 210px; border: 0; outline: 0; background: transparent; color: #263a53; font-size: 12px; }
-.note-find-bar > span { min-width: 34px; color: #8795a7; font-size: 10px; text-align: center; }
-.note-find-bar > button { width: 27px; height: 27px; display: grid; place-items: center; border: 0; border-radius: 7px; background: transparent; color: #627891; cursor: pointer; }
-.note-find-bar > button:hover { background: #edf5ff; color: var(--blue); }
+/* 查找条：外层只管容器与阴影，行内布局交给 .note-find-row。
+   ⚠️ 别再写 `.note-find-bar > input` 这类直接子选择器 —— 输入框已经下沉到行容器内，
+   照旧写会静默失效（样式不报错、只是不生效）。 */
+.note-find-bar { position: absolute; z-index: 45; top: 10px; right: 18px; display: grid; gap: 2px; border: 1px solid #d6e1ed; border-radius: 11px; padding: 5px 7px 5px 10px; background: rgba(255,255,255,.97); box-shadow: 0 12px 32px rgba(30,52,80,.16); color: #718299; }
+.note-find-row { display: flex; align-items: center; gap: 5px; }
+.note-find-row > input { width: 210px; border: 0; outline: 0; background: transparent; color: #263a53; font-size: 12px; }
+.note-find-row > span { min-width: 34px; color: #8795a7; font-size: 10px; text-align: center; }
+.note-find-row > button { width: 27px; height: 27px; display: grid; place-items: center; border: 0; border-radius: 7px; background: transparent; color: #627891; cursor: pointer; }
+.note-find-row > button:hover { background: #edf5ff; color: var(--blue); }
+/* 替换行是文字按钮，撑不开的话「全部」会被压成两个字叠一起。 */
+.note-find-row--replace > button { width: auto; height: 24px; padding: 0 8px; font-size: 11px; white-space: nowrap; }
+.note-find-toggle.is-active { background: #e7f1ff; color: var(--blue); }
 .milkdown-editor-root .note-find-match { border-radius: 3px; background: #ffd95c; color: #3f3200; box-shadow: 0 0 0 1px rgba(180,130,0,.18); }
 body.is-link-modifier-active .milkdown-editor-root a[href] { cursor: pointer; }
 .milkdown-editor-shell.is-preview .milkdown-editor-root a[href] { cursor: pointer; }
@@ -1756,9 +1763,10 @@ button:focus-visible { outline: 3px solid rgba(47,128,237,.22); outline-offset: 
   .database-backup-status.error { border-color: #653945; background: #321f2a; }
   .database-backup-policy select, .database-backup-policy input, .database-backup-policy button { border-color: #35506f; background: #172941; color: #b8c7da; }
   .note-find-bar { border-color: #31465f; background: rgba(20,36,58,.98); color: #91a6bd; }
-  .note-find-bar > input { color: #e1ebf8; }
-  .note-find-bar > button { color: #9eb1c7; }
-  .note-find-bar > button:hover { background: #203853; color: #8cbcf7; }
+  .note-find-row > input { color: #e1ebf8; }
+  .note-find-row > button { color: #9eb1c7; }
+  .note-find-row > button:hover { background: #203853; color: #8cbcf7; }
+  .note-find-toggle.is-active { background: #203853; color: #8cbcf7; }
   .milkdown-editor-root .note-find-match { background: #c48d19; color: #fff7dc; box-shadow: 0 0 0 1px rgba(255,220,125,.24); }
   .database-backup-list article { border-color: #2c405b; background: #14253c; }
   .database-backup-kind { background: #1d3a5b; color: #8bbcf8; }

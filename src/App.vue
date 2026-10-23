@@ -169,11 +169,30 @@ const searchInput = ref<HTMLInputElement | null>(null)
 const noteFindVisible = ref(false)
 const noteFindKeyword = ref('')
 const noteFindInput = ref<HTMLInputElement | null>(null)
+/**
+ * 替换行是否展开。
+ *
+ * 默认收起：⌘F 的既有心智是「一行查找」，常显替换输入会把药丸撑高、压到正文。
+ * 需要替换时点右侧的替换图标或按 ⌘⌥F 展开。
+ */
+const noteReplaceVisible = ref(false)
+const noteReplaceKeyword = ref('')
+const noteReplaceInput = ref<HTMLInputElement | null>(null)
 const noteFindResult = reactive({ count: 0, index: -1 })
 const markdownEditorRef = ref<{
   clearFindHighlight: () => void
   findText: (keyword: string, requestedIndex: number) => { count: number, index: number }
   getScrollTop: () => number
+  /**
+   * 把当前匹配或全部匹配替换成新文本。
+   *
+   * 两个编辑器同一签名：单次替换后再调用一次自己重新定位下一个匹配。
+   */
+  replaceText: (
+    keyword: string,
+    replacement: string,
+    options?: { all?: boolean }
+  ) => { replaced: number, count: number, index: number }
   /**
    * 在光标处插入一段 Markdown。
    *
@@ -893,11 +912,13 @@ function openQuickOpen(): void {
 /**
  * 打开当前笔记查找栏并聚焦关键词输入框。
  *
+ * :param showReplace: 是否同时展开替换行（⌘⌥F）。
  * :return: 无返回值。
  */
-function openCurrentNoteFind(): void {
+function openCurrentNoteFind(showReplace = false): void {
   if (!activeNote.value && !activeFileDoc.value) return
   noteFindVisible.value = true
+  if (showReplace) noteReplaceVisible.value = true
   void nextTick(() => {
     noteFindInput.value?.focus()
     noteFindInput.value?.select()
@@ -3536,9 +3557,10 @@ function handleShortcut(event: KeyboardEvent): void {
     event.preventDefault()
     searchInput.value?.focus()
   }
+  // ⌘F 查找、⌘⌥F 查找并替换。macOS 的 ⌘H 被系统「隐藏窗口」占用，替换只能挂在 F 上。
   if (event.key.toLocaleLowerCase() === 'f' && (activeNote.value || activeFileDoc.value)) {
     event.preventDefault()
-    openCurrentNoteFind()
+    openCurrentNoteFind(event.altKey)
   }
 }
 
@@ -3570,12 +3592,52 @@ function refreshCurrentNoteFind(): void {
 }
 
 /**
+ * 展开或收起替换行。
+ *
+ * :return: 无返回值。
+ */
+function toggleNoteReplace(): void {
+  noteReplaceVisible.value = !noteReplaceVisible.value
+  if (!noteReplaceVisible.value) return
+  void nextTick(() => {
+    noteReplaceInput.value?.focus()
+    noteReplaceInput.value?.select()
+  })
+}
+
+/**
+ * 替换当前匹配或全部匹配。
+ *
+ * 统一走编辑器暴露的 `replaceText`：富文本走 ProseMirror 事务、源码走 CodeMirror
+ * changes，两边都只算一次撤销，撤销后不会留下替换到一半的中间态。
+ *
+ * :param all: 是否替换全部匹配。
+ * :return: 无返回值。
+ */
+function replaceInCurrentNote(all = false): void {
+  if (!noteFindKeyword.value.trim()) return
+  const result = markdownEditorRef.value?.replaceText(
+    noteFindKeyword.value,
+    noteReplaceKeyword.value,
+    { all }
+  )
+  if (!result) return
+  Object.assign(noteFindResult, { count: result.count, index: result.index })
+  if (!result.replaced) {
+    showEditorFeedback('没有可替换的匹配')
+    return
+  }
+  showEditorFeedback(all ? `已替换 ${result.replaced} 处` : '已替换 1 处')
+}
+
+/**
  * 关闭当前笔记查找并清除匹配高亮。
  *
  * :return: 无返回值。
  */
 function closeCurrentNoteFind(): void {
   noteFindVisible.value = false
+  noteReplaceVisible.value = false
   markdownEditorRef.value?.clearFindHighlight()
 }
 
@@ -3634,11 +3696,13 @@ watch(draft, scheduleSave, { deep: true })
 watch(activeNoteId, () => {
   closeCurrentNoteFind()
   noteFindKeyword.value = ''
+  noteReplaceKeyword.value = ''
   Object.assign(noteFindResult, { count: 0, index: -1 })
 })
 watch(activeFilePath, () => {
   closeCurrentNoteFind()
   noteFindKeyword.value = ''
+  noteReplaceKeyword.value = ''
   Object.assign(noteFindResult, { count: 0, index: -1 })
 })
 watch(activeNoteId, syncCurrentNoteTab)
@@ -4414,19 +4478,43 @@ onBeforeUnmount(() => {
 
           <div class="editor-body">
             <div v-if="noteFindVisible" class="note-find-bar">
-              <Icon icon="tabler:search" />
-              <input
-                ref="noteFindInput"
-                v-model="noteFindKeyword"
-                type="search"
-                placeholder="在当前笔记中查找"
-                @input="refreshCurrentNoteFind"
-                @keydown.enter.prevent="findInCurrentNote($event.shiftKey ? -1 : 1)"
-              />
-              <span>{{ noteFindResult.count ? `${noteFindResult.index + 1}/${noteFindResult.count}` : '0/0' }}</span>
-              <button type="button" aria-label="上一个匹配" @click="findInCurrentNote(-1)"><Icon icon="tabler:chevron-up" /></button>
-              <button type="button" aria-label="下一个匹配" @click="findInCurrentNote(1)"><Icon icon="tabler:chevron-down" /></button>
-              <button type="button" aria-label="关闭查找" @click="closeCurrentNoteFind"><Icon icon="tabler:x" /></button>
+              <div class="note-find-row">
+                <Icon icon="tabler:search" />
+                <input
+                  ref="noteFindInput"
+                  v-model="noteFindKeyword"
+                  type="search"
+                  placeholder="在当前笔记中查找"
+                  @input="refreshCurrentNoteFind"
+                  @keydown.enter.prevent="findInCurrentNote($event.shiftKey ? -1 : 1)"
+                />
+                <span>{{ noteFindResult.count ? `${noteFindResult.index + 1}/${noteFindResult.count}` : '0/0' }}</span>
+                <button type="button" aria-label="上一个匹配" @click="findInCurrentNote(-1)"><Icon icon="tabler:chevron-up" /></button>
+                <button type="button" aria-label="下一个匹配" @click="findInCurrentNote(1)"><Icon icon="tabler:chevron-down" /></button>
+                <button
+                  type="button"
+                  class="note-find-toggle"
+                  :class="{ 'is-active': noteReplaceVisible }"
+                  :aria-label="noteReplaceVisible ? '收起替换' : '展开替换'"
+                  :aria-pressed="noteReplaceVisible"
+                  @click="toggleNoteReplace"
+                >
+                  <Icon icon="tabler:replace" />
+                </button>
+                <button type="button" aria-label="关闭查找" @click="closeCurrentNoteFind"><Icon icon="tabler:x" /></button>
+              </div>
+              <div v-if="noteReplaceVisible" class="note-find-row note-find-row--replace">
+                <Icon icon="tabler:arrow-back-up" />
+                <input
+                  ref="noteReplaceInput"
+                  v-model="noteReplaceKeyword"
+                  type="text"
+                  placeholder="替换为"
+                  @keydown.enter.prevent="replaceInCurrentNote($event.metaKey || $event.ctrlKey)"
+                />
+                <button type="button" @click="replaceInCurrentNote(false)">替换</button>
+                <button type="button" @click="replaceInCurrentNote(true)">全部</button>
+              </div>
             </div>
             <!--
               外部文件：用源码编辑器按原文编辑，保存时逐字符写回磁盘。

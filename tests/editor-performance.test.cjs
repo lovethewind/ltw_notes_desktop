@@ -274,8 +274,9 @@ test("笔记内查找定位结果时不会抢走查找框焦点", () => {
     resolve(projectRoot, "src/components/MarkdownVisualEditor.vue"),
     "utf8"
   )
+  // 块边界取「顶格 }」：函数体内部都是缩进的，不会撞上。
   const findTextBlock = editorSource.match(
-    /function findText\([\s\S]*?\n}\n\n\/\*\*[\s\S]*?function clearFindHighlight/
+    /function findText\([\s\S]*?\n}\n/
   )?.[0]
 
   assert.ok(findTextBlock, "应找到笔记内查找实现")
@@ -287,13 +288,21 @@ test("笔记内查找在不抢焦点时显式滚动编辑区", () => {
     resolve(projectRoot, "src/components/MarkdownVisualEditor.vue"),
     "utf8"
   )
+  // 滚动逻辑已抽成 scrollMatchIntoView（查找与替换共用），断言落在它身上。
+  const scrollBlock = editorSource.match(
+    /function scrollMatchIntoView\([\s\S]*?\n}\n/
+  )?.[0]
   const findTextBlock = editorSource.match(
-    /function findText\([\s\S]*?\n}\n\n\/\*\*[\s\S]*?function clearFindHighlight/
+    /function findText\([\s\S]*?\n}\n/
   )?.[0]
 
+  assert.ok(scrollBlock, "应找到滚动定位实现")
+  assert.match(scrollBlock, /closest<HTMLElement>\('\.milkdown-editor-scroll'\)/)
+  assert.match(scrollBlock, /scrollContainer\.scrollTo/)
   assert.ok(findTextBlock, "应找到笔记内查找实现")
-  assert.match(findTextBlock, /closest<HTMLElement>\('\.milkdown-editor-scroll'\)/)
-  assert.match(findTextBlock, /scrollContainer\.scrollTo/)
+  assert.match(findTextBlock, /scrollMatchIntoView\(view, match\.from\)/)
+  // 查找不能顺手 focus 编辑器：用户还在查找框里输关键词。
+  assert.doesNotMatch(findTextBlock, /view\.focus\(\)/)
 })
 
 test("笔记内查找使用独立装饰持续高亮当前匹配项", () => {

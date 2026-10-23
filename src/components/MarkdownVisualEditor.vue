@@ -3575,6 +3575,58 @@ async function insertMarkdown(markdown: string): Promise<{ ok: boolean, message:
 }
 
 /**
+ * 收集文档中的全部查找匹配（关键词需已 trim + 小写化）。
+ *
+ * 只在**单个文本节点内**匹配：`线程` + 加粗的 `池` 不会被当成一个词命中。
+ * 跨节点命中会牵出标记边界，替换后新文本该继承哪边的样式无从判断，
+ * 所以查找和替换共用这一套口径，宁可靠"找不到"也不猜。
+ *
+ * :param documentNode: ProseMirror 文档节点。
+ * :param normalizedKeyword: 已小写化的关键词；空串直接返回空数组。
+ * :return: 匹配区间列表，按文档顺序排列。
+ */
+function collectDocumentMatches(
+  documentNode: ProseMirrorNode,
+  normalizedKeyword: string
+): Array<{ from: number, to: number }> {
+  const matches: Array<{ from: number, to: number }> = []
+  if (!normalizedKeyword) return matches
+  documentNode.descendants((node, position) => {
+    if (!node.isText || !node.text) return
+    const normalizedText = node.text.toLocaleLowerCase()
+    let offset = normalizedText.indexOf(normalizedKeyword)
+    while (offset >= 0) {
+      matches.push({
+        from: position + offset,
+        to: position + offset + normalizedKeyword.length
+      })
+      offset = normalizedText.indexOf(normalizedKeyword, offset + normalizedKeyword.length)
+    }
+  })
+  return matches
+}
+
+/**
+ * 把某个文档位置滚到视口中间。
+ *
+ * 顶部查找条会盖住正文上沿，居中而不是贴顶才看得见当前匹配。
+ *
+ * :param view: ProseMirror 视图。
+ * :param position: 文档位置。
+ * :return: 无返回值。
+ */
+function scrollMatchIntoView(view: ProseMirrorView, position: number): void {
+  const scrollContainer = view.dom.closest<HTMLElement>('.milkdown-editor-scroll')
+  if (!scrollContainer) return
+  const matchCoordinates = view.coordsAtPos(position)
+  const containerRect = scrollContainer.getBoundingClientRect()
+  scrollContainer.scrollTo({
+    top: scrollContainer.scrollTop + matchCoordinates.top - containerRect.top - containerRect.height / 2,
+    behavior: 'auto'
+  })
+}
+
+/**
  * 在编辑器正文中查找并选中指定匹配项。
  *
  * :param keyword: 查找关键词。
@@ -3587,26 +3639,11 @@ function findText(keyword: string, requestedIndex: number): { count: number, ind
   // 预览层盖在编辑器上，高亮在里面看不见 —— 先带用户回到编辑态再定位。
   // 与外部文件预览（MarkdownSourceEditor）同一处置：两边都是「预览不可编辑，查找要能看见」。
   if (previewMode.value) togglePreview()
-  const matches: Array<{ from: number, to: number }> = []
+  let found = 0
   editor.editor.action((context) => {
     const view = context.get(editorViewCtx)
-    if (!normalizedKeyword) {
-      activeFindMatch = null
-      view.dispatch(view.state.tr)
-      return
-    }
-    view.state.doc.descendants((node, position) => {
-      if (!node.isText || !node.text) return
-      const normalizedText = node.text.toLocaleLowerCase()
-      let offset = normalizedText.indexOf(normalizedKeyword)
-      while (offset >= 0) {
-        matches.push({
-          from: position + offset,
-          to: position + offset + normalizedKeyword.length
-        })
-        offset = normalizedText.indexOf(normalizedKeyword, offset + normalizedKeyword.length)
-      }
-    })
+    const matches = collectDocumentMatches(view.state.doc, normalizedKeyword)
+    found = matches.length
     if (!matches.length) {
       activeFindMatch = null
       view.dispatch(view.state.tr)
@@ -3615,27 +3652,78 @@ function findText(keyword: string, requestedIndex: number): { count: number, ind
     const index = ((requestedIndex % matches.length) + matches.length) % matches.length
     const match = matches[index]
     activeFindMatch = match
-    const transaction = view.state.tr
-      .setSelection(TextSelection.create(view.state.doc, match.from, match.to))
-    view.dispatch(transaction)
-    const scrollContainer = view.dom.closest<HTMLElement>('.milkdown-editor-scroll')
-    if (scrollContainer) {
-      const matchCoordinates = view.coordsAtPos(match.from)
-      const containerRect = scrollContainer.getBoundingClientRect()
-      scrollContainer.scrollTo({
-        top: scrollContainer.scrollTop
-          + matchCoordinates.top
-          - containerRect.top
-          - containerRect.height / 2,
-        behavior: 'auto'
-      })
-    }
+    view.dispatch(view.state.tr.setSelection(TextSelection.create(view.state.doc, match.from, match.to)))
+    scrollMatchIntoView(view, match.from)
   })
-  if (!matches.length) return { count: 0, index: -1 }
-  return {
-    count: matches.length,
-    index: ((requestedIndex % matches.length) + matches.length) % matches.length
-  }
+  if (!found) return { count: 0, index: -1 }
+  return { count: found, index: ((requestedIndex % found) + found) % found }
+}
+
+/**
+ * 把当前匹配或全部匹配替换成新文本（笔记内查找替换用）。
+ *
+ * 匹配口径与 findText 完全一致。替换文本按**纯文本**插入：在替换框里写 `**粗**`
+ * 得到的就是这串字符，不会变成粗体 —— 用户要的是改字，不是改样式；
+ * 真按 Markdown 解析反而会凭空生成节点，撤销粒度也会碎掉。
+ *
+ * :param keyword: 查找关键词。
+ * :param replacement: 替换文本；空串等于删除匹配内容。
+ * :param options: `all` 为真时替换全部匹配。
+ * :return: 实际替换数量、替换后剩余匹配数与当前高亮索引。
+ */
+function replaceText(
+  keyword: string,
+  replacement: string,
+  options: { all?: boolean } = {}
+): { replaced: number, count: number, index: number } {
+  const normalizedKeyword = keyword.trim().toLocaleLowerCase()
+  if (!editor || !editorReady || !normalizedKeyword) return { replaced: 0, count: 0, index: -1 }
+  // 预览态下改在里面看不见，先回编辑态（与 findText 同一处置）。
+  if (previewMode.value) togglePreview()
+  let replaced = 0
+  let count = 0
+  let index = -1
+  editor.editor.action((context) => {
+    const view = context.get(editorViewCtx)
+    const matches = collectDocumentMatches(view.state.doc, normalizedKeyword)
+    if (!matches.length) {
+      activeFindMatch = null
+      view.dispatch(view.state.tr)
+      return
+    }
+    if (options.all) {
+      // 倒序改：一次事务、一次撤销，而且靠前匹配的偏移不会被打乱。
+      let transaction = view.state.tr
+      for (let cursor = matches.length - 1; cursor >= 0; cursor -= 1) {
+        transaction = transaction.insertText(replacement, matches[cursor].from, matches[cursor].to)
+      }
+      activeFindMatch = null
+      view.dispatch(transaction)
+      replaced = matches.length
+      return
+    }
+    // 单次：优先改当前高亮那一条；高亮已被编辑改没了就退回第一条。
+    const target = matches.find((match) => activeFindMatch?.from === match.from) ?? matches[0]
+    view.dispatch(view.state.tr.insertText(replacement, target.from, target.to))
+    replaced = 1
+    // 替换会挪动其后所有匹配的位置，只能在新文档上重新收集。
+    const remaining = collectDocumentMatches(view.state.doc, normalizedKeyword)
+    count = remaining.length
+    if (!remaining.length) {
+      activeFindMatch = null
+      return
+    }
+    // 从替换位置往后找下一个；后面没有了就绕回开头（findIndex 返回 -1 时兜成 0）。
+    index = Math.max(
+      0,
+      remaining.findIndex((match) => match.from >= target.from + replacement.length)
+    )
+    const next = remaining[index]
+    activeFindMatch = next
+    view.dispatch(view.state.tr.setSelection(TextSelection.create(view.state.doc, next.from, next.to)))
+    scrollMatchIntoView(view, next.from)
+  })
+  return { replaced, count, index }
 }
 
 /**
@@ -3651,7 +3739,7 @@ function clearFindHighlight(): void {
   })
 }
 
-defineExpose({ clearFindHighlight, findText, getScrollTop, insertMarkdown })
+defineExpose({ clearFindHighlight, findText, getScrollTop, insertMarkdown, replaceText })
 
 watch(
   () => [props.value, props.documentId] as const,

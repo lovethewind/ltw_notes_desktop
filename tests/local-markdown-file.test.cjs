@@ -65,9 +65,12 @@ test('源码编辑器与富文本编辑器暴露同一套接口', () => {
   const source = readSource('src/components/MarkdownSourceEditor.vue')
   const visualSource = readSource('src/components/MarkdownVisualEditor.vue')
 
-  // App.vue 的「在当前笔记中查找」「插入 AI 回答」是同一条链路，两个编辑器都要接住，
+  // App.vue 的「在当前笔记中查找 / 替换」「插入 AI 回答」是同一条链路，两个编辑器都要接住，
   // 差一个就会出现「文件标签下按钮点了没反应」这种只在特定标签上复现的问题。
-  const exposed = /defineExpose\(\{ clearFindHighlight, findText, getScrollTop, insertMarkdown \}\)/
-  assert.match(source, exposed)
-  assert.match(visualSource, exposed)
+  // 逐项断言而不是整串匹配：以后往 defineExpose 里加接口不会因为顺序不同误报。
+  for (const api of ['clearFindHighlight', 'findText', 'replaceText', 'getScrollTop', 'insertMarkdown']) {
+    const exposed = new RegExp(`defineExpose\\(\\{[^}]*\\b${api}\\b`)
+    assert.match(source, exposed, `源码编辑器缺少暴露接口：${api}`)
+    assert.match(visualSource, exposed, `富文本编辑器缺少暴露接口：${api}`)
+  }
 })

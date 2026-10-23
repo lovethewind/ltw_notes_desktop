@@ -531,6 +531,69 @@ function findText(keyword: string, requestedIndex: number): { count: number, ind
   return { count: matches.length, index }
 }
 
+/**
+ * 把当前匹配或全部匹配替换成新文本（笔记内查找替换用）。
+ *
+ * 与 findText 同一套匹配口径（大小写不敏感、不解析正则）。替换文本原样写入，
+ * 不做转义也不做 Markdown 解析 —— 外部文件是「用户写什么就该是什么」。
+ *
+ * :param keyword: 查找关键词。
+ * :param replacement: 替换文本；空串等于删除匹配内容。
+ * :param options: `all` 为真时替换全部匹配。
+ * :return: 实际替换数量、替换后剩余匹配数与当前高亮索引。
+ */
+function replaceText(
+  keyword: string,
+  replacement: string,
+  options: { all?: boolean } = {}
+): { replaced: number, count: number, index: number } {
+  if (!view) return { replaced: 0, count: 0, index: -1 }
+  // 预览态下 CodeMirror 是收起的，替换后既看不见结果也保持不住高亮。
+  const returnedFromPreview = mode.value === 'preview'
+  if (returnedFromPreview) switchMode('source')
+  const matches = collectMatches(keyword.trim())
+  if (!matches.length) {
+    view.dispatch({ effects: setFindMatches.of(null) })
+    return { replaced: 0, count: 0, index: -1 }
+  }
+  if (options.all) {
+    // 多个 changes 交给 CodeMirror 自己按位置应用，整体只算一次撤销。
+    // 正文一变 findField 就会清空高亮（它的 update 里判 docChanged），不用再补 effect。
+    view.dispatch({
+      changes: matches.map((match) => ({ from: match.from, to: match.to, insert: replacement }))
+    })
+    return { replaced: matches.length, count: 0, index: -1 }
+  }
+  // 单次：改当前高亮那一条；高亮失效（比如刚编辑过）就退回第一条。
+  const activeIndex = view.state.field(findField)?.active ?? -1
+  const target = matches[activeIndex] ?? matches[0]
+  view.dispatch({ changes: { from: target.from, to: target.to, insert: replacement } })
+  // 替换挪动了其后所有匹配的位置，重新收集才能定位下一个。
+  const remaining = collectMatches(keyword.trim())
+  if (!remaining.length) {
+    view.dispatch({ effects: setFindMatches.of(null) })
+    return { replaced: 1, count: 0, index: -1 }
+  }
+  const index = Math.max(
+    0,
+    remaining.findIndex((match) => match.from >= target.from + replacement.length)
+  )
+  const next = remaining[index]
+  view.dispatch({
+    effects: setFindMatches.of({ matches: remaining, active: index }),
+    selection: { anchor: next.from, head: next.to },
+    scrollIntoView: !returnedFromPreview
+  })
+  if (returnedFromPreview) {
+    void nextTick(() => {
+      requestAnimationFrame(() => {
+        view?.dispatch({ selection: { anchor: next.from, head: next.to }, scrollIntoView: true })
+      })
+    })
+  }
+  return { replaced: 1, count: remaining.length, index }
+}
+
 /** 清除查找高亮。 */
 function clearFindHighlight(): void {
   view?.dispatch({ effects: setFindMatches.of(null) })
@@ -567,7 +630,7 @@ function insertMarkdown(markdown: string): { ok: boolean, message: string } {
   return { ok: true, message: '已插入到当前文件' }
 }
 
-defineExpose({ clearFindHighlight, findText, getScrollTop, insertMarkdown })
+defineExpose({ clearFindHighlight, findText, getScrollTop, insertMarkdown, replaceText })
 
 onMounted(() => {
   if (!container.value) return
