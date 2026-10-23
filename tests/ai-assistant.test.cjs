@@ -733,3 +733,74 @@ test('回答落地的接线：面板按钮 → 事件 → App 调编辑器插入
   // 存为新笔记：createNote 只能给文件夹，标题与正文必须再 updateNote 一次。
   assert.match(appSource, /async function saveAiAnswerAsNote[\s\S]{0,700}?updateNote\(created\.id, \{[\s\S]{0,120}?content: payload\.markdown/)
 })
+
+test('来源带上让笔记命中的检索词，供界面把正文滚到命中处', async (context) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'xinyue-ai-anchor-'))
+  context.after(() => fs.rmSync(directory, { recursive: true, force: true }))
+
+  const notes = {
+    'note-1': {
+      id: 'note-1',
+      title: '发布流程',
+      content: '# 发布流程\n\n灰度发布先切 10% 流量。',
+      isDeleted: false
+    },
+    // 关键词只在标题里、正文里没有：定位无从谈起，锚点必须是 null。
+    'note-2': {
+      id: 'note-2',
+      title: '灰度发布规范',
+      content: '正文讲的是别的。',
+      isDeleted: false
+    }
+  }
+  const assistant = createAiAssistant({
+    settingsPath: path.join(directory, 'ai-settings.json'),
+    encryptSecret: (value) => `encrypted:${value}`,
+    decryptSecret: (value) => value.slice('encrypted:'.length),
+    repository: {
+      searchNotes: (term) => (term === '灰度发布' ? [{ id: 'note-1' }, { id: 'note-2' }] : []),
+      getNoteForEditing: (id) => notes[id] || null
+    },
+    request: async () => ({
+      ok: true,
+      status: 200,
+      json: async () => ({ choices: [{ message: { content: '答[S1][S2]' } }] })
+    })
+  })
+  await assistant.saveSettings({ baseUrl: 'https://api.example.com/v1', model: 'demo', apiKey: 'secret' })
+
+  const result = await assistant.ask({ question: '灰度发布怎么切流量', scope: 'all' })
+  assert.deepEqual(result.sources.map((source) => source.noteId), ['note-1', 'note-2'])
+  // 正文里有这个词 → 记住它，点来源能滚到命中处。
+  assert.equal(result.sources[0].matchTerm, '灰度发布')
+  // 只在标题命中 → 正文搜不到，不给锚点（否则界面白滚一趟还是停在顶部）。
+  assert.equal(result.sources[1].matchTerm, null)
+})
+
+test('引用跳转的接线：面板带检索词 → App 滚到命中处且不选中', () => {
+  const projectRoot = path.resolve(__dirname, '..')
+  const read = (relative) => fs.readFileSync(path.join(projectRoot, relative), 'utf8')
+  const panelSource = read('src/components/AiAssistantPanel.vue')
+  const visualEditor = read('src/components/MarkdownVisualEditor.vue')
+  const sourceEditor = read('src/components/MarkdownSourceEditor.vue')
+  const appSource = read('src/App.vue')
+
+  // 面板：事件必须带检索词。只传 noteId 的话打开笔记只能停在顶部，
+  // 而 excerpt 是正文开头那 180 字，拿它当锚点没有意义。
+  assert.match(panelSource, /openSource: \[payload: \{ noteId: string, matchTerm\?: string \| null \}\]/)
+  assert.match(
+    panelSource,
+    /function openSource\(source: AiAssistantSource\)[\s\S]{0,300}?emit\('openSource', \{ noteId: source\.noteId, matchTerm: source\.matchTerm \?\? null \}\)/
+  )
+  assert.match(panelSource, /@click="openSource\(source\)"/)
+
+  // App：切完笔记再定位，且定位失败不报错（命中可能已被改掉）。
+  assert.match(appSource, /await selectNote\(note\)[\s\S]{0,400}?markdownEditorRef\.value\?\.scrollToText\(matchTerm\)/)
+
+  // 两个编辑器都要暴露它。
+  assert.match(visualEditor, /defineExpose\(\{[^}]*scrollToText[^}]*\}\)/)
+  assert.match(sourceEditor, /defineExpose\(\{[^}]*scrollToText[^}]*\}\)/)
+  // 富文本版只能滚、不能选：选中一段会让下一次输入直接覆盖它。
+  assert.match(visualEditor, /function scrollToText[\s\S]{0,600}?scrollMatchIntoView\(view, matches\[0\]\.from\)/)
+  assert.doesNotMatch(visualEditor, /function scrollToText[\s\S]{0,600}?setSelection/)
+})

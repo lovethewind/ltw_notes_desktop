@@ -184,6 +184,13 @@ const markdownEditorRef = ref<{
   findText: (keyword: string, requestedIndex: number) => { count: number, index: number }
   getScrollTop: () => number
   /**
+   * 把正文滚到指定文本处。
+   *
+   * 与 `findText` 的差别是**不选中**：AI 回答的来源跳转只是「带用户去看」，
+   * 留一个选中段会让下一次输入直接把它覆盖掉。
+   */
+  scrollToText: (keyword: string) => boolean
+  /**
    * 把当前匹配或全部匹配替换成新文本。
    *
    * 两个编辑器同一签名：单次替换后再调用一次自己重新定位下一个匹配。
@@ -1002,8 +1009,18 @@ async function locateAttachmentNote(reference: AttachmentNoteReference): Promise
 }
 
 /** 打开 AI 回答引用的原笔记，复用既有关键导航入口而不改变其行为。 */
-async function openAiAssistantSource(noteId: string): Promise<void> {
-  const note = await findWorkspaceNote(noteId, false)
+/**
+ * 打开 AI 回答引用的来源笔记。
+ *
+ * 带上 `matchTerm` 时再把正文滚到命中处：`excerpt` 是笔记开头那 180 字，
+ * 拿它定位只会停在顶部。找不到（命中在标题/标签、文本被改动过）就保持原样，
+ * 只打开整篇 —— 定位失败不该变成一次报错。
+ *
+ * :param payload: 来源笔记 ID 与让这篇命中本次检索的词。
+ * :return: 无返回值。
+ */
+async function openAiAssistantSource(payload: { noteId: string, matchTerm?: string | null }): Promise<void> {
+  const note = await findWorkspaceNote(String(payload?.noteId || ''), false)
   if (!note) {
     actionError.value = '引用笔记已不存在'
     return
@@ -1011,6 +1028,11 @@ async function openAiAssistantSource(noteId: string): Promise<void> {
   searchKeyword.value = ''
   setFilter('all')
   await selectNote(note)
+  const matchTerm = String(payload?.matchTerm || '').trim()
+  if (!matchTerm) return
+  // 新笔记的编辑器要先挂上去才有文档可滚；selectNote 内部已 await 过一次，再等一帧足够。
+  await nextTick()
+  markdownEditorRef.value?.scrollToText(matchTerm)
 }
 
 /** 打开 AI 助手前刷新防抖草稿，确保主进程读取到当前编辑内容。 */

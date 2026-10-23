@@ -685,6 +685,8 @@ function createRepository(database) {
   const AI_CONVERSATION_MAX_AGE_DAYS = 30
   /** 单条来源摘要在库里的最大长度，防止把整篇笔记塞进来。 */
   const AI_SOURCE_EXCERPT_LIMIT = 400
+  /** 来源命中词在库里的最大长度；检索词本身不超过 32 字，留点余量。 */
+  const AI_SOURCE_TERM_LIMIT = 64
 
   /** 把问题压成一行标题，用于历史列表。 */
   function aiConversationTitle(question) {
@@ -701,6 +703,8 @@ function createRepository(database) {
       noteId: String(source?.noteId || ""),
       title: String(source?.title || ""),
       excerpt: String(source?.excerpt || "").slice(0, AI_SOURCE_EXCERPT_LIMIT),
+      // 命中词要跟着存：恢复历史后点来源还能定位到正文命中处。
+      matchTerm: source?.matchTerm ? String(source.matchTerm).slice(0, AI_SOURCE_TERM_LIMIT) : null,
       // 长笔记只取了前 N 字：恢复历史时这条提示也得跟着回来。
       truncated: Boolean(source?.truncated)
     }))

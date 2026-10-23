@@ -194,9 +194,26 @@ function createAiAssistant({ settingsPath, encryptSecret, decryptSecret, reposit
     return { baseUrl, model, hasApiKey: true }
   }
 
-  function appendCandidate(target, seenIds, note) {
+  /**
+   * 收一条候选笔记，并记下让这篇命中检索的那个词。
+   *
+   * 记词是给「点 [S1] 跳过去」用的：界面拿它把正文滚到命中处，
+   * 而不是停在笔记顶部。只记正文里确实出现过的词 —— 命中可能来自标题或标签，
+   * 那种情况正文里根本没有，记了也是白找。
+   *
+   * @param {any[]} target 候选数组（按相关度排）。
+   * @param {Set<string>} seenIds 已收过的笔记 ID，防同一篇被多个词重复收。
+   * @param {any} note 笔记记录。
+   * @param {string} [matchedTerm] 让这篇命中的检索词。
+   * @return {void}
+   */
+  function appendCandidate(target, seenIds, note, matchedTerm) {
     if (!note || note.isDeleted || seenIds.has(note.id) || target.length >= MAX_SOURCE_COUNT) return
     seenIds.add(note.id)
+    const term = String(matchedTerm || '').trim()
+    if (term && String(note.content || '').toLocaleLowerCase().includes(term.toLocaleLowerCase())) {
+      note.matchedTerm = term
+    }
     target.push(note)
   }
 
@@ -221,7 +238,7 @@ function createAiAssistant({ settingsPath, encryptSecret, decryptSecret, reposit
       })
       for (const match of matches) {
         if (filterByFolder && (match.folderId || null) !== folderId) continue
-        appendCandidate(candidates, seenIds, repository.getNoteForEditing(match.id) || match)
+        appendCandidate(candidates, seenIds, repository.getNoteForEditing(match.id) || match, term)
       }
       if (candidates.length >= MAX_SOURCE_COUNT) break
     }
@@ -259,6 +276,8 @@ function createAiAssistant({ settingsPath, encryptSecret, decryptSecret, reposit
         noteId: note.id,
         title,
         excerpt: excerpt.slice(0, 180),
+        // 界面点这条来源时据此定位命中处；「当前笔记」档位没有检索词，给 null。
+        matchTerm: note.matchedTerm || null,
         // 界面据此提示「这篇太长，只取了前 N 字」，别让人以为模型看全了。
         truncated: cleaned.length > excerpt.length
       })

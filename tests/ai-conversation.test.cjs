@@ -73,7 +73,7 @@ test('同一会话里的轮次按追加顺序读回，来源与漏标标记一�
     const first = repository.appendAiConversationTurn({
       question: '第一个问题',
       answer: '第一段回答。[S1]',
-      sources: [{ id: 'S1', noteId: 'note-1', title: '并发方案', excerpt: '片段一' }]
+      sources: [{ id: 'S1', noteId: 'note-1', title: '并发方案', excerpt: '片段一', matchTerm: '并发' }]
     })
     repository.appendAiConversationTurn({
       conversationId: first.conversationId,
@@ -86,7 +86,8 @@ test('同一会话里的轮次按追加顺序读回，来源与漏标标记一�
     assert.equal(conversation.turns.length, 2)
     assert.deepEqual(conversation.turns.map((turn) => turn.question), ['第一个问题', '那第二条呢'])
     assert.deepEqual(conversation.turns[0].sources, [
-      { id: 'S1', noteId: 'note-1', title: '并发方案', excerpt: '片段一', truncated: false }
+      // matchTerm 必须存回来：恢复历史后点来源还要能定位到正文命中处。
+      { id: 'S1', noteId: 'note-1', title: '并发方案', excerpt: '片段一', matchTerm: '并发', truncated: false }
     ])
     assert.equal(conversation.turns[0].citationMissing, false)
     // 漏标来源的那条要能区分出来，恢复后仍要提示「本条未标注来源」。

@@ -445,6 +445,13 @@ export interface AiAssistantSource {
   excerpt: string
   /** 这篇太长，只把前 N 字送给了模型（界面据此提示，别让人以为看全了）。 */
   truncated?: boolean
+  /**
+   * 让这篇笔记命中本次检索的词（正文里确实出现过才会给）。
+   *
+   * 点来源跳过去时用它把正文滚到命中处 —— `excerpt` 是笔记开头那 180 字，
+   * 不代表命中位置，拿它当锚点只会停在顶部。命中在标题或标签时这里是 null。
+   */
+  matchTerm?: string | null
 }
 
 /** 一轮已完成的问答；追问时按顺序回传给主进程拼进 messages。 */

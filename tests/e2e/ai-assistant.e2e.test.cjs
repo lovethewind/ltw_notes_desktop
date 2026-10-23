@@ -169,7 +169,14 @@ test('AI 回答按 Markdown 渲染、清理不安全 HTML，[S1] 可直接跳到
     application = await launchApplication(userDataPath)
     await seedNotes(application.page, [
       { title: 'Markdown 来源', content: '用于生成回答的正文。' },
-      { title: '引用目标', content: '引用目标笔记里有并发方案。' }
+      {
+        title: '引用目标',
+        // 命中词只出现在末尾：跳转后必须滚下去，否则断言不出「定位」和「没定位」的区别。
+        content: [
+          ...Array.from({ length: 120 }, (_, index) => `第 ${index + 1} 段填充内容，用来把正文撑长。`),
+          '引用目标笔记里有并发方案。'
+        ].join('\n\n')
+      }
     ])
     await application.page.getByRole('button', { name: 'AI 笔记助手' }).click()
     const panel = application.page.getByRole('complementary', { name: 'AI 笔记助手' })
@@ -210,6 +217,13 @@ test('AI 回答按 Markdown 渲染、清理不安全 HTML，[S1] 可直接跳到
     await citation.click()
     await application.page.waitForFunction(() =>
       document.querySelector('.title-input')?.value === '引用目标')
+    // 跳过去还得落在命中处：命中词在长文末尾，正文必须真的滚下去。
+    await application.page.waitForFunction(() => {
+      const scroller = document.querySelector('.milkdown-editor-scroll')
+      return Boolean(scroller && scroller.scrollTop > 200)
+    }, null, { timeout: 5000 })
+    // 只滚不选：留一个选中段会让用户下一次输入直接把它覆盖掉。
+    assert.equal(await application.page.evaluate(() => window.getSelection()?.toString() || ''), '')
   } finally {
     if (application) await application.electronApplication.close().catch(() => {})
     await model.close()

@@ -48,7 +48,13 @@ const props = defineProps<{
 
 const emit = defineEmits<{
   close: []
-  openSource: [noteId: string]
+  /**
+   * 打开来源笔记。
+   *
+   * 带上 `matchTerm` 是为了让正文滚到命中处；缺省（命中在标题/标签、
+   * 或「当前笔记」档位没有检索词）就只打开整篇，停在原来的位置。
+   */
+  openSource: [payload: { noteId: string, matchTerm?: string | null }]
   clearSelection: []
   /** 把某轮回答插到当前编辑器光标处。 */
   insertAnswer: [payload: { markdown: string }]
@@ -471,6 +477,16 @@ function truncatedHint(turn: ChatTurn): string {
   return `有 ${limited.length} 篇笔记较长，只把各自前面一段送给了模型，回答可能有遗漏。`
 }
 
+/**
+ * 打开一条来源笔记。
+ *
+ * :param source: 这一轮的结构化来源；`matchTerm` 让 App 打开后能定位到命中处。
+ * :return: 无返回值。
+ */
+function openSource(source: AiAssistantSource): void {
+  emit('openSource', { noteId: source.noteId, matchTerm: source.matchTerm ?? null })
+}
+
 /** 回答正文里的 `[S1]` 锚点：跳转交给外部（会切到那篇笔记）。 */
 function handleAnswerClick(event: MouseEvent, turn: ChatTurn): void {
   const target = event.target as HTMLElement | null
@@ -479,7 +495,7 @@ function handleAnswerClick(event: MouseEvent, turn: ChatTurn): void {
   event.preventDefault()
   const sourceId = anchor.getAttribute('href')?.replace('#ai-source-', '') || ''
   const source = turn.sources.find((item) => item.id === sourceId)
-  if (source) emit('openSource', source.noteId)
+  if (source) openSource(source)
 }
 
 async function copyTurn(turn: ChatTurn): Promise<void> {
@@ -732,7 +748,8 @@ async function togglePin(item: AiConversationSummary): Promise<void> {
 function openNoteFromHistory(item: AiConversationSummary): void {
   if (!item.noteId || !item.noteTitle) return
   historyOpen.value = false
-  emit('openSource', item.noteId)
+  // 历史里只知道「在哪篇笔记下问的」，没有检索词，所以不做定位。
+  emit('openSource', { noteId: item.noteId, matchTerm: null })
 }
 
 /**
@@ -1221,7 +1238,7 @@ onBeforeUnmount(() => {
                   v-for="source in turn.sources"
                   :key="`${turn.id}-${source.id}`"
                   type="button"
-                  @click="emit('openSource', source.noteId)"
+                  @click="openSource(source)"
                 >
                   <span class="ai-source-id">{{ source.id }}</span>
                   <span class="ai-source-text"><strong>{{ source.title }}</strong><small>{{ source.excerpt }}</small></span>

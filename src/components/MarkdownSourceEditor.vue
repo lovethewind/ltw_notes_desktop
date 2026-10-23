@@ -532,6 +532,37 @@ function findText(keyword: string, requestedIndex: number): { count: number, ind
 }
 
 /**
+ * 把指定文本滚到视口，但**不选中、不挂查找高亮**。
+ *
+ * AI 回答的来源跳转会用到：跳过去是为了看，选中一段会让下一次输入
+ * 直接把它替换掉。这里只把光标落到命中处（无选区）并滚过去。
+ *
+ * :param keyword: 要定位的文本（AI 侧给的是命中检索词）。
+ * :return: 是否找到并滚动了。
+ */
+function scrollToText(keyword: string): boolean {
+  if (!view) return false
+  const returnedFromPreview = mode.value === 'preview'
+  if (returnedFromPreview) switchMode('source')
+  const matches = collectMatches(keyword.trim())
+  if (!matches.length) return false
+  const target = matches[0]
+  view.dispatch({
+    selection: { anchor: target.from },
+    // 刚切回源码模式时容器还没量出尺寸，这一帧滚动会落空，下一帧补一次。
+    scrollIntoView: !returnedFromPreview
+  })
+  if (returnedFromPreview) {
+    void nextTick(() => {
+      requestAnimationFrame(() => {
+        view?.dispatch({ selection: { anchor: target.from }, scrollIntoView: true })
+      })
+    })
+  }
+  return true
+}
+
+/**
  * 把当前匹配或全部匹配替换成新文本（笔记内查找替换用）。
  *
  * 与 findText 同一套匹配口径（大小写不敏感、不解析正则）。替换文本原样写入，
@@ -630,7 +661,7 @@ function insertMarkdown(markdown: string): { ok: boolean, message: string } {
   return { ok: true, message: '已插入到当前文件' }
 }
 
-defineExpose({ clearFindHighlight, findText, getScrollTop, insertMarkdown, replaceText })
+defineExpose({ clearFindHighlight, findText, getScrollTop, insertMarkdown, replaceText, scrollToText })
 
 onMounted(() => {
   if (!container.value) return

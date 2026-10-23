@@ -3660,6 +3660,39 @@ function findText(keyword: string, requestedIndex: number): { count: number, ind
 }
 
 /**
+ * 把指定文本滚到视口中间，但**不改选区、不留查找高亮**。
+ *
+ * 与 `findText` 的差别只有这一点：跳过去是为了让用户看（AI 回答的来源跳转），
+ * 选中一段会让人下一次输入直接把它替换掉，那是数据事故而不是功能。
+ *
+ * :param keyword: 要定位的文本（AI 侧给的是命中检索词）。
+ * :return: 是否找到并滚动了。
+ */
+function scrollToText(keyword: string): boolean {
+  const normalizedKeyword = keyword.trim().toLocaleLowerCase()
+  const activeEditor = editor
+  if (!activeEditor || !editorReady || !normalizedKeyword) return false
+  const scrollToFirstMatch = (): boolean => {
+    let found = false
+    activeEditor.editor.action((context) => {
+      const view = context.get(editorViewCtx)
+      const matches = collectDocumentMatches(view.state.doc, normalizedKeyword)
+      if (!matches.length) return
+      found = true
+      scrollMatchIntoView(view, matches[0].from)
+    })
+    return found
+  }
+  // 预览层盖在编辑器上：先回编辑态，等这一帧渲染完再量坐标，否则 scrollTo 落空。
+  if (previewMode.value) {
+    togglePreview()
+    void nextTick(scrollToFirstMatch)
+    return true
+  }
+  return scrollToFirstMatch()
+}
+
+/**
  * 把当前匹配或全部匹配替换成新文本（笔记内查找替换用）。
  *
  * 匹配口径与 findText 完全一致。替换文本按**纯文本**插入：在替换框里写 `**粗**`
@@ -3739,7 +3772,7 @@ function clearFindHighlight(): void {
   })
 }
 
-defineExpose({ clearFindHighlight, findText, getScrollTop, insertMarkdown, replaceText })
+defineExpose({ clearFindHighlight, findText, getScrollTop, insertMarkdown, replaceText, scrollToText })
 
 watch(
   () => [props.value, props.documentId] as const,
