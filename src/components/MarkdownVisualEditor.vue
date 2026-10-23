@@ -3537,6 +3537,44 @@ function setContent(value: string, documentId: string): void {
 }
 
 /**
+ * 在当前光标处插入一段 Markdown（AI 回答落地用）。
+ *
+ * 与右键「粘贴为 Markdown」走同一条解析链路（`markdownToSlice`），
+ * 所以多段正文、列表、代码块插入后是真正的编辑器节点，而不是一坨纯文本；
+ * 光标处有选区时按 ProseMirror 惯例替换选区。
+ *
+ * :param markdown: 待插入的 Markdown 源码。
+ * :return: 是否插入成功，以及给用户看的结果文案。
+ */
+async function insertMarkdown(markdown: string): Promise<{ ok: boolean, message: string }> {
+  const text = String(markdown || '').trim()
+  if (!text) return { ok: false, message: '没有可插入的内容' }
+  if (!editor || !editorReady) return { ok: false, message: '编辑器还没准备好' }
+  if (props.readonly) return { ok: false, message: '当前笔记不可编辑' }
+  // 预览层盖在编辑器上：先回到编辑态，否则内容插进去了用户却看不见（与 findText 同一处置）。
+  if (previewMode.value) togglePreview()
+  let inserted = false
+  await editor.editor.action((context) => {
+    const view = context.get(editorViewCtx)
+    const { from, to, $from } = view.state.selection
+    let transaction = view.state.tr
+    // 光标停在段落中间时先把这一段断开：插入的是一块独立内容，黏在前半句后面会读成「原话的延续」。
+    // 光标已经在段首 / 空段落里时不拆，免得平白多出一个空段。
+    if (from === to && $from.parent.isTextblock && $from.parentOffset > 0) {
+      transaction = transaction.split(from)
+    }
+    transaction = transaction.replaceSelection(markdownToSlice(text)(context)).scrollIntoView()
+    view.dispatch(transaction)
+    // 焦点交给编辑器：插入完可以直接接着改，也避免 AI 面板的输入框继续吃键盘。
+    view.focus()
+    inserted = true
+  })
+  return inserted
+    ? { ok: true, message: '已插入到当前笔记' }
+    : { ok: false, message: '插入失败，请重试' }
+}
+
+/**
  * 在编辑器正文中查找并选中指定匹配项。
  *
  * :param keyword: 查找关键词。
@@ -3613,7 +3651,7 @@ function clearFindHighlight(): void {
   })
 }
 
-defineExpose({ clearFindHighlight, findText, getScrollTop })
+defineExpose({ clearFindHighlight, findText, getScrollTop, insertMarkdown })
 
 watch(
   () => [props.value, props.documentId] as const,

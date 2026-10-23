@@ -61,11 +61,13 @@ test('源码编辑器把编辑器原文原样回传，不做规范化', () => {
   assert.match(source, /emit\('change', update\.state\.doc\.toString\(\), props\.documentId\)/)
 })
 
-test('源码编辑器与富文本编辑器暴露同一套查找接口', () => {
+test('源码编辑器与富文本编辑器暴露同一套接口', () => {
   const source = readSource('src/components/MarkdownSourceEditor.vue')
   const visualSource = readSource('src/components/MarkdownVisualEditor.vue')
 
-  // App.vue 的「在当前笔记中查找」是同一条链路，两个编辑器都要接住它。
-  assert.match(source, /defineExpose\(\{ clearFindHighlight, findText, getScrollTop \}\)/)
-  assert.match(visualSource, /defineExpose\(\{ clearFindHighlight, findText, getScrollTop \}\)/)
+  // App.vue 的「在当前笔记中查找」「插入 AI 回答」是同一条链路，两个编辑器都要接住，
+  // 差一个就会出现「文件标签下按钮点了没反应」这种只在特定标签上复现的问题。
+  const exposed = /defineExpose\(\{ clearFindHighlight, findText, getScrollTop, insertMarkdown \}\)/
+  assert.match(source, exposed)
+  assert.match(visualSource, exposed)
 })

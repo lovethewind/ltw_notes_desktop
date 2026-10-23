@@ -632,3 +632,86 @@ test('选中正文可以直接「问 AI」：片段带进面板并作为 S1 资�
     await fs.rm(userDataPath, { recursive: true, force: true })
   }
 })
+
+test('回答可以插入当前笔记，也能直接存成新笔记', { timeout: 90_000 }, async () => {
+  const userDataPath = await fs.mkdtemp(path.join(os.tmpdir(), 'xinyue-notes-ai-land-e2e-'))
+  const model = startMockModel(['线程池适合 IO 密集任务，阻塞操作要拆开。[S1]'])
+  const port = await model.listen()
+  let application
+
+  try {
+    application = await launchApplication(userDataPath)
+    const page = application.page
+    // 自己建笔记是为了留住 id：最后要直接查库确认「插入」真的写进了正文。
+    const noteId = await page.evaluate(async () => {
+      const note = await window.notesDesktop.createNote(null)
+      await window.notesDesktop.updateNote(note.id, {
+        title: '并发方案',
+        content: '并发方案的原始正文。'
+      })
+      await window.notesDesktop.saveWorkspaceSession({
+        tabs: [{ noteId: note.id, isPinned: false }],
+        activeNoteId: note.id
+      })
+      return note.id
+    })
+    await page.reload()
+    await page.locator('.milkdown-editor-root .ProseMirror').waitFor()
+
+    await page.getByRole('button', { name: 'AI 笔记助手' }).click()
+    const panel = page.getByRole('complementary', { name: 'AI 笔记助手' })
+    await saveAiSettings(panel, { baseUrl: `http://127.0.0.1:${port}`, model: 'land-test' })
+
+    await panel.getByLabel('你想从笔记中了解什么？').fill('并发方案怎么讲')
+    await panel.getByRole('button', { name: '发送' }).click()
+    await page.waitForFunction(() => (
+      document.querySelectorAll('.ai-answer-text').length === 1
+      && !document.querySelector('.ai-answer-text.is-streaming')
+    ), null, { timeout: 20_000 })
+
+    // 动作按钮平时隐藏，悬停气泡才浮出（与复制、重新生成同一套）。
+    const bubble = panel.locator('.ai-bubble--assistant').first()
+    await bubble.hover()
+    assert.equal(await panel.getByRole('button', { name: '插入到当前笔记' }).count(), 1)
+    assert.equal(await panel.getByRole('button', { name: '存为新笔记' }).count(), 1)
+
+    // 光标落进正文再插入：应变成真正的编辑器节点，而不是一坨纯文本。
+    await page.locator('.milkdown-editor-root .ProseMirror').click()
+    await panel.getByRole('button', { name: '插入到当前笔记' }).click()
+    await page.waitForFunction(() => {
+      const body = document.querySelector('.milkdown-editor-root .ProseMirror')
+      return Boolean(body && body.textContent.includes('线程池适合 IO 密集任务'))
+    }, null, { timeout: 5000 })
+    const editorText = await page.locator('.milkdown-editor-root .ProseMirror').innerText()
+    assert.match(editorText, /参考来源/)
+
+    // 只断言 DOM 证明不了「真的写进去了」：轮询库里这篇笔记的正文（自动保存防抖 1.5s）。
+    // ⚠️ 不要用 `waitForFunction` 的 async 断言：返回的 Promise 本身是 truthy，会立刻「通过」。
+    let saved = null
+    for (let attempt = 0; attempt < 20; attempt += 1) {
+      saved = await page.evaluate((id) => window.notesDesktop.getNote(id), noteId)
+      if (String(saved?.content || '').includes('参考来源')) break
+      await page.waitForTimeout(300)
+    }
+    assert.match(String(saved?.content || ''), /线程池适合 IO 密集任务/)
+    assert.match(saved.content, /参考来源/)
+    assert.match(saved.content, /https:\/\/xinyue-note\.local\//)
+
+    // 存为新笔记：标题取问题前 30 字，建完直接打开。
+    await bubble.hover()
+    await panel.getByRole('button', { name: '存为新笔记' }).click()
+    await page.waitForFunction(
+      () => document.querySelector('.title-input')?.value === '并发方案怎么讲',
+      null,
+      { timeout: 10_000 }
+    )
+    await page.waitForFunction(() => {
+      const body = document.querySelector('.milkdown-editor-root .ProseMirror')
+      return Boolean(body && body.textContent.includes('线程池适合 IO 密集任务'))
+    }, null, { timeout: 5000 })
+  } finally {
+    if (application) await application.electronApplication.close().catch(() => {})
+    await model.close()
+    await fs.rm(userDataPath, { recursive: true, force: true })
+  }
+})

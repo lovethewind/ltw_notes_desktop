@@ -679,3 +679,45 @@ test('选区问 AI 的接线：气泡按钮 → 编辑器事件 → 面板 chip 
   assert.match(assistantSource, /isSelection: true/)
   assert.match(assistantSource, /note\.isSelection \? MAX_SELECTION_CHARACTERS : perNoteLimit/)
 })
+
+test('回答落地的接线：面板按钮 → 事件 → App 调编辑器插入 / 建新笔记', () => {
+  const projectRoot = path.resolve(__dirname, '..')
+  const read = (relative) => fs.readFileSync(path.join(projectRoot, relative), 'utf8')
+  const panelSource = read('src/components/AiAssistantPanel.vue')
+  const visualEditor = read('src/components/MarkdownVisualEditor.vue')
+  const sourceEditor = read('src/components/MarkdownSourceEditor.vue')
+  const appSource = read('src/App.vue')
+
+  // 面板：两个动作按钮必须挂在同一组里（单按钮各写 margin-left:auto 会把它们推散）。
+  assert.match(panelSource, /class="ai-bubble-actions"/)
+  assert.match(panelSource, /@click="insertTurnIntoNote\(turn\)"/)
+  assert.match(panelSource, /@click="saveTurnAsNote\(turn\)"/)
+  assert.match(panelSource, /insertAnswer: \[payload: \{ markdown: string \}\]/)
+  assert.match(panelSource, /saveAnswerAsNote: \[payload: \{ markdown: string, title: string \}\]/)
+  // 没有可插入目标时必须真的置灰，而不是点了没反应。
+  assert.match(panelSource, /:disabled="!canInsertAnswer \|\| transferringTurnId === turn\.id"/)
+  assert.match(panelSource, /buildAiAnswerNoteMarkdown\(turn\.answer, turn\.sources\)/)
+
+  // 正文编辑器：必须走 Markdown 解析，不能退化成纯文本插入（否则列表/代码块会变成一坨字）。
+  assert.match(visualEditor, /defineExpose\(\{[^}]*insertMarkdown[^}]*\}\)/)
+  assert.match(visualEditor, /function insertMarkdown[\s\S]{0,900}?markdownToSlice\(text\)\(context\)/)
+  assert.match(visualEditor, /replaceSelection\(markdownToSlice\(text\)\(context\)\)/)
+  // 光标停在段落中间要先断开，否则插入的整块内容会黏在前半句后面。
+  assert.match(visualEditor, /\$from\.parent\.isTextblock && \$from\.parentOffset > 0/)
+  assert.match(visualEditor, /transaction = transaction\.split\(from\)/)
+  // 预览层盖在编辑器上：插入前得先回编辑态，否则插进去了看不见。
+  assert.match(visualEditor, /function insertMarkdown[\s\S]{0,600}?if \(previewMode\.value\) togglePreview\(\)/)
+
+  // 外部文件：保真优先，只做 CodeMirror 文本插入，不做任何自动排版。
+  assert.match(sourceEditor, /defineExpose\(\{[^}]*insertMarkdown[^}]*\}\)/)
+  assert.match(sourceEditor, /changes: \{ from: position, insert: text \}/)
+  assert.match(sourceEditor, /function insertMarkdown[\s\S]{0,800}?if \(mode\.value === 'preview'\) switchMode\('source'\)/)
+
+  // 上层：接线到两个真实动作，插入目标按「编辑器在不在」判断而不是按笔记 ID。
+  assert.match(appSource, /@insert-answer="insertAiAnswerIntoNote"/)
+  assert.match(appSource, /@save-answer-as-note="saveAiAnswerAsNote"/)
+  assert.match(appSource, /:can-insert-answer="Boolean\(activeNote \|\| activeFileDoc\)"/)
+  assert.match(appSource, /insertMarkdown: \(markdown: string\) => Promise<\{ ok: boolean, message: string \}> \| \{ ok: boolean, message: string \}/)
+  // 存为新笔记：createNote 只能给文件夹，标题与正文必须再 updateNote 一次。
+  assert.match(appSource, /async function saveAiAnswerAsNote[\s\S]{0,700}?updateNote\(created\.id, \{[\s\S]{0,120}?content: payload\.markdown/)
+})

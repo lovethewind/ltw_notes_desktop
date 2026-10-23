@@ -10,6 +10,7 @@ import type {
   AiAssistantTurn,
   AiConversationSummary
 } from '../types'
+import { buildAiAnswerNoteMarkdown, deriveAiAnswerNoteTitle } from '../utils/ai-answer-insert'
 
 /** 面板里的一轮对话；比 IPC 返回多存渲染好的 HTML、来源与流式状态。 */
 interface ChatTurn {
@@ -36,12 +37,23 @@ const props = defineProps<{
   currentNoteTitle: string
   /** 正文里选中的片段（从选中气泡「问 AI」带进来）；空串表示没有选区。 */
   selectionText: string
+  /**
+   * 当前有没有可插入的目标。
+   *
+   * 不能用 `currentNoteId` 判断：打开的是磁盘上的 `.md` 文件时没有笔记 ID，
+   * 但编辑器照样能接收插入。由 App 统一给出「编辑器是否就绪」的结论。
+   */
+  canInsertAnswer: boolean
 }>()
 
 const emit = defineEmits<{
   close: []
   openSource: [noteId: string]
   clearSelection: []
+  /** 把某轮回答插到当前编辑器光标处。 */
+  insertAnswer: [payload: { markdown: string }]
+  /** 把某轮回答存成一篇新笔记并打开。 */
+  saveAnswerAsNote: [payload: { markdown: string, title: string }]
 }>()
 
 /** 追问时最多回传几轮 —— 与主进程 `MAX_HISTORY_TURNS` 对齐。 */
@@ -467,6 +479,44 @@ async function copyTurn(turn: ChatTurn): Promise<void> {
   }
 }
 
+/** 正在落地的是哪一轮。纯粹用来挡连点，避免双击存出两篇一模一样的笔记。 */
+const transferringTurnId = ref<number | null>(null)
+let transferTimer: ReturnType<typeof setTimeout> | undefined
+
+/**
+ * 把一轮回答整理成 Markdown，并进入「落地中」状态。
+ *
+ * :param turn: 要落地的这一轮。
+ * :return: 可写进笔记的 Markdown；为空表示这一轮没内容，调用方放弃落地。
+ */
+function beginTransfer(turn: ChatTurn): string | null {
+  if (transferringTurnId.value !== null) return null
+  const markdown = buildAiAnswerNoteMarkdown(turn.answer, turn.sources)
+  if (!markdown) {
+    error.value = '这一轮没有可插入的内容'
+    return null
+  }
+  transferringTurnId.value = turn.id
+  // 父组件的落库/插入是异步的，回执要靠全局提示；这里只锁一小段时间就够挡住手抖。
+  if (transferTimer) clearTimeout(transferTimer)
+  transferTimer = setTimeout(() => { transferringTurnId.value = null }, 900)
+  return markdown
+}
+
+/** 插入到当前编辑器光标处。 */
+function insertTurnIntoNote(turn: ChatTurn): void {
+  const markdown = beginTransfer(turn)
+  if (!markdown) return
+  emit('insertAnswer', { markdown })
+}
+
+/** 存成一篇新笔记（标题取问题前 30 字）。 */
+function saveTurnAsNote(turn: ChatTurn): void {
+  const markdown = beginTransfer(turn)
+  if (!markdown) return
+  emit('saveAnswerAsNote', { markdown, title: deriveAiAnswerNoteTitle(turn.question) })
+}
+
 /**
  * 「＋」= 新开一条对话，而不是把旧对话删掉。
  *
@@ -764,6 +814,7 @@ onBeforeUnmount(() => {
   stopLoadingStages()
   if (copyTimer) clearTimeout(copyTimer)
   if (renderTimer) clearTimeout(renderTimer)
+  if (transferTimer) clearTimeout(transferTimer)
   if (searchTimer) clearTimeout(searchTimer)
   unsubscribeDelta?.()
   unsubscribeDelta = null
@@ -980,26 +1031,48 @@ onBeforeUnmount(() => {
             <div class="ai-bubble-head">
               <span class="ai-avatar"><Icon icon="tabler:sparkles" /></span>
               <span class="ai-bubble-model">{{ settings.model || 'AI' }}</span>
-              <button
-                v-if="turn.status === 'done' && isLastTurn(turn) && !loading"
-                type="button"
-                class="ai-copy"
-                aria-label="重新生成"
-                title="重新生成"
-                @click="regenerateTurn(turn)"
-              >
-                <Icon icon="tabler:refresh" />
-              </button>
-              <button
-                v-if="turn.status === 'done'"
-                type="button"
-                class="ai-copy"
-                :aria-label="copiedTurnId === turn.id ? '已复制' : '复制回答'"
-                :title="copiedTurnId === turn.id ? '已复制' : '复制回答'"
-                @click="copyTurn(turn)"
-              >
-                <Icon :icon="copiedTurnId === turn.id ? 'tabler:check' : 'tabler:copy'" />
-              </button>
+              <!-- 回答落地动作：重新生成 / 复制 / 插入正文 / 存为新笔记。 -->
+              <div v-if="turn.status === 'done'" class="ai-bubble-actions">
+                <button
+                  v-if="isLastTurn(turn) && !loading"
+                  type="button"
+                  class="ai-copy"
+                  aria-label="重新生成"
+                  title="重新生成"
+                  @click="regenerateTurn(turn)"
+                >
+                  <Icon icon="tabler:refresh" />
+                </button>
+                <button
+                  type="button"
+                  class="ai-copy"
+                  :aria-label="copiedTurnId === turn.id ? '已复制' : '复制回答'"
+                  :title="copiedTurnId === turn.id ? '已复制' : '复制回答'"
+                  @click="copyTurn(turn)"
+                >
+                  <Icon :icon="copiedTurnId === turn.id ? 'tabler:check' : 'tabler:copy'" />
+                </button>
+                <button
+                  type="button"
+                  class="ai-copy"
+                  :disabled="!canInsertAnswer || transferringTurnId === turn.id"
+                  aria-label="插入到当前笔记"
+                  :title="canInsertAnswer ? '插入到当前笔记' : '先打开一篇笔记或文件'"
+                  @click="insertTurnIntoNote(turn)"
+                >
+                  <Icon icon="tabler:corner-down-left" />
+                </button>
+                <button
+                  type="button"
+                  class="ai-copy"
+                  :disabled="transferringTurnId === turn.id"
+                  aria-label="存为新笔记"
+                  title="存为新笔记"
+                  @click="saveTurnAsNote(turn)"
+                >
+                  <Icon icon="tabler:file-plus" />
+                </button>
+              </div>
             </div>
             <!-- 首字节还没到：三点 + 阶段文案占住这一轮的位置。 -->
             <div v-if="turn.status === 'pending'" class="ai-loading">
@@ -1161,9 +1234,14 @@ onBeforeUnmount(() => {
 .ai-avatar { display: grid; width: 22px; height: 22px; flex: none; place-items: center; border-radius: 7px; background: linear-gradient(135deg, rgba(50,170,167,.2), rgba(47,128,237,.22)); color: var(--blue); }
 .ai-avatar svg { width: 14px; height: 14px; }
 .ai-bubble-model { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.ai-copy { margin-left: auto; display: grid; width: 24px; height: 24px; place-items: center; border: 0; border-radius: 6px; background: transparent; color: var(--muted); cursor: pointer; opacity: 0; transition: opacity .15s ease; }
+/* 动作按钮组靠右；单个按钮不再各自 margin-left:auto —— 否则第一个被推走、后面的挤在左边。 */
+.ai-bubble-actions { display: flex; align-items: center; gap: 2px; margin-left: auto; }
+.ai-copy { display: grid; width: 24px; height: 24px; place-items: center; border: 0; border-radius: 6px; background: transparent; color: var(--muted); cursor: pointer; opacity: 0; transition: opacity .15s ease; }
 .ai-bubble--assistant:hover .ai-copy { opacity: 1; }
-.ai-copy:hover { background: rgba(47,128,237,.1); color: var(--blue); }
+.ai-copy:not(:disabled):hover { background: rgba(47,128,237,.1); color: var(--blue); }
+/* 置灰的「插入」在悬停时也得保持灰：否则看着能点，点下去没反应。 */
+.ai-bubble--assistant:hover .ai-copy:disabled { opacity: .3; }
+.ai-copy:disabled { cursor: not-allowed; }
 
 .ai-answer-text { overflow-wrap: anywhere; }
 .ai-answer-text :deep(:first-child) { margin-top: 0; }

@@ -542,7 +542,32 @@ function getScrollTop(): number {
   return view?.scrollDOM.scrollTop ?? 0
 }
 
-defineExpose({ clearFindHighlight, findText, getScrollTop })
+/**
+ * 在光标处原样插入一段 Markdown（AI 回答落地用）。
+ *
+ * ⚠️ 外部文件是「保真优先」：这里**不做任何自动排版** —— 不补换行、不重新折行、
+ * 不动其余行，插进去的就是传入的字符串。想让内容独立成段由用户自己先按回车决定。
+ *
+ * :param markdown: 待插入的 Markdown 源码。
+ * :return: 是否插入成功，以及给用户看的结果文案。
+ */
+function insertMarkdown(markdown: string): { ok: boolean, message: string } {
+  const text = String(markdown || '').trim()
+  if (!text) return { ok: false, message: '没有可插入的内容' }
+  if (!view) return { ok: false, message: '编辑器还没准备好' }
+  // 预览模式下 CodeMirror 是收起的，先回源码模式才看得到插入结果（与 findText 一致）。
+  if (mode.value === 'preview') switchMode('source')
+  const position = view.state.selection.main.head
+  view.dispatch({
+    changes: { from: position, insert: text },
+    selection: { anchor: position + text.length },
+    scrollIntoView: true
+  })
+  view.focus()
+  return { ok: true, message: '已插入到当前文件' }
+}
+
+defineExpose({ clearFindHighlight, findText, getScrollTop, insertMarkdown })
 
 onMounted(() => {
   if (!container.value) return

@@ -174,11 +174,18 @@ const markdownEditorRef = ref<{
   clearFindHighlight: () => void
   findText: (keyword: string, requestedIndex: number) => { count: number, index: number }
   getScrollTop: () => number
+  /**
+   * 在光标处插入一段 Markdown。
+   *
+   * 笔记走 ProseMirror 的 Markdown 解析（异步），外部文件走 CodeMirror 文本插入（同步）；
+   * 两种都 await，调用方不必关心挂的是哪一个。
+   */
+  insertMarkdown: (markdown: string) => Promise<{ ok: boolean, message: string }> | { ok: boolean, message: string }
 } | null>(null)
 const loading = ref(true)
 const saveState = ref<SaveState>('idle')
 const lastSavedAt = ref('')
-const linkCopyFeedback = ref('')
+const editorFeedback = ref('')
 const historyVisible = ref(false)
 const actionError = ref('')
 const {
@@ -416,7 +423,7 @@ let draftVersion = 0
 let pendingRemoteRefresh = false
 let initialWorkspaceLoad: Promise<void> | null = null
 let confirmationResolver: ((confirmed: boolean) => void) | null = null
-let linkCopyFeedbackTimer: ReturnType<typeof setTimeout> | null = null
+let editorFeedbackTimer: ReturnType<typeof setTimeout> | null = null
 let disposeOpenSyncSettings: (() => void) | null = null
 let disposeOpenNoteLink: (() => void) | null = null
 let disposeBeforeQuitSave: (() => void) | null = null
@@ -1017,6 +1024,58 @@ async function askAiWithSelection(text: string): Promise<void> {
 /** 清掉「选中片段」chip，后续提问回到整篇/全库召回。 */
 function clearAiSelection(): void {
   aiSelectionText.value = ''
+}
+
+/**
+ * 把 AI 回答插到当前编辑器光标处。
+ *
+ * 目标可能是笔记，也可能是磁盘上的 `.md` 文件 —— 两者都实现了 `insertMarkdown`，
+ * 所以这里只认「编辑器在不在」，不认 `activeNote`。
+ *
+ * :param payload: 已整理好的 Markdown。
+ * :return: 无返回值。
+ */
+async function insertAiAnswerIntoNote(payload: { markdown: string }): Promise<void> {
+  const editor = markdownEditorRef.value
+  if (!editor?.insertMarkdown) {
+    showEditorFeedback('先打开一篇笔记或文件')
+    return
+  }
+  try {
+    const result = await editor.insertMarkdown(payload.markdown)
+    showEditorFeedback(result.message)
+  } catch (insertError) {
+    showEditorFeedback(insertError instanceof Error ? insertError.message : '插入失败')
+  }
+}
+
+/**
+ * 把 AI 回答存成一篇新笔记并打开。
+ *
+ * 新笔记跟随当前笔记所在文件夹：在「项目 A」里问出来的结论，默认就该落在项目 A。
+ *
+ * :param payload: 已整理好的 Markdown 与标题。
+ * :return: 无返回值。
+ */
+async function saveAiAnswerAsNote(payload: { markdown: string, title: string }): Promise<void> {
+  try {
+    await flushSave()
+    const folderId = activeNote.value?.folderId ?? null
+    const created = await window.notesDesktop.createNote(folderId)
+    const saved = await window.notesDesktop.updateNote(created.id, {
+      title: payload.title,
+      content: payload.markdown
+    })
+    const note = saved ?? created
+    workspace.notes.unshift(note)
+    workspace.pendingCount = Math.max(workspace.pendingCount, 1)
+    if (folderId) expandedFolderIds.value = new Set([...expandedFolderIds.value, folderId])
+    else unclassifiedExpanded.value = true
+    await selectNote(note)
+    showEditorFeedback('已存为新笔记')
+  } catch (saveError) {
+    showEditorFeedback(saveError instanceof Error ? saveError.message : '存为新笔记失败')
+  }
 }
 
 /**
@@ -3186,17 +3245,17 @@ async function handleNoteContextCommand(
 }
 
 /**
- * 在页面顶部显示短暂的复制结果提示。
+ * 在页面顶部显示短暂的操作结果提示（复制链接、AI 回答落地等共用一条）。
  *
  * :param message: 待显示的提示内容。
  * :return: 无返回值。
  */
-function showLinkCopyFeedback(message: string): void {
-  linkCopyFeedback.value = message
-  if (linkCopyFeedbackTimer) clearTimeout(linkCopyFeedbackTimer)
-  linkCopyFeedbackTimer = setTimeout(() => {
-    linkCopyFeedback.value = ''
-    linkCopyFeedbackTimer = null
+function showEditorFeedback(message: string): void {
+  editorFeedback.value = message
+  if (editorFeedbackTimer) clearTimeout(editorFeedbackTimer)
+  editorFeedbackTimer = setTimeout(() => {
+    editorFeedback.value = ''
+    editorFeedbackTimer = null
   }, 1800)
 }
 
@@ -3241,9 +3300,9 @@ async function copyNoteLink(note: OfflineNote): Promise<void> {
         })
       ])
     }
-    showLinkCopyFeedback('笔记链接已复制')
+    showEditorFeedback('笔记链接已复制')
   } catch {
-    showLinkCopyFeedback('复制失败，请检查剪贴板权限')
+    showEditorFeedback('复制失败，请检查剪贴板权限')
   }
 }
 
@@ -3718,7 +3777,7 @@ onBeforeUnmount(() => {
     clearTimeout(syncBrowserLoginTimer)
     syncBrowserLoginTimer = null
   }
-  if (linkCopyFeedbackTimer) clearTimeout(linkCopyFeedbackTimer)
+  if (editorFeedbackTimer) clearTimeout(editorFeedbackTimer)
   if (confirmationResolver) resolveConfirmation(false)
   if (saveTimer) clearTimeout(saveTimer)
   if (workspaceSearchTimer) clearTimeout(workspaceSearchTimer)
@@ -3729,7 +3788,7 @@ onBeforeUnmount(() => {
 <template>
   <div :class="['desktop-shell', { 'tree-lines-hidden': !showTreeLines }]" @click="createMenuVisible = false; closeContextMenu(); closePropertyPickers(); noteBatchPicker.visible = false; noteTabOverflowVisible = false; tabContextMenu.visible = false">
     <Transition name="editor-feedback">
-      <div v-if="linkCopyFeedback" class="editor-feedback">{{ linkCopyFeedback }}</div>
+      <div v-if="editorFeedback" class="editor-feedback">{{ editorFeedback }}</div>
     </Transition>
     <header class="titlebar">
       <div class="titlebar-brand"><span class="brand-dot"></span>心悦笔记</div>
@@ -4412,9 +4471,12 @@ onBeforeUnmount(() => {
           :current-folder-id="activeNote?.folderId ?? null"
           :current-note-title="activeNote?.title ?? ''"
           :selection-text="aiSelectionText"
+          :can-insert-answer="Boolean(activeNote || activeFileDoc)"
           @close="aiAssistantVisible = false"
           @clear-selection="clearAiSelection"
           @open-source="openAiAssistantSource"
+          @insert-answer="insertAiAnswerIntoNote"
+          @save-answer-as-note="saveAiAnswerAsNote"
         />
       </section>
     </main>
