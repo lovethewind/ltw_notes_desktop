@@ -2833,6 +2833,8 @@ function createWindow() {
     if (shouldShowMainWindow(process.env)) browserWindow.show()
   })
   browserWindow.webContents.once("did-finish-load", () => {
+    // 页面加载完才能收 IPC：系统在启动早期投来的文件路径先攒着，这里补投一次。
+    flushPendingOpenFiles()
     if (app.isPackaged) {
       setTimeout(() => {
         if (!browserWindow.isDestroyed() && !browserWindow.webContents.isDestroyed()) {
@@ -2943,12 +2945,94 @@ protocol.registerSchemesAsPrivileged([{
   }
 }])
 
+/**
+ * 系统请求用本应用打开的文件路径。
+ *
+ * macOS 的「拖到 Dock 图标」「双击」「右键 → 打开方式」都走 open-file 事件；
+ * 冷启动时它可能早于窗口创建，因此先攒在这里，等渲染层加载完成再投递。
+ */
+const pendingOpenFilePaths = []
+
+/** 能作为外部文件打开的后缀：与渲染层窗口内拖放的白名单保持一致。 */
+const OPENABLE_FILE_PATTERN = /\.(md|markdown|mdown|txt|text)$/i
+
+/**
+ * 把攒下的文件路径一次性交给渲染层。
+ *
+ * 窗口不存在或还在加载时直接返回，等 did-finish-load 再调一次。
+ *
+ * @returns {void}
+ */
+function flushPendingOpenFiles() {
+  if (!pendingOpenFilePaths.length) return
+  const canSend = mainWindow
+    && !mainWindow.isDestroyed()
+    && !mainWindow.webContents.isDestroyed()
+    && !mainWindow.webContents.isLoading()
+  if (!canSend) return
+  const filePaths = pendingOpenFilePaths.splice(0, pendingOpenFilePaths.length)
+  mainWindow.webContents.send("local-file:open-paths", filePaths)
+}
+
+/**
+ * 从启动参数里挑出可打开的文件路径。
+ *
+ * Windows / Linux 没有 open-file 事件，冷启动的路径只能从 argv 里取。
+ *
+ * @param {string[]} argv 启动参数。
+ * @returns {string[]} 可打开的文件路径。
+ */
+function collectOpenablePathsFromArgv(argv) {
+  if (!Array.isArray(argv)) return []
+  return argv
+    .slice(1)
+    .filter((argument) => typeof argument === "string" && !argument.startsWith("-"))
+    .filter((argument) => OPENABLE_FILE_PATTERN.test(argument))
+}
+
+app.on("open-file", (event, filePath) => {
+  event.preventDefault()
+  const resolved = typeof filePath === "string" ? filePath.trim() : ""
+  if (!resolved) return
+  pendingOpenFilePaths.push(resolved)
+  flushPendingOpenFiles()
+  // macOS 关窗不退进程：窗口已经没了还拖文件过来，应该顺带把窗口叫回来。
+  if (app.isReady() && (!mainWindow || mainWindow.isDestroyed())) createWindow()
+})
+
+// Windows / Linux 冷启动：文件路径由系统拼在启动参数里。
+if (process.platform !== "darwin") {
+  pendingOpenFilePaths.push(...collectOpenablePathsFromArgv(process.argv))
+}
+
+// 只跑一个实例：第二个实例带着文件参数启动时，把路径交给已经在跑的窗口。
+// E2E 各用例各自使用独立 userData，跳过加锁避免并行时报「已有实例」。
+const hasSingleInstanceLock = e2eRuntime ? true : app.requestSingleInstanceLock()
+if (!hasSingleInstanceLock) {
+  app.quit()
+} else if (!e2eRuntime) {
+  app.on("second-instance", (_event, argv) => {
+    const filePaths = collectOpenablePathsFromArgv(argv)
+    if (filePaths.length) {
+      pendingOpenFilePaths.push(...filePaths)
+      flushPendingOpenFiles()
+    }
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      if (mainWindow.isMinimized()) mainWindow.restore()
+      mainWindow.show()
+      mainWindow.focus()
+    }
+  })
+}
+
 app.on("open-url", (event, url) => {
   event.preventDefault()
   void handleAppDeepLink(url)
 })
 
 app.whenReady().then(() => {
+  // 第二个实例已经 quit，别再建一遍窗口。
+  if (!hasSingleInstanceLock) return
   syncSettings = loadSyncSettings()
   quickCaptureSettings = loadQuickCaptureSettings(app.getPath("userData"))
   migrateDomainProfile(currentUserDataPath, syncSettings.backendUrl, syncSettings.accountId)

@@ -146,6 +146,18 @@ contextBridge.exposeInMainWorld("notesDesktop", {
     ipcRenderer.on("local-file:open-request", listener)
     return () => ipcRenderer.removeListener("local-file:open-request", listener)
   },
+  /**
+   * 监听系统请求用本应用打开的文件（拖到图标 / 双击 / 右键「打开方式」）。
+   *
+   * 主进程可能攒多个路径一次投递，渲染层按顺序逐个打开。
+   */
+  onOpenLocalFilePaths: (callback) => {
+    const listener = (_event, filePaths) => {
+      callback(Array.isArray(filePaths) ? filePaths.filter((item) => typeof item === "string") : [])
+    }
+    ipcRenderer.on("local-file:open-paths", listener)
+    return () => ipcRenderer.removeListener("local-file:open-paths", listener)
+  },
   /** 监听菜单栏「保存」（当前文档为笔记时由渲染层回落到笔记保存）。 */
   onSaveLocalFile: (callback) => {
     const listener = () => callback()

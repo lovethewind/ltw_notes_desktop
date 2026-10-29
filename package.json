@@ -57,6 +57,20 @@
         ]
       }
     ],
+    "fileAssociations": [
+      {
+        "ext": [
+          "md",
+          "markdown",
+          "mdown"
+        ],
+        "name": "Markdown Document",
+        "description": "Markdown 文档",
+        "mimeType": "text/markdown",
+        "role": "Editor",
+        "rank": "Alternate"
+      }
+    ],
     "directories": {
       "output": "release"
     },

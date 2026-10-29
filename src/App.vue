@@ -458,6 +458,7 @@ let disposeOpenDataTransfer: (() => void) | null = null
 let disposeOpenGeneralSettings: (() => void) | null = null
 let disposeOpenSearch: (() => void) | null = null
 let disposeOpenLocalFile: (() => void) | null = null
+let disposeOpenLocalFilePaths: (() => void) | null = null
 let disposeSaveLocalFile: (() => void) | null = null
 let disposeSaveLocalFileAs: (() => void) | null = null
 let disposeDatabaseBackupStatus: (() => void) | null = null
@@ -1942,6 +1943,45 @@ async function openMarkdownFileByPath(filePath: string): Promise<void> {
   }
 }
 
+/** 可打开的外部文件后缀：窗口内拖放与系统请求（拖到图标 / 双击）共用这一套。 */
+const OPENABLE_FILE_PATTERN = /\.(md|markdown|mdown|txt|text)$/i
+
+/** 系统投递的打开请求串成一条链：open-file 会逐个到达，不能让它们同时抢标签。 */
+let openLocalFileChain: Promise<void> = Promise.resolve()
+
+/**
+ * 打开系统请求的单个外部文件。
+ *
+ * @param filePath 文件绝对路径。
+ * @return 打开完成后的 Promise。
+ */
+async function openSingleLocalFileFromSystem(filePath: string): Promise<void> {
+  if (!filePath) return
+  if (!OPENABLE_FILE_PATTERN.test(filePath)) {
+    actionError.value = '只支持打开 Markdown 或纯文本文件'
+    return
+  }
+  await openMarkdownFileByPath(filePath)
+}
+
+/**
+ * 依次打开系统请求的外部文件（拖到图标 / 双击 / 右键「打开方式」）。
+ *
+ * 排成串行队列而不是并发：多个文件一起拖进来时主进程会连续投递，并发读盘会让
+ * 标签顺序跟着 IO 完成时间乱跳，也会让「已打开则聚焦」的判断在同一个文件上抢跑。
+ *
+ * @param filePaths 系统投递的文件绝对路径。
+ * @return 无返回值，完成时机在队列内部推进。
+ */
+function openLocalFilesFromSystem(filePaths: string[]): void {
+  for (const filePath of filePaths) {
+    openLocalFileChain = openLocalFileChain
+      .then(() => openSingleLocalFileFromSystem(filePath))
+      // 单个文件失败不能断链，否则后续拖进来的文件全都不再打开。
+      .catch(() => {})
+  }
+}
+
 /**
  * 接收文件编辑器内容变化。
  *
@@ -2091,7 +2131,7 @@ function handleWindowFileDrop(event: DragEvent): void {
     actionError.value = '无法读取拖入文件的路径，请改用「文件 → 打开 Markdown 文件…」'
     return
   }
-  if (!/\.(md|markdown|mdown|txt|text)$/i.test(filePath)) {
+  if (!OPENABLE_FILE_PATTERN.test(filePath)) {
     actionError.value = '只支持拖入 Markdown 或纯文本文件'
     return
   }
@@ -3783,6 +3823,9 @@ onMounted(() => {
   disposeOpenGeneralSettings = window.notesDesktop.onOpenGeneralSettings(() => void openGeneralSettings())
   disposeOpenSearch = window.notesDesktop.onOpenSearch(handleSearchMenuCommand)
   disposeOpenLocalFile = window.notesDesktop.onOpenLocalFile(() => void openMarkdownFileFromDialog())
+  disposeOpenLocalFilePaths = window.notesDesktop.onOpenLocalFilePaths((filePaths) => {
+    openLocalFilesFromSystem(filePaths)
+  })
   disposeSaveLocalFile = window.notesDesktop.onSaveLocalFile(() => {
     // 菜单「保存」是文档级操作：文件标签写回磁盘，笔记保持立即落库。
     if (activeFileDoc.value) void saveActiveMarkdownFile()
@@ -3847,6 +3890,8 @@ onBeforeUnmount(() => {
   disposeOpenSearch = null
   disposeOpenLocalFile?.()
   disposeOpenLocalFile = null
+  disposeOpenLocalFilePaths?.()
+  disposeOpenLocalFilePaths = null
   disposeSaveLocalFile?.()
   disposeSaveLocalFile = null
   disposeSaveLocalFileAs?.()

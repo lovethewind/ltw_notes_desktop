@@ -680,6 +680,12 @@ export interface NotesDesktopApi {
   getDroppedFilePath(file: File): string
   /** 监听菜单栏「打开 Markdown 文件…」。 */
   onOpenLocalFile(callback: () => void): () => void
+  /**
+   * 监听系统请求用本应用打开的文件（拖到图标 / 双击 / 右键「打开方式」）。
+   *
+   * 主进程可能攒多个路径一次投递。
+   */
+  onOpenLocalFilePaths(callback: (filePaths: string[]) => void): () => void
   /** 监听菜单栏「保存」。 */
   onSaveLocalFile(callback: () => void): () => void
   /** 监听菜单栏「另存为…」。 */
